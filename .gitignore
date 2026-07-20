@@ -1,0 +1,12 @@
+/target
+/result
+/result-*
+.direnv/
+/direnv
+/build/
+/_build/
+/builddir/
+*.gresource
+*.gresource.c
+*.gresource.h
+*.blp.ui
