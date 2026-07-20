@@ -84,9 +84,12 @@ mod imp {
                         .vexpand(true)
                         .build();
 
-                    let obj_clone = obj.clone();
+                    let obj_weak = obj.downgrade();
                     btn.connect_clicked(move |_| {
-                        let imp = obj_clone.imp();
+                        let Some(obj) = obj_weak.upgrade() else {
+                            return;
+                        };
+                        let imp = obj.imp();
                         let cells = imp.grid_data.borrow();
                         if let Some(&cell) = cells.get(idx) {
                             drop(cells);
@@ -114,14 +117,18 @@ mod imp {
             *self.day_buttons.borrow_mut() = buttons;
 
             // Wire up month navigation.
-            let obj_prev = obj.clone();
+            let obj_prev = obj.downgrade();
             self.prev_button.connect_clicked(move |_| {
-                obj_prev.previous_month();
+                if let Some(obj) = obj_prev.upgrade() {
+                    obj.previous_month();
+                }
             });
 
-            let obj_next = obj.clone();
+            let obj_next = obj.downgrade();
             self.next_button.connect_clicked(move |_| {
-                obj_next.next_month();
+                if let Some(obj) = obj_next.upgrade() {
+                    obj.next_month();
+                }
             });
 
             // Initialise date state from the local clock.

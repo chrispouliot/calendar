@@ -1,0 +1,38 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $MonthView: Adw.Bin {
+  Box {
+    orientation: vertical;
+    spacing: 0;
+    css-name: "calendar-view";
+    css-classes: ["month-view"];
+
+    Grid headers_grid {
+      row-homogeneous: true;
+      column-homogeneous: true;
+      hexpand: true;
+    }
+
+    Separator {
+      margin-start: 4;
+      margin-end: 4;
+    }
+
+    ScrolledWindow week_scroll {
+      hexpand: true;
+      vexpand: true;
+      hscrollbar-policy: never;
+      vscrollbar-policy: automatic;
+      overlay-scrolling: true;
+      propagate-natural-height: false;
+
+      child: Viewport {
+        child: Box week_rows_box {
+          orientation: vertical;
+          homogeneous: true;
+        };
+      };
+    }
+  }
+}

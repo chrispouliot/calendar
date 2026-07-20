@@ -3,13 +3,15 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo::rerun-if-changed=data/ui/window.blp");
     println!("cargo::rerun-if-changed=data/ui/common/date-chooser.blp");
+    println!("cargo::rerun-if-changed=data/ui/views/month-view.blp");
     println!("cargo::rerun-if-changed=data/style.css");
     println!("cargo::rerun-if-changed=data/resources.gresource.xml");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let ui_out_dir = out_dir.join("ui");
 
-    std::fs::create_dir_all(&ui_out_dir).unwrap();
+    std::fs::create_dir_all(ui_out_dir.join("views")).unwrap();
+    std::fs::create_dir_all(ui_out_dir.join("common")).unwrap();
 
     // Compile Blueprint files to .ui in OUT_DIR/ui/
     let status = std::process::Command::new("blueprint-compiler")
@@ -19,6 +21,7 @@ fn main() {
             "data/ui",
             "data/ui/window.blp",
             "data/ui/common/date-chooser.blp",
+            "data/ui/views/month-view.blp",
         ])
         .status()
         .expect("Failed to run blueprint-compiler");

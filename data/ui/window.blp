@@ -12,6 +12,9 @@ template $CalendarWindow: Adw.ApplicationWindow {
     child: Adw.OverlaySplitView split_view {
       pin-sidebar: true;
       show-sidebar: false;
+      min-sidebar-width: 300;
+      max-sidebar-width: 340;
+      sidebar-width-fraction: 0.33;
 
       [sidebar]
       Adw.ToolbarView {
@@ -57,7 +60,7 @@ template $CalendarWindow: Adw.ApplicationWindow {
             active: bind split_view.show-sidebar bidirectional;
           }
 
-          title-widget: Label {
+          title-widget: Label title_label {
             label: "Calendar";
             css-classes: ["title"];
           };
@@ -87,23 +90,10 @@ template $CalendarWindow: Adw.ApplicationWindow {
             use-underline: true;
             icon-name: "calendar-month-symbolic";
 
-            child: Box {
-              orientation: vertical;
-              vexpand: true;
-              valign: center;
-              halign: center;
-              spacing: 12;
-
-              Image {
-                icon-name: "calendar-month-symbolic";
-                pixel-size: 64;
-              }
-
-              Label {
-                label: "Month View";
-                css-classes: ["title-1"];
-              }
-            };
+            child: Adw.Bin month_view_bin {
+            hexpand: true;
+            vexpand: true;
+          };
           }
 
           Adw.ViewStackPage week_page {
@@ -203,7 +193,7 @@ template $CalendarWindow: Adw.ApplicationWindow {
   }
 
   Adw.Breakpoint {
-    condition ("max-width: 700sp")
+    condition ("max-width: 1000sp")
 
     setters {
       split_view.collapsed: true;

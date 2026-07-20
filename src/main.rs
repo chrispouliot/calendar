@@ -40,26 +40,30 @@ fn load_css() {
 
 fn add_application_actions(app: &Application) {
     let quit = gio::SimpleAction::new("quit", None);
-    let app_clone = app.clone();
+    let app_weak = app.downgrade();
     quit.connect_activate(move |_, _| {
-        app_clone.quit();
+        if let Some(app) = app_weak.upgrade() {
+            app.quit();
+        }
     });
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &["<primary>q"]);
 
     let about = gio::SimpleAction::new("about", None);
-    let app_clone = app.clone();
+    let app_weak = app.downgrade();
     about.connect_activate(move |_, _| {
-        let about_window = adw::AboutWindow::new();
-        about_window.set_application_name("Calendar");
-        about_window.set_application_icon(APP_ID);
-        about_window.set_version("0.1.0");
+        if let Some(app) = app_weak.upgrade() {
+            let about_window = adw::AboutWindow::new();
+            about_window.set_application_name("Calendar");
+            about_window.set_application_icon(APP_ID);
+            about_window.set_version("0.1.0");
 
-        if let Some(window) = app_clone.active_window() {
-            about_window.set_transient_for(Some(&window));
+            if let Some(window) = app.active_window() {
+                about_window.set_transient_for(Some(&window));
+            }
+
+            about_window.present();
         }
-
-        about_window.present();
     });
     app.add_action(&about);
 }

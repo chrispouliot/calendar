@@ -611,52 +611,112 @@ Note: Actions have no behaviour yet; wiring to real navigation/event-creation wi
 
 Goal: establish EDS-free calendar/event domain objects.
 
-Status: Not started
+Status: Complete
 
 Tasks:
 
-- [ ] Define `Calendar` model:
-  - [ ] id
-  - [ ] name
-  - [ ] color
-  - [ ] visible
-  - [ ] read-only
-  - [ ] source/backend kind
-- [ ] Define `Event` model:
-  - [ ] id/uid
-  - [ ] calendar id
-  - [ ] title
-  - [ ] start/end
-  - [ ] all-day
-  - [ ] location
-  - [ ] description
-  - [ ] recurrence placeholder
-  - [ ] reminders placeholder
-- [ ] Define repository traits.
-- [ ] Implement an in-memory repository.
-- [ ] Add range-query behavior for events.
+- [x] Define `Calendar` model:
+  - [x] id
+  - [x] name
+  - [x] color
+  - [x] visible
+  - [x] read-only
+  - [x] source/backend kind
+- [x] Define `Event` model:
+  - [x] id/uid
+  - [x] calendar id
+  - [x] title
+  - [x] start/end
+  - [x] all-day
+  - [x] location
+  - [x] description
+  - [x] recurrence placeholder
+  - [x] reminders placeholder
+- [x] Define repository traits.
+- [x] Implement an in-memory repository.
+- [x] Add start-inclusive/end-exclusive timed event range queries.
 
 Verification:
 
 ```text
 cargo test
 cargo check
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-### Phase 5: Month view MVP
+Note: the repository currently exposes timed range queries; the pure month projection handles all-day and timed events for view rendering.
 
-Goal: first useful event-rendering view.
+### Phase 5: Month view MVP (continuous week scrolling + no auto-selection)
 
-Status: Not started
+Goal: first useful event-rendering view with GNOME Calendar-like continuous
+vertical week scrolling.
+
+Status: Complete
+
+Architecture:
+
+- **15-week-row buffer:** 5 visible + 5 buffered above + 5 buffered below,
+  managed by `calendar::weeks_buffer::WeeksBuffer`.
+- **GtkScrolledWindow** with an automatic overlay scrollbar. Using a
+  non-`never` vertical policy keeps tall buffered content from propagating its
+  minimum height into the window. Native smooth/kinetic scrolling (touchpad)
+  passes through untouched. A single discrete-only
+  `EventControllerScroll` at `CAPTURE` phase intercepts mouse-wheel events
+  and snaps the adjustment by exactly one row per notch, returning `STOP`.
+- **Row recycling:** when the scroll adjustment value approaches the top or
+  bottom of the 15-row content (within 0.5&times;row_height of an edge), the
+  `WeeksBuffer` is shifted by &pm;1 week and the adjustment value is
+  counter-adjusted to preserve the apparent visual position. After each shift
+  the 105 cells are immediately repopulated from cached calendar/event data.
+- **No automatic day selection:** `selected_date` is `None` on initial load
+  and after Previous/Next/Today navigation. Scrolling does not change
+  selection. The first click on a day selects it; a second click on an
+  already-selected empty day fires the quick-add placeholder.
+- **Viewport-centre title and `other-month` styling:** the title month and
+  dimmed-month styling are derived from the Thursday of whichever buffer row
+  falls at the viewport's vertical centre pixel
+  (`(value + page_size/2) / row_height`). The month-changed callback fires
+  on every adjustment tick when the centre pixel's month changes, so the
+  header updates smoothly during scrolling — not only at buffer-recycle
+  boundaries.
+- **Calendar-month navigation:** Previous and Next target the centre
+  month's previous/next calendar month, then set the first visible row's
+  Monday to the Monday on/before that month's 1st. Today starts from the
+  Monday on/before the current month's 1st and shifts the buffer just
+  enough to make today's week visible (handles six-week months). Neither
+  auto-selects a day.
+- **Stable content height (no feedback loop):** the content's `height-request`
+  and row height are computed from the initial viewport size and remain fixed.
+  Resizing may expose more or fewer complete week rows, but scroll calculations
+  remain tied to the rows' actual size and cannot feed child height back into
+  the viewport's page size.
+- **No day-button focus:** day buttons are constructed with `can_focus:
+  false` so the initial GTK keyboard-focus highlight cannot be mistaken for
+  a selection. Mouse clicks still work for selection and quick-add.
+- **Event projection:** `project_month` is called for every unique
+  (year, month) pair among the 105 dates in the 15-row buffer; results are
+  indexed by date into a `HashMap<NaiveDate, DayProjection>` and looked up
+  per cell during rendering.
 
 Tasks:
 
-- [ ] Generate month grid dates.
-- [ ] Highlight today and selected active date.
-- [ ] Render events as colored chips.
-- [ ] Filter by visible calendars.
-- [ ] Connect date navigation.
-- [ ] Open quick-add flow from a day/empty area.
+- [x] Generate month grid dates (via `calendar_grid::month_grid`).
+- [x] Highlight today and selected active date.
+- [x] Render events as colored chips.
+- [x] Filter by visible calendars.
+- [x] Connect date navigation (Previous, Today, Next button actions).
+- [x] Open quick-add placeholder from the new-event action or by re-clicking a selected empty day.
+- [x] Month/year title updates on navigation.
+- [x] In-memory repository seeded with test calendar + events.
+- [x] Preserve Week/Agenda placeholders, sidebar, responsive layout, About/Quit.
+- [x] Continuous week scrolling via 15-row `WeeksBuffer` + `GtkScrolledWindow`.
+- [x] Row recycling at scroll edges.
+- [x] No automatic day selection (empty on init, navigation, Today).
+- [x] Dominant-month title updated during scrolling.
+- [x] Event chips refresh across all 105 cells after buffer shift.
+- [x] Re-use `project_month` by projecting all months covered by the buffer
+      and indexing results by date.
 
 Verification:
 
@@ -665,7 +725,133 @@ cargo test
 cargo run
 ```
 
-Manual check: month grid works, events display, navigation changes the visible month.
+Manual check: month grid works, events display, navigation changes the
+visible month, vertical scrolling moves through weeks continuously, no day
+is auto-selected, today styling stays distinct from selection.
+
+Manual runtime verification passed: continuous scrolling works, the bottom
+view switcher remains visible, and no allocation warnings are emitted.
+
+**Phase 5 visual refinements (post-baseline, not altering accepted status):**
+
+- Today pill: `.monthview-day-label` uses accent-background/foreground,
+  `font-weight: 700`, `border-radius: 6px`, `padding: 1px 6px`. Today wins
+  over `other-month` and `first-day` styling. The selected cell retains a
+  light accent background behind the today pill.
+- Initial‑week position: `WeeksBuffer` starts at `monday_of_week(today)`
+  on both initial load and Today action. Selection stays `None`.
+- Month boundaries: day 1 label displays the full month name and gets a
+  `first-day` CSS class with grey pill styling (light/dark variant). Cells
+  for days 1–7 receive `separator-top`; day 1 additionally receives
+  `separator-side`. Separator classes are recomputed in both `repopulate_rows`
+  and `refresh_cell_styles`.
+- Fix attempt 1/3 (post-user verification of unstaged refinement) —
+  **REJECTED** in diff review:
+  - CSS: Added `button.monthview-cell.other-month .monthview-day-label.first-day`
+    rules to preserve first-day white-on-dark-2 (black-on-light-3 in dark mode)
+    even when the cell is `other-month`. Today rules already come last.
+  - Scroll: `setup_scroll` now defers the initial adjustment positioning until
+    the adjustment range (`upper - page_size`) can accommodate
+    `VISIBLE_START × row_height`. Uses a one-shot idle retry; `initialized`
+    stays `false` so recycle callbacks cannot shift the buffer while waiting.
+    After successful positioning, fires month-changed callback and refreshes
+    cell styles to align with the true centre month.
+  - Sidebar: OverlaySplitView now has `min-sidebar-width: 300`,
+    `max-sidebar-width: 340`, `sidebar-width-fraction: 0.33` to guarantee
+    →288 sp for the date-chooser AdwBin.
+  - Rejection reasons:
+    1. `setup_scroll` lines 780–788 recursively enqueue another idle callback
+       whenever the range is not ready (unbounded loop). Same issue for the
+       zero-height branch around 736–745. Must be replaced with finite/event-
+       driven lifecycle.
+    2. CSS today precedence is not final for all combinations: `today.other-month`
+       and `other-month.day-label.first-day` tie at equal specificity (0‑4‑2),
+       and `first-day` was placed later, so first-day colours override the accent
+       for `today + other-month + first-day`. Today must win for ordinary,
+       other-month, first-day, and selected combinations.
+
+- Fix attempt 2/3 — replaced idle retry with two notify handlers on the
+  adjustment (`page-size`, `upper`) installed in `constructed()` — failed
+  **3/3** in acceptance testing (escalated by worker).
+  - Runtime diagnostics (view the user's real display at app startup):
+    - scroll height 526, intended row 105.2, requested box 1578, target 526.
+    - First three setup passes: box allocation 885 despite min/natural 1578;
+      adjustment upper 885, page 526, range 359 → target cannot be set.
+    - Later pass: box allocation/upper finally 1578, range 1052.
+  - **Root cause:** live allocation race.  `set_height_request` does not
+    propagate synchronously to the adjustment range; the notify handlers
+    catch the update one or more layout cycles later, but during those
+    cycles `initialized` remains `false` and the viewport opens at value 0
+    (nine content rows visible, five pre-buffer weeks visible).
+  - **Expert-directed correction:**
+    1. Removed `eprintln!` diagnostics and the obsolete
+       `notify::upper` / `notify::page-size` handlers.
+    2. `notify::height` and then `map` both failed to invoke setup in the live
+       widget hierarchy; the latter was confirmed by temporary diagnostics
+       producing no output. A `size_allocate` override also left nine natural-
+       height rows because it changed requests during the active allocation
+       pass and initialized before the resize took effect. Setup now runs from
+       the previously confirmed `realize` + one bounded idle callback, outside
+       allocation; explicit geometry means no retry or polling is needed.
+    3. Stores 15 row-box references (`row_boxes`) for explicit per-row
+       sizing instead of relying on the outer homogeneous box's
+       allocation to catch up.
+    4. On first valid allocation, computes a whole-pixel row height from
+       `viewport / 5`,
+       sets each row's `height_request` to `row_height`, sets the outer
+       content-box `height_request` to `15 * row_height`, and then
+       **explicitly establishes every adjustment parameter** atomically:
+       `lower=0`, `upper=15*row_h`, `page_size=viewport`, `step=row_h`,
+       `page=viewport`, `value=VISIBLE_START*row_h`.
+    5. All under the `recycling_guard`; marks `initialized` true
+       immediately after.
+    6. If GTK later recomputes the adjustment from the now-explicit
+       content geometry, it converges to the same bounds/value rather
+       than resetting to zero.
+    7. Preserves go_today/month navigation, 5-row viewport, 15-row
+       buffer, event chips, CSS fixes, and sidebar constraints.
+    8. The responsive split-view breakpoint now matches GNOME Calendar at
+       1000sp instead of 700sp, preventing startup's 360px minimum allocation
+        from dividing the content to 241px before the default size settles.
+  - Awaiting manual visual verification (`cargo run`).
+
+**Unstaged CSS-architecture refinement (awaiting manual verification):**
+
+   - **Topbar/title reference change** (preserved from first pass): the topbar
+     dominant month and all month-changed callbacks now derive from the first
+     visible complete week (row `VISIBLE_START`, Thursday col 3) instead of the
+     viewport centre.  Cell dimming (`other-month`) continues to use the
+     viewport centre via `ref_year_month()` → `viewport_center_ym()`.  Fixes
+     the initial July 20, 2026 viewport showing "August" when the first visible
+     week is still July.
+   - **GNOME-style `calendar-view` root:** Month template CSS node changed from
+     `monthview` to `calendar-view` (shared root) with style class `month-view`.
+     All Month selectors updated from `monthview …` to
+     `calendar-view.month-view …`.  The root sets `font-size: 10pt`; Month day
+     labels inherit this baseline (no forced 11pt).  Weekday labels match GNOME
+     with uppercase abbreviations, the `heading` class, dim colour, and 12px inset.
+   - **Relative event sizing:** Chip containers use `font-size: 0.9rem` (GNOME
+     events.css pattern) — no explicit `min-height`; natural layout prevents
+     clipping.  Overflow labels use CSS `font-size: smaller`.
+   - **No artificial shared-class API** per leaf element; inheritance from
+     `calendar-view` and existing widget classes are faithful to GNOME.
+   - **Future Week/Agenda notes** (no speculative selectors added):
+     Week view should use Libadwaita `heading`/`title-2` for day numbers,
+     10pt for hour labels, `heading dimmed` for weekday names.  Agenda should
+     use `caption-heading` for day headings.  Shared event widgets across views
+     use 0.9 rem.
+   - Sidebar/mini-calendar typography unchanged; Week/Agenda placeholder
+     `title-1` empty-state headings preserved.
+   - **Fix attempt 1 (REJECTED):** initial `first_visible_week_ym()` always
+     read row `VISIBLE_START` from the buffer.  This was correct only at the
+     centred initial position; during ordinary scrolling within the 15-row
+     buffer the title would remain stuck and month-changed callbacks would not
+     fire because the visible rows shift without recycling.  Fixed by deriving
+     the first completely visible row from the live scroll adjustment and row
+     height, using `ceil(val / row_h)` so a partially clipped top row during
+     smooth/kinetic scrolling falls through to the next complete row.
+     Pre‑initialisation fallback stays at `VISIBLE_START`.
+   - No staged changes; run acceptance commands below on the working tree.
 
 ### Phase 6: Quick add and event preview
 

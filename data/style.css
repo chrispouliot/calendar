@@ -42,3 +42,120 @@ datechooser button.flat.circular.today.selected {
 datechooser button.flat.circular.other-month {
   color: alpha(currentColor, 0.35);
 }
+
+/* ── GNOME-style calendar-view architecture ──
+ *
+ * Root baseline at 10pt.  Month and future Week share this root; each
+ * view-specific widget adds its own style class.  Agenda uses
+ * `agenda-view` and role-specific Adwaita classes instead.
+ * Events across views use relative 0.9rem sizing (GNOME events.css
+ * pattern).  Overflow/secondary labels use relative `smaller`.  */
+
+calendar-view {
+  font-size: 10pt;
+}
+
+calendar-view .monthview-chip {
+  font-size: 0.9rem;
+}
+
+calendar-view .monthview-overflow {
+  font-size: smaller;
+}
+
+/* ── Month View ── */
+
+calendar-view.month-view {
+  padding: 4px;
+}
+
+calendar-view.month-view .monthview-weekday {
+  color: alpha(currentColor, 0.55);
+  padding-top: 6px;
+  padding-bottom: 2px;
+}
+
+calendar-view.month-view button.monthview-cell {
+  border: 1px solid alpha(currentColor, 0.08);
+  border-radius: 0;
+  padding: 2px;
+  background: none;
+  font-weight: normal;
+}
+
+calendar-view.month-view button.monthview-cell:focus {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+}
+
+calendar-view.month-view .monthview-day-label.first-day {
+  font-weight: 700;
+  border-radius: 6px;
+  padding: 1px 6px;
+  color: white;
+  background-color: var(--dark-2);
+}
+
+@media (prefers-color-scheme: dark) {
+  calendar-view.month-view .monthview-day-label.first-day {
+    color: black;
+    background-color: var(--light-3);
+  }
+}
+
+calendar-view.month-view button.monthview-cell.separator-top {
+  border-top-color: alpha(currentColor, 0.3);
+}
+
+calendar-view.month-view button.monthview-cell.separator-side {
+  border-left-color: alpha(currentColor, 0.3);
+}
+
+calendar-view.month-view button.monthview-cell.selected {
+  background-color: alpha(var(--accent-bg-color), 0.15);
+}
+
+calendar-view.month-view button.monthview-cell.selected .monthview-day-label {
+  color: var(--accent-color);
+  font-weight: bold;
+}
+
+calendar-view.month-view button.monthview-cell.other-month .monthview-day-label {
+  color: alpha(currentColor, 0.35);
+}
+
+/* First-day must keep its own colours even when other-month.
+   This rule is more specific than the generic other-month rule
+   above, so it wins on specificity. */
+calendar-view.month-view button.monthview-cell.other-month .monthview-day-label.first-day {
+  color: white;
+  background-color: var(--dark-2);
+}
+
+@media (prefers-color-scheme: dark) {
+  calendar-view.month-view button.monthview-cell.other-month .monthview-day-label.first-day {
+    color: black;
+    background-color: var(--light-3);
+  }
+}
+
+/* Today accent — final effective override for all combinations.
+   Placed last so any specificity tie is won by source order. */
+calendar-view.month-view button.monthview-cell.today .monthview-day-label,
+calendar-view.month-view button.monthview-cell.today.other-month .monthview-day-label,
+calendar-view.month-view button.monthview-cell.today.selected .monthview-day-label {
+  color: var(--accent-fg-color);
+  background-color: var(--accent-bg-color);
+  font-weight: 700;
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+
+calendar-view.month-view .monthview-day-label {
+  padding: 1px 3px;
+}
+
+calendar-view.month-view .monthview-overflow {
+  font-weight: bold;
+  color: alpha(currentColor, 0.6);
+}

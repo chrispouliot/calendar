@@ -45,6 +45,18 @@
             pkgs.gtk4
             pkgs.libadwaita
           ];
+
+          gtkRuntimeLibraries = [
+            pkgs.glib
+            pkgs.gdk-pixbuf
+            pkgs.gtk4
+            pkgs.cairo
+            pkgs.graphene
+            pkgs.pango
+            pkgs.harfbuzz
+            pkgs.vulkan-loader
+            pkgs.libadwaita
+          ];
         in {
           default = pkgs.mkShell {
             strictDeps = true;
@@ -74,12 +86,7 @@
               pkgs.gettext
             ];
 
-            buildInputs = [
-              # Libraries used by gtk4-rs and libadwaita-rs
-              pkgs.glib
-              pkgs.gtk4
-              pkgs.libadwaita
-
+            buildInputs = gtkRuntimeLibraries ++ [
               # Runtime data commonly expected by GTK/GNOME apps
               pkgs.gsettings-desktop-schemas
               pkgs.adwaita-icon-theme
@@ -102,11 +109,7 @@
                 pkgs.libadwaita
               ];
 
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-              pkgs.glib
-              pkgs.gtk4
-              pkgs.libadwaita
-            ];
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath gtkRuntimeLibraries;
 
             shellHook = ''
               export XDG_DATA_DIRS="${xdgDataDirs}''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
