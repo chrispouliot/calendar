@@ -8,4 +8,10 @@
     <file compressed="true">ui/views/month-view.ui</file>
     <file compressed="true">style.css</file>
   </gresource>
+  <gresource prefix="/dev/chris/calendar">
+    <file compressed="true">icons/scalable/emblems/calendar-month-symbolic.svg</file>
+    <file compressed="true">icons/scalable/emblems/calendar-week-symbolic.svg</file>
+    <file compressed="true">icons/scalable/emblems/calendar-agenda-symbolic.svg</file>
+    <file compressed="true">icons/scalable/emblems/calendar-today-symbolic.svg</file>
+  </gresource>
 </gresources>

@@ -20,6 +20,9 @@ fn main() {
 }
 
 fn build_ui(app: &Application) {
+    if let Some(display) = gdk::Display::default() {
+        gtk::IconTheme::for_display(&display).add_resource_path("/dev/chris/calendar/icons/");
+    }
     load_css();
     let win = window::CalendarWindow::new(app);
     gtk::prelude::GtkWindowExt::present(&win);

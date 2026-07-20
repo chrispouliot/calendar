@@ -8,6 +8,10 @@ fn main() {
     println!("cargo::rerun-if-changed=data/ui/views/month-view.blp");
     println!("cargo::rerun-if-changed=data/style.css");
     println!("cargo::rerun-if-changed=data/resources.gresource.xml");
+    println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-month-symbolic.svg");
+    println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-week-symbolic.svg");
+    println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-agenda-symbolic.svg");
+    println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-today-symbolic.svg");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let ui_out_dir = out_dir.join("ui");

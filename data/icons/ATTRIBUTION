@@ -1,0 +1,11 @@
+The symbolic icons in scalable/emblems/ are from GNOME Calendar
+(https://gitlab.gnome.org/GNOME/gnome-calendar), licensed under
+GPL-3.0-or-later.
+
+Files:
+  scalable/emblems/calendar-month-symbolic.svg
+  scalable/emblems/calendar-week-symbolic.svg
+  scalable/emblems/calendar-agenda-symbolic.svg
+  scalable/emblems/calendar-today-symbolic.svg
+
+Source: https://gitlab.gnome.org/GNOME/gnome-calendar/-/tree/main/src/gui/icons
