@@ -1,0 +1,115 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $QuickAddPopover: Popover {
+  width-request: 360;
+
+  styles [
+    "quick-add-popover",
+  ]
+
+  child: Box {
+    orientation: vertical;
+    margin-top: 12;
+    margin-bottom: 12;
+    spacing: 12;
+
+    Label date_label {
+      hexpand: true;
+      wrap: true;
+      max-width-chars: 25;
+      xalign: 0.0;
+      margin-top: 6;
+      margin-bottom: 6;
+      margin-start: 27;
+      margin-end: 27;
+
+      styles [
+        "title-4",
+      ]
+    }
+
+    ListBox {
+      accessible-role: none;
+      selection-mode: none;
+      margin-start: 12;
+      margin-end: 12;
+
+      styles [
+        "boxed-list",
+      ]
+
+      Adw.EntryRow title_entry {
+        title: _("Title");
+        activates-default: true;
+      }
+    }
+
+    ScrolledWindow calendar_scroll {
+      propagate-natural-height: true;
+      max-content-height: 240;
+
+      styles [
+        "undershoot-top",
+        "undershoot-bottom",
+      ]
+
+      child: ListBox calendars_list_box {
+        tab-behavior: item;
+        margin-start: 12;
+        margin-end: 12;
+        margin-top: 12;
+        margin-bottom: 12;
+
+        styles [
+          "boxed-list",
+          "calendars-list",
+          "compact",
+        ]
+      };
+    }
+
+    Label no_calendars_label {
+      label: _("No writable calendars available.");
+      halign: center;
+      xalign: 0.0;
+      margin-start: 12;
+      margin-end: 12;
+      margin-top: 6;
+      margin-bottom: 6;
+      css-classes: ["dim-label"];
+      visible: false;
+    }
+
+    Box action_box {
+      homogeneous: true;
+      margin-start: 12;
+      margin-end: 12;
+      spacing: 9;
+
+      Button edit_details_button {
+        valign: center;
+
+        child: Label {
+          label: _("_Edit Details");
+          use-underline: true;
+
+          styles [
+            "heading",
+          ]
+        };
+      }
+
+      Button save_button {
+        valign: center;
+        sensitive: false;
+        label: _("_Save Event");
+        use-underline: true;
+
+        styles [
+          "suggested-action",
+        ]
+      }
+    }
+  };
+}

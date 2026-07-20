@@ -669,10 +669,10 @@ Architecture:
   `WeeksBuffer` is shifted by &pm;1 week and the adjustment value is
   counter-adjusted to preserve the apparent visual position. After each shift
   the 105 cells are immediately repopulated from cached calendar/event data.
-- **No automatic day selection:** `selected_date` is `None` on initial load
-  and after Previous/Next/Today navigation. Scrolling does not change
-  selection. The first click on a day selects it; a second click on an
-  already-selected empty day fires the quick-add placeholder.
+- **No automatic day selection:** the Month View has no date-selection state.
+  The first click on an empty day fires the Quick-Add activation callback
+  immediately; days containing event chips do nothing — event-chip preview is
+  pending.  Previous/Next/Today navigation do not auto-select a day.
 - **Viewport-centre title and `other-month` styling:** the title month and
   dimmed-month styling are derived from the Thursday of whichever buffer row
   falls at the viewport's vertical centre pixel
@@ -857,31 +857,115 @@ view switcher remains visible, and no allocation warnings are emitted.
 
 Goal: create and inspect events.
 
-Status: Not started
+Status: Complete — Quick Add and event preview manually verified.
+
+History:
+- Attempt 1 (unstaged) was rejected by dev diff review before user testing:
+  1. Popover used `autohide: false`, `has-arrow: false` — removed; native GNOME
+     dismiss/Escape behavior restored.
+  2. Entry was inside a PreferencesGroup, not a boxed-list ListBox — corrected.
+  3. Header used bare "Today" / "Monday, July 20" instead of reference wording
+     ("New Event Today" / "New Event Monday" / "New Event on July 20").
+  4. Buttons used invented `pill` styles — removed; Edit Details uses child
+     Label + `heading`, Save Event uses `suggested-action`.
+  5. Calendar list used an unbounded PreferencesGroup instead of a
+     ScrolledWindow+boxed-list ListBox with max 240px and undershoot styles.
+  6. Error class was shown only on attempted save — now toggles immediately
+     on text change (matching reference's `summary_entry_text_changed`).
+  7. Host window read `popover.imp().title_entry` — save callback now delivers
+     the validated title, calendar, and date without host access to internals.
+  8. State reset was only done on successful save/open — now uses
+     `connect_closed` for automatic title/error/date reset on any dismiss.
+  9. "Holidays (read-only)" seed calendar was a new visible-only test fixture —
+     removed; filtering behavior lives in the code alone.
+
+- Attempt 2 was rejected by dev diff review before user testing:
+  1. No-writable-calendar empty state was lost when switching to ListBox.
+     Restored an explanatory `no_calendars_label` that hides the empty
+     scroll list, disables title/save, and uses accurate non‑sidebar
+     wording.
+  2. Fresh popover opens showed the title in error (red).  Root cause:
+     `refresh_save_sensitive()` unconditionally toggled the error class,
+     and it was called on every `reset_title()` / `set_calendars()`.
+     Split: save-sensitivity recomputation no longer touches the error
+     class; only `on_title_text_changed()` (i.e. actual user typing)
+     adds/removes `error`.  The `closed` lifecycle remains the single
+     definitive cleanup path.
+   3. Documentation incorrectly claimed a GNOME-style width=1/height=1
+      point rect.  The actual implementation uses the originating widget's
+      allocation rectangle computed via `compute_point` + `width()`/`height()`;
+      corrected the plan text to match.
+
+- Attempt 3 was rejected by dev diff review and escalated to the expert:
+  `window.rs` still cleared the nonempty title immediately before `popdown()`,
+  synchronously triggering blank-title error styling during dismissal. The
+  expert confirmed GNOME's `closed` lifecycle should exclusively clear title,
+  error, and date state. Both caller resets and the public reset API were removed;
+  repository failures keep the popover and entered title intact for retry.
 
 Tasks:
 
-- [ ] Add quick-add popover:
-  - [ ] title entry
-  - [ ] calendar selector
-  - [ ] Add button
-  - [ ] Edit Event button placeholder
-- [ ] Add event preview popover:
-  - [ ] title
-  - [ ] date/time
-  - [ ] location/description if present
-  - [ ] Edit button placeholder
-- [ ] Persist created events to in-memory repository.
-- [ ] Refresh month view after creation.
+- [x] Add quick-add popover:
+  - [x] Title entry (Adw.EntryRow in boxed-list ListBox)
+  - [x] Calendar selector (ScrolledWindow 240px max + compact boxed-list
+        ListBox; radio single-select, deterministic first-writable default)
+  - [x] Save Event button (suggested-action, sensitive only on nonblank title
+        + writable calendar selection)
+  - [x] No-writable-calendar empty state (explanatory label hides list, disables
+        title/save; re-enables when calendars become available)
+  - [x] Edit Details button placeholder (child Label with heading style,
+        emits toast in Phase 6)
+  - [x] Date-context header using `title-4` with native Popover show/closed
+        lifecycle; wording mirrors `get_date_string_for_day` ("New Event
+        Today", "New Event Tomorrow", "New Event Monday", "New Event on
+        July 20", etc.)
+  - [x] Bottom homogeneous Edit Details + Save Event row (9 px spacing)
+  - [x] Approx. 360px width; native autohide + arrow behavior
+  - [x] Auto-focus + select-all on the title when shown (connect_show)
+  - [x] Error class toggled immediately during typing, not just on attempted save
+  - [x] Enter in a valid title saves; Enter in a blank title fires Edit Details
+  - [x] Popover anchored to the New-Event button or the originating day cell
+        using the widget's allocation rectangle (compute_point + size)
+- [x] Persist created events to in-memory repository through
+      `EventRepository::save_event` (using the staged pure model seam
+      `new_quick_add_event`).
+- [x] Refresh month view immediately after creation (`render_month_view`).
+- [x] Repository failure surfaced as a toast.
+- [x] A single first click on an empty Month-view day opens Quick Add
+      immediately, anchored to that cell. Month View has no selection state;
+      days containing event chips remain reserved for event preview.
+- [x] Calendars remain seeded (Personal, Work, Hidden; until Phase 10);
+      Phase 5 temporary sample events are removed.
+- [x] Add event preview popover:
+  - [x] title
+  - [x] date/time
+  - [x] location/description if present
+  - [x] Edit button placeholder
+  - [x] primary-click activation on individual Month event chips
+  - [x] native dismissal and chip-anchored positioning
+  - [x] pointer cursor on chips and action-button focus on preview map
+  - [x] pointer-open focus-ring suppression with keyboard focus preserved
+  - [x] installed edit/info symbolic icons (no empty circular action)
 
 Verification:
 
 ```text
-cargo check
-cargo run
+cargo test            (passes — 7 unit tests; Phase 6 pure seam pinned)
+cargo check           (passes)
+cargo fmt --all --check (passes)
+cargo clippy --all-targets --all-features -- -D warnings  (passes)
+cargo run             (manual verification required for GTK visuals)
 ```
 
-Manual check: create an event, see it in month view, click it to see preview.
+Manual check: open the New-Event popover from the action bar and from
+a first click on an empty Month-view day; verify "New Event Today" / "New Event
+Monday" / "New Event on July 20" header wording; type a title, confirm
+error class is shown immediately while the field is blank and clears the
+moment any character is typed; pick a calendar, save and see the chip appear
+in Month; click Edit Details and verify the toast; click outside/Escape and
+verify the popover dismisses naturally. Click the saved event chip and verify
+the preview title, date, empty-notes state, Edit Details toast, anchoring, and
+native dismissal.
 
 ### Phase 7: Local persistence
 

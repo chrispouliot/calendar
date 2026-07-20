@@ -1,7 +1,7 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::backend::{CalendarRepository, EventRepository, InMemoryRepository};
-use calendar::model::{Calendar, CalendarSource, Event, EventSchedule};
+use calendar::backend::{CalendarRepository, EventRepository, InMemoryRepository, RepositoryError};
+use calendar::model::{Calendar, CalendarSource, EmptyQuickAddTitle, Event, new_quick_add_event};
 use chrono::NaiveDate;
 use gtk::{gio, glib};
 use std::cell::RefCell;
@@ -28,8 +28,18 @@ mod imp {
         #[template_child]
         pub title_label: TemplateChild<gtk::Label>,
 
-        // In-memory repository with seeded test data.
+        // Phase 6: New-Event button (host of the quick-add popover).
+        #[template_child]
+        pub new_event_button: TemplateChild<gtk::Button>,
+
+        // In-memory repository with seeded calendars.
         pub repository: RefCell<InMemoryRepository>,
+
+        // The Quick-Add popover, created once and parented to the window.
+        pub quick_add: RefCell<Option<crate::ui::quick_add_popover::QuickAddPopover>>,
+
+        // The event preview popover, created once and parented to the window.
+        pub event_popover: RefCell<Option<crate::ui::event_popover::EventPopover>>,
     }
 
     #[glib::object_subclass]
@@ -55,34 +65,41 @@ mod imp {
             let chooser = crate::ui::date_chooser::DateChooser::new();
             self.date_chooser_bin.set_child(Some(&chooser));
 
-            // ── Seed in-memory repository with temporary test data ──
+            // ── Seed the repository with deterministic test calendars ──
             //
-            // TODO(Phase 6): Remove this seed data when real event creation
-            // is wired up. This exists solely so event-chip styling can be
-            // inspected during Phase 5 development.
-            self.seed_repository();
+            // Calendars remain seeded until calendar management (Phase 10)
+            // exists, so the Quick-Add popover always has choices.  The
+            // temporary sample events seeded during Phase 5 development have
+            // been removed; new events come from Quick Add.
+            self.seed_calendars();
 
             // ── Create and place MonthView ──
             let month_view = crate::ui::month_view::MonthView::new();
             let win = self.obj();
-            let imp = self;
             let win_weak = win.downgrade();
 
-            // Connect the quick-add activation placeholder: re-clicking an
-            // already-selected empty day fires this callback.
+            // Connect the day-activation callback: first click on an empty
+            // Month-view day opens the Quick-Add popover at the originating
+            // day cell.  The (row, col) is used to compute the cell's
+            // rectangle in window coordinates.  Days containing event chips
+            // do not fire this callback — event-chip preview will be
+            // implemented in the next unit.
             month_view.set_on_activate({
                 let win_weak = win_weak.clone();
-                move |date| {
+                move |row, col, date| {
                     if let Some(win) = win_weak.upgrade() {
-                        win.imp()
-                            .overlay
-                            .add_toast(adw::Toast::new(&format!("New event on {date}")));
+                        let cell_rect = win
+                            .imp()
+                            .with_month_view(|mv| {
+                                mv.day_cell_rect(row, col, win.upcast_ref::<gtk::Widget>())
+                            })
+                            .flatten();
+                        win.imp().open_quick_add(date, cell_rect);
                     }
                 }
             });
 
-            // Connect the month-changed callback for title updates (fired when
-            // scrolling changes which month is dominant among visible weeks).
+            // Connect the month-changed callback for title updates.
             month_view.set_on_month_changed({
                 let win_weak = win_weak.clone();
                 move |y, m| {
@@ -92,7 +109,57 @@ mod imp {
                 }
             });
 
-            imp.month_view_bin.set_child(Some(&month_view));
+            self.month_view_bin.set_child(Some(&month_view));
+
+            // ── Construct the Quick-Add popover ──
+            let popover = crate::ui::quick_add_popover::QuickAddPopover::new();
+            popover.set_parent(win.upcast_ref::<gtk::Widget>());
+
+            let popover_weak = popover.downgrade();
+            popover.set_on_save({
+                let win_weak = win_weak.clone();
+                move |title, calendar_id, date| {
+                    if let Some(win) = win_weak.upgrade() {
+                        win.imp()
+                            .finalize_quick_add_save(&popover_weak, &title, calendar_id, date);
+                    }
+                }
+            });
+            let win_weak2 = win_weak.clone();
+            popover.set_on_edit_details(move || {
+                if let Some(win) = win_weak2.upgrade() {
+                    win.imp()
+                        .overlay
+                        .add_toast(adw::Toast::new("Full event editor is not implemented yet."));
+                }
+            });
+
+            *self.quick_add.borrow_mut() = Some(popover);
+
+            // ── Construct the event preview popover ──
+            let event_popover = crate::ui::event_popover::EventPopover::new();
+            event_popover.set_parent(win.upcast_ref::<gtk::Widget>());
+
+            let win_weak3 = win_weak.clone();
+            event_popover.set_on_edit_details(move || {
+                if let Some(win) = win_weak3.upgrade() {
+                    win.imp()
+                        .overlay
+                        .add_toast(adw::Toast::new("Full event editor is not implemented yet."));
+                }
+            });
+
+            // Connect MonthView on_event_activate to open the preview.
+            month_view.set_on_event_activate({
+                let win_weak = win_weak.clone();
+                move |event_id, chip_widget| {
+                    if let Some(win) = win_weak.upgrade() {
+                        win.imp().open_event_preview(event_id, &chip_widget);
+                    }
+                }
+            });
+
+            *self.event_popover.borrow_mut() = Some(event_popover);
 
             // ── Window actions ──
 
@@ -127,13 +194,7 @@ mod imp {
             let win_weak = win.downgrade();
             new_event.connect_activate(move |_, _| {
                 if let Some(win) = win_weak.upgrade() {
-                    let msg = win
-                        .imp()
-                        .with_month_view(|mv| mv.selected_date())
-                        .flatten()
-                        .map(|d| format!("New event on {d}"))
-                        .unwrap_or_else(|| "New event".to_string());
-                    win.imp().overlay.add_toast(adw::Toast::new(&msg));
+                    win.imp().open_quick_add_from_button();
                 }
             });
             win.add_action(&new_event);
@@ -244,13 +305,12 @@ impl imp::CalendarWindow {
         self.render_month_view();
     }
 
-    /// Seed the repository with temporary test data.
-    ///
-    /// Temporary — remove when Phase 6 adds real event creation.
-    fn seed_repository(&self) {
+    /// Seed deterministic test calendars.  These remain until calendar
+    /// management (Phase 10) exists, so the Quick-Add popover always has
+    /// choices.
+    fn seed_calendars(&self) {
         let mut repo = self.repository.borrow_mut();
 
-        // Calendars: two visible, one hidden.
         let cal_id = Uuid::parse_str("e1111111-e111-1111-1111-111111111111").unwrap();
         let _ = repo.save_calendar(&Calendar {
             id: cal_id,
@@ -280,90 +340,140 @@ impl imp::CalendarWindow {
             read_only: false,
             source: CalendarSource::Local,
         });
-
-        // Determine today's date (fallback used for deterministic builds).
-        let now = glib::DateTime::now_local().unwrap();
-        let today =
-            NaiveDate::from_ymd_opt(now.year(), now.month() as u32, now.day_of_month() as u32)
-                .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
-
-        // All-day event on today.
-        let _ = repo.save_event(&Event {
-            id: Uuid::parse_str("f1111111-f111-1111-1111-111111111111").unwrap(),
-            calendar_id: cal_id,
-            title: "Test Event".to_string(),
-            location: String::new(),
-            description: String::new(),
-            schedule: EventSchedule::AllDay {
-                start_date: today,
-                end_date_exclusive: today
-                    .succ_opt()
-                    .unwrap_or_else(|| today + chrono::Duration::days(1)),
-            },
-            recurrence: None,
-            reminders: Vec::new(),
-        });
-
-        // All-day event on the same day in the Work calendar (multiple chips).
-        let _ = repo.save_event(&Event {
-            id: Uuid::parse_str("f2222222-f222-2222-2222-222222222222").unwrap(),
-            calendar_id: work_cal_id,
-            title: "Standup".to_string(),
-            location: String::new(),
-            description: String::new(),
-            schedule: EventSchedule::AllDay {
-                start_date: today,
-                end_date_exclusive: today
-                    .succ_opt()
-                    .unwrap_or_else(|| today + chrono::Duration::days(1)),
-            },
-            recurrence: None,
-            reminders: Vec::new(),
-        });
-
-        // Timed event three days from now.
-        let three_days = today + chrono::Duration::days(3);
-        let tz_utc = chrono::FixedOffset::east_opt(0).unwrap();
-        let _ = repo.save_event(&Event {
-            id: Uuid::parse_str("f3333333-f333-3333-3333-333333333333").unwrap(),
-            calendar_id: cal_id,
-            title: "Lunch Meeting".to_string(),
-            location: String::new(),
-            description: String::new(),
-            schedule: EventSchedule::Timed {
-                start: three_days
-                    .and_hms_opt(12, 0, 0)
-                    .unwrap()
-                    .and_local_timezone(tz_utc)
-                    .single()
-                    .unwrap(),
-                end: three_days
-                    .and_hms_opt(13, 0, 0)
-                    .unwrap()
-                    .and_local_timezone(tz_utc)
-                    .single()
-                    .unwrap(),
-                timezone: None,
-            },
-            recurrence: None,
-            reminders: Vec::new(),
-        });
-
-        // Multi-day all-day event spanning days 2–5 from today.
-        let two_days = today + chrono::Duration::days(2);
-        let five_days = today + chrono::Duration::days(5);
-        let _ = repo.save_event(&Event {
-            id: Uuid::parse_str("f4444444-f444-4444-4444-444444444444").unwrap(),
-            calendar_id: cal_id,
-            title: "Multi-day Trip".to_string(),
-            location: String::new(),
-            description: String::new(),
-            schedule: EventSchedule::AllDay {
-                start_date: two_days,
-                end_date_exclusive: five_days,
-            },
-            recurrence: None,
-            reminders: Vec::new(),
-        });
     }
+
+    // ── Quick-Add helpers ──
+
+    /// Open the Quick-Add popover positioned at the bottom New-Event button.
+    /// The date defaults to local today since Month View has no selected-date
+    /// state.
+    fn open_quick_add_from_button(&self) {
+        let date = today_local();
+
+        let rect = self.compute_widget_rect(&self.new_event_button.get());
+        self.open_quick_add(date, rect);
+    }
+
+    /// Open the Quick-Add popover for the given date, optionally pointing
+    /// at a pre-computed rectangle in the window's coordinate space.  When
+    /// `rect` is provided the popover anchors there; otherwise it auto-
+    /// centers (fallback for callers that cannot determine geometry).
+    fn open_quick_add(&self, date: NaiveDate, rect: Option<gtk::gdk::Rectangle>) {
+        let Some(popover) = self.quick_add.borrow().clone() else {
+            return;
+        };
+
+        // Refresh calendar list from the repository so renames / toggles
+        // are reflected in the popover each time it opens.
+        let calendars = self.repository.borrow().list_calendars();
+        popover.set_calendars(&calendars);
+        popover.set_date(date);
+
+        if let Some(rect) = rect {
+            // Default PositionType::Top places the popover below the
+            // pointing rect; GTK flips it to Bottom if the rect is too
+            // close to the bottom of the screen (e.g. the New-Event
+            // button in the action bar).  No explicit position override
+            // is needed.
+            popover.set_pointing_to(Some(&rect));
+        } else {
+            popover.set_pointing_to(None);
+        }
+
+        popover.popup();
+    }
+
+    /// Build, persist, and close the Quick-Add popover.  Uses the pure
+    /// model seam `new_quick_add_event` with the caller-supplied trimmed
+    /// title.  Failures are surfaced as a toast; on success the MonthView
+    /// is refreshed and the popover resets and hides.
+    fn finalize_quick_add_save(
+        &self,
+        popover_weak: &glib::WeakRef<crate::ui::quick_add_popover::QuickAddPopover>,
+        title: &str,
+        calendar_id: Uuid,
+        date: NaiveDate,
+    ) {
+        let event_id = Uuid::new_v4();
+        let event = match new_quick_add_event(event_id, calendar_id, title, date) {
+            Ok(ev) => ev,
+            Err(EmptyQuickAddTitle) => {
+                // Guard against edge case: popover delivered empty title.
+                self.overlay
+                    .add_toast(adw::Toast::new("Event title cannot be empty."));
+                return;
+            }
+        };
+
+        let result = self.repository.borrow_mut().save_event(&event);
+        match result {
+            Ok(()) => {
+                self.render_month_view();
+                if let Some(popover) = popover_weak.upgrade() {
+                    popover.popdown();
+                }
+            }
+            Err(RepositoryError) => {
+                self.overlay
+                    .add_toast(adw::Toast::new("Could not save event."));
+            }
+        }
+    }
+
+    /// Compute the widget's allocation rectangle in the window's
+    /// coordinate space.  Returns `None` if the transform is unavailable
+    /// (e.g. widget not yet realised).
+    fn compute_widget_rect(&self, widget: &impl IsA<gtk::Widget>) -> Option<gtk::gdk::Rectangle> {
+        let origin = widget.compute_point(
+            self.obj().upcast_ref::<gtk::Widget>(),
+            &gtk::graphene::Point::new(0.0, 0.0),
+        )?;
+        Some(gtk::gdk::Rectangle::new(
+            origin.x() as i32,
+            origin.y() as i32,
+            widget.width(),
+            widget.height(),
+        ))
+    }
+
+    // ── Event preview helper ──
+
+    /// Resolve an event from the repository, populate the preview popover,
+    /// anchor it at the chip widget, and open it.  Missing events are
+    /// handled silently (the popover simply isn't shown).
+    fn open_event_preview(&self, event_id: Uuid, chip_widget: &gtk::Widget) {
+        let Some(popover) = self.event_popover.borrow().clone() else {
+            return;
+        };
+
+        let repo = self.repository.borrow();
+        let event = match repo.get_event(event_id) {
+            Some(ev) => ev,
+            None => return, // silently ignore missing events
+        };
+        let calendar = repo.get_calendar(event.calendar_id);
+        drop(repo);
+
+        let today = today_local();
+        popover.set_event(&event, calendar.as_ref(), today);
+
+        let rect = self.compute_widget_rect(chip_widget);
+        if let Some(r) = rect {
+            popover.set_pointing_to(Some(&r));
+        }
+        popover.popup();
+    }
+}
+
+// ── Free helper ──
+
+/// Read the local today date (no timezone conversion).  Falls back to a
+/// deterministic value if the local clock is unavailable.
+fn today_local() -> NaiveDate {
+    glib::DateTime::now_local()
+        .ok()
+        .and_then(|dt| {
+            NaiveDate::from_ymd_opt(dt.year(), dt.month() as u32, dt.day_of_month() as u32)
+        })
+        .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 7, 20).unwrap())
 }

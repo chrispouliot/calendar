@@ -3,6 +3,8 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo::rerun-if-changed=data/ui/window.blp");
     println!("cargo::rerun-if-changed=data/ui/common/date-chooser.blp");
+    println!("cargo::rerun-if-changed=data/ui/common/quick-add-popover.blp");
+    println!("cargo::rerun-if-changed=data/ui/common/event-popover.blp");
     println!("cargo::rerun-if-changed=data/ui/views/month-view.blp");
     println!("cargo::rerun-if-changed=data/style.css");
     println!("cargo::rerun-if-changed=data/resources.gresource.xml");
@@ -21,6 +23,8 @@ fn main() {
             "data/ui",
             "data/ui/window.blp",
             "data/ui/common/date-chooser.blp",
+            "data/ui/common/quick-add-popover.blp",
+            "data/ui/common/event-popover.blp",
             "data/ui/views/month-view.blp",
         ])
         .status()

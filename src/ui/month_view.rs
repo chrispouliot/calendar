@@ -7,10 +7,21 @@ use calendar::model::{Calendar, Event};
 use calendar::month_view::project_month;
 use calendar::weeks_buffer::{TOTAL_ROWS, VISIBLE_START, WeeksBuffer};
 use chrono::{Datelike, NaiveDate};
-use gtk::glib;
+use gtk::{gdk, glib, graphene};
+use uuid::Uuid;
 
-/// Callback type for day activation (re-click on already-selected day).
-type ActivateFn = Box<dyn Fn(NaiveDate)>;
+/// Callback type for day activation: first click on an empty day cell
+/// opens Quick Add.  Carries the (row, col) of the originating cell so
+/// the host can anchor the popover at that cell rather than as a
+/// free-floating dialog.  Days that contain event chips do not fire this
+/// callback — event-chip preview is handled by `on_event_activate`.
+type ActivateFn = Box<dyn Fn(usize, usize, NaiveDate)>;
+
+/// Callback type for event-chip activation: fired when the user clicks
+/// a chip widget inside a day cell.  Carries the event UUID and a
+/// reference to the chip widget so the host can resolve the event from
+/// the repository and anchor the preview popover at the chip.
+type EventActivateFn = Box<dyn Fn(uuid::Uuid, gtk::Widget)>;
 
 /// Callback type for dominant-month change (title update).
 type MonthChangedFn = Box<dyn Fn(i32, u32)>;
@@ -30,9 +41,6 @@ mod imp {
 
         /// Pure WeeksBuffer for date management; initialised in constructed().
         pub weeks_buffer: RefCell<WeeksBuffer>,
-
-        /// Selected date — `None` means nothing selected.
-        pub selected_date: Cell<Option<NaiveDate>>,
 
         /// Today (read from clock at construction).
         pub today_date: Cell<NaiveDate>,
@@ -63,8 +71,11 @@ mod imp {
         /// Callback fired when dominant month changes (for title update).
         pub on_month_changed: RefCell<Option<MonthChangedFn>>,
 
-        /// Callback fired when an already-selected empty day is re-clicked.
+        /// Callback fired on first click of an empty day cell (Quick Add).
         pub on_activate: RefCell<Option<ActivateFn>>,
+
+        /// Callback fired when a chip widget is clicked.
+        pub on_event_activate: RefCell<Option<EventActivateFn>>,
     }
 
     impl Default for MonthView {
@@ -76,7 +87,6 @@ mod imp {
                 weeks_buffer: RefCell::new(WeeksBuffer::new(
                     NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
                 )),
-                selected_date: Cell::new(None),
                 today_date: Cell::new(NaiveDate::from_ymd_opt(2026, 1, 5).unwrap()),
                 last_title_ym: Cell::new((2026, 1)),
                 cached_calendars: RefCell::new(Vec::new()),
@@ -89,6 +99,7 @@ mod imp {
                 initialized: Cell::new(false),
                 on_month_changed: RefCell::new(None),
                 on_activate: RefCell::new(None),
+                on_event_activate: RefCell::new(None),
             }
         }
     }
@@ -214,9 +225,6 @@ mod imp {
             let buf = WeeksBuffer::new(monday_of_week(today));
             *self.weeks_buffer.borrow_mut() = buf;
 
-            // No day selected initially.
-            self.selected_date.set(None);
-
             // ── Discrete scroll controller (mouse wheel snaps one week) ──
             // Sits at Capture phase. SMOOTH / KINETIC events pass through
             // untouched so the ScrolledWindow's native kinetic scrolling works.
@@ -299,15 +307,44 @@ impl MonthView {
         self.first_visible_week_ym()
     }
 
-    /// Currently selected date, if any.
-    pub fn selected_date(&self) -> Option<NaiveDate> {
-        self.imp().selected_date.get()
+    /// Register a callback invoked when a **first click** on an empty day
+    /// cell fires (the month view has no selection state).  The (row, col)
+    /// of the cell is supplied so the host can position popovers at the
+    /// originating day cell.  Days containing event chips do not fire this
+    /// callback — event-chip preview is handled by `on_event_activate`.
+    pub fn set_on_activate<F: Fn(usize, usize, NaiveDate) + 'static>(&self, f: F) {
+        *self.imp().on_activate.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Register a callback invoked when an already-selected day is re-clicked
-    /// (the quick-add placeholder activation path).
-    pub fn set_on_activate<F: Fn(NaiveDate) + 'static>(&self, f: F) {
-        *self.imp().on_activate.borrow_mut() = Some(Box::new(f));
+    /// Register a callback invoked when a chip widget is clicked inside
+    /// a day cell.  The (event_id, chip_widget) pair lets the host resolve
+    /// the event from the repository and anchor a preview popover at the
+    /// chip's on-screen location.
+    pub fn set_on_event_activate<F: Fn(Uuid, gtk::Widget) + 'static>(&self, f: F) {
+        *self.imp().on_event_activate.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// The pixel rectangle of the day cell at `row, col` in the coordinate
+    /// space of `target` (typically the application window).  Returns
+    /// `None` if the cell index is out of range or the transform fails.
+    pub fn day_cell_rect(
+        &self,
+        row: usize,
+        col: usize,
+        target: &impl IsA<gtk::Widget>,
+    ) -> Option<gdk::Rectangle> {
+        let imp = self.imp();
+        let idx = row.checked_mul(7)?.checked_add(col)?;
+        let buttons = imp.day_buttons.borrow();
+        let button = buttons.get(idx)?.clone();
+        drop(buttons);
+        let origin = button.compute_point(target, &graphene::Point::new(0.0, 0.0))?;
+        Some(gdk::Rectangle::new(
+            origin.x() as i32,
+            origin.y() as i32,
+            button.width(),
+            button.height(),
+        ))
     }
 
     /// Register a callback invoked when the viewport centre month changes
@@ -316,11 +353,11 @@ impl MonthView {
         *self.imp().on_month_changed.borrow_mut() = Some(Box::new(f));
     }
 
-    // ── Navigation (targets calendar months, clears selection) ──
+    // ── Navigation (targets calendar months) ──
 
     /// Navigate to the previous calendar month. The Monday on/before that
-    /// month's 1st becomes the first visible row's Monday.  Selection is
-    /// cleared and the viewport resets to its centred position.
+    /// month's 1st becomes the first visible row's Monday.  The viewport
+    /// resets to its centred position.
     pub fn navigate_previous(&self) {
         let (y, m) = self.viewport_center_ym();
         let (py, pm) = if m == 1 { (y - 1, 12u32) } else { (y, m - 1) };
@@ -335,13 +372,11 @@ impl MonthView {
     }
 
     /// Jump to today.  Today's week becomes the first visible week (refinement 2).
-    /// Selection is cleared.
     pub fn go_today(&self) {
         let imp = self.imp();
         let today = imp.today_date.get();
         let buf = WeeksBuffer::new(monday_of_week(today));
         *imp.weeks_buffer.borrow_mut() = buf;
-        imp.selected_date.set(None);
         self.reset_scroll_position();
         self.after_navigation();
         self.repopulate_rows();
@@ -360,7 +395,10 @@ impl MonthView {
 
 // ── Chip widget ──
 
-fn create_chip_widget(chip: &calendar::month_view::EventChip) -> gtk::Widget {
+fn create_chip_widget(
+    chip: &calendar::month_view::EventChip,
+    month_view_weak: &glib::WeakRef<MonthView>,
+) -> gtk::Widget {
     let hbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(3)
@@ -368,6 +406,7 @@ fn create_chip_widget(chip: &calendar::month_view::EventChip) -> gtk::Widget {
         .halign(gtk::Align::Start)
         .css_classes(["monthview-chip"])
         .build();
+    hbox.set_cursor_from_name(Some("pointer"));
 
     let dot = gtk::Label::builder()
         .label("\u{25CF}")
@@ -389,6 +428,29 @@ fn create_chip_widget(chip: &calendar::month_view::EventChip) -> gtk::Widget {
         .max_width_chars(12)
         .build();
     hbox.append(&title);
+
+    // Chip click → fire event-activation callback.  We capture the event_id
+    // and a weak MonthView reference so the closure can access the callback
+    // without owning the chip data past render.
+    let event_id = chip.event_id;
+    let mv_weak = month_view_weak.clone();
+    let hbox_weak = hbox.downgrade();
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_PRIMARY);
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    gesture.connect_pressed(|gesture, _n_press, _x, _y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    gesture.connect_released(move |gesture, _n_press, _x, _y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        if let Some(mv) = mv_weak.upgrade()
+            && let Some(hb) = hbox_weak.upgrade()
+            && let Some(cb) = mv.imp().on_event_activate.borrow().as_ref()
+        {
+            cb(event_id, hb.upcast::<gtk::Widget>());
+        }
+    });
+    hbox.add_controller(gesture);
 
     hbox.upcast()
 }
@@ -458,33 +520,34 @@ fn project_buffer_dates(
 // ── Private helpers on the outer MonthView ──
 
 impl MonthView {
+    /// Handle a click on the day cell at (row, col).
+    ///
+    /// If the cell has no event chips, fire the activation callback
+    /// immediately (first click → Quick Add).  Chips are handled
+    /// separately by the per-chip gesture controller, which intercepts
+    /// clicks at Capture phase before they reach this handler.
     fn handle_day_click(&self, row: usize, col: usize) {
         let imp = self.imp();
+        let idx = row * 7 + col;
+        let has_chips = imp
+            .chip_boxes
+            .borrow()
+            .get(idx)
+            .map(|chip_box| chip_box.first_child().is_some())
+            .unwrap_or(false);
+
+        if has_chips {
+            return; // individual chip gestures handle event preview
+        }
+
+        // First click on an empty day → open Quick Add.
         let buf = imp.weeks_buffer.borrow();
         let date = buf.row_dates(row)[col];
         drop(buf);
 
-        let sel = imp.selected_date.get();
-        let is_selected = sel == Some(date);
-
-        if is_selected {
-            let idx = row * 7 + col;
-            let is_empty = imp
-                .chip_boxes
-                .borrow()
-                .get(idx)
-                .is_none_or(|chip_box| chip_box.first_child().is_none());
-
-            if is_empty {
-                if let Some(cb) = imp.on_activate.borrow().as_ref() {
-                    cb(date);
-                }
-                return;
-            }
+        if let Some(cb) = imp.on_activate.borrow().as_ref() {
+            cb(row, col, date);
         }
-
-        imp.selected_date.set(Some(date));
-        self.refresh_cell_styles();
     }
 
     // ── Viewport-centre helpers ──
@@ -551,14 +614,12 @@ impl MonthView {
     // ── Navigation internals ──
 
     /// Set the WeeksBuffer so the Monday on/before the given month's 1st is
-    /// the first visible row's Monday.  Selection cleared, scroll reset,
-    /// title callback fired.
+    /// the first visible row's Monday.  Scroll reset, title callback fired.
     fn set_buffer_to_month(&self, year: i32, month: u32) {
         let imp = self.imp();
         let first_of = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month target");
         let first_visible = monday_of_week(first_of);
         *imp.weeks_buffer.borrow_mut() = WeeksBuffer::new(first_visible);
-        imp.selected_date.set(None);
         self.reset_scroll_position();
         self.after_navigation();
         self.repopulate_rows();
@@ -601,13 +662,14 @@ impl MonthView {
         let calendars = imp.cached_calendars.borrow();
         let events = imp.cached_events.borrow();
 
+        let month_view_weak = self.downgrade();
+
         let buf = imp.weeks_buffer.borrow();
         let all_projections = project_buffer_dates(&buf, &calendars, &events);
         let projection_map: HashMap<NaiveDate, &DayProjection> =
             all_projections.iter().map(|d| (d.date, d)).collect();
         let (dom_y, dom_m) = self.ref_year_month();
         let today = imp.today_date.get();
-        let sel = imp.selected_date.get();
         drop(buf);
 
         for chip_box in imp.chip_boxes.borrow().iter() {
@@ -663,7 +725,7 @@ impl MonthView {
                             chip_box.append(&overflow_label);
                             break;
                         }
-                        let chip_widget = create_chip_widget(chip);
+                        let chip_widget = create_chip_widget(chip, &month_view_weak);
                         chip_box.append(&chip_widget);
                     }
                 }
@@ -676,9 +738,6 @@ impl MonthView {
                     }
                     if date == today {
                         classes.push("today");
-                    }
-                    if Some(date) == sel {
-                        classes.push("selected");
                     }
                     // Month-boundary separator classes (refinement 3).
                     let day = date.day();
@@ -696,14 +755,12 @@ impl MonthView {
 
     /// Reapply CSS classes to all 105 buttons and their day labels without
     /// touching chips or day numbers.  Separator and first-day classes are
-    /// recomputed so scrolling/recycling/selection/title-month changes cannot
-    /// strip them.
+    /// recomputed so scrolling/recycling/title-month changes cannot strip them.
     fn refresh_cell_styles(&self) {
         let imp = self.imp();
         let buf = imp.weeks_buffer.borrow();
         let (dom_y, dom_m) = self.ref_year_month();
         let today = imp.today_date.get();
-        let sel = imp.selected_date.get();
         let buttons = imp.day_buttons.borrow();
 
         for row in 0..TOTAL_ROWS {
@@ -717,9 +774,6 @@ impl MonthView {
                     }
                     if date == today {
                         classes.push("today");
-                    }
-                    if Some(date) == sel {
-                        classes.push("selected");
                     }
                     // Month-boundary separator classes (refinement 3).
                     let day = date.day();

@@ -48,6 +48,47 @@ pub struct RecurrenceSpec;
 pub struct ReminderSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyQuickAddTitle;
+
+/// Build the base all-day one-day `Event` for a quick-add popover.
+///
+/// Pure: no clock, no ID generation (caller supplies both UUIDs), no
+/// GTK, no repository writes. The `title` is trimmed; a title that
+/// is empty after trimming is rejected with `EmptyQuickAddTitle`.
+/// The result has empty `location`/`description`, no `recurrence`,
+/// no `reminders`, and an `AllDay` schedule spanning exactly
+/// `date..date+1 day` as an exclusive end.
+pub fn new_quick_add_event(
+    event_id: Uuid,
+    calendar_id: Uuid,
+    title: &str,
+    date: NaiveDate,
+) -> Result<Event, EmptyQuickAddTitle> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(EmptyQuickAddTitle);
+    }
+
+    let next_day = date
+        .succ_opt()
+        .expect("NaiveDate::succ_opt never fails for valid dates");
+
+    Ok(Event {
+        id: event_id,
+        calendar_id,
+        title: trimmed.to_string(),
+        location: String::new(),
+        description: String::new(),
+        schedule: EventSchedule::AllDay {
+            start_date: date,
+            end_date_exclusive: next_day,
+        },
+        recurrence: None,
+        reminders: Vec::new(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DateTimeRange {
     pub start: DateTime<FixedOffset>,
     pub end: DateTime<FixedOffset>,

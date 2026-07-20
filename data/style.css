@@ -111,15 +111,6 @@ calendar-view.month-view button.monthview-cell.separator-side {
   border-left-color: alpha(currentColor, 0.3);
 }
 
-calendar-view.month-view button.monthview-cell.selected {
-  background-color: alpha(var(--accent-bg-color), 0.15);
-}
-
-calendar-view.month-view button.monthview-cell.selected .monthview-day-label {
-  color: var(--accent-color);
-  font-weight: bold;
-}
-
 calendar-view.month-view button.monthview-cell.other-month .monthview-day-label {
   color: alpha(currentColor, 0.35);
 }
@@ -142,8 +133,7 @@ calendar-view.month-view button.monthview-cell.other-month .monthview-day-label.
 /* Today accent — final effective override for all combinations.
    Placed last so any specificity tie is won by source order. */
 calendar-view.month-view button.monthview-cell.today .monthview-day-label,
-calendar-view.month-view button.monthview-cell.today.other-month .monthview-day-label,
-calendar-view.month-view button.monthview-cell.today.selected .monthview-day-label {
+calendar-view.month-view button.monthview-cell.today.other-month .monthview-day-label {
   color: var(--accent-fg-color);
   background-color: var(--accent-bg-color);
   font-weight: 700;
@@ -158,4 +148,31 @@ calendar-view.month-view .monthview-day-label {
 calendar-view.month-view .monthview-overflow {
   font-weight: bold;
   color: alpha(currentColor, 0.6);
+}
+
+/* ── Quick-Add popover ──
+ *
+ * The popover template uses these style hooks to paint calendar
+ * swatches and highlight blank-title validation errors. */
+
+.calendar-color-swatch {
+  border-radius: 50%;
+  background-color: var(--dim-label-color, currentColor);
+}
+
+.calendar-color-swatch.calendar-color-1 { background-color: #3366cc; }
+.calendar-color-swatch.calendar-color-2 { background-color: #cc3333; }
+.calendar-color-swatch.calendar-color-3 { background-color: #33aa55; }
+.calendar-color-swatch.calendar-color-4 { background-color: #dd8833; }
+.calendar-color-swatch.calendar-color-5 { background-color: #9966cc; }
+.calendar-color-swatch.calendar-color-6 { background-color: #339999; }
+.calendar-color-swatch.calendar-color-7 { background-color: #999999; }
+
+/* Adwaita EntryRow error state for the title. */
+adw-entry-row.error {
+  box-shadow: 0 0 0 1px var(--error-color) inset;
+}
+
+label.no-events {
+  font-style: italic;
 }
