@@ -102,6 +102,12 @@
                 pkgs.libadwaita
               ];
 
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.glib
+              pkgs.gtk4
+              pkgs.libadwaita
+            ];
+
             shellHook = ''
               export XDG_DATA_DIRS="${xdgDataDirs}''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
 

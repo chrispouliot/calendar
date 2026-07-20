@@ -1,0 +1,44 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $DateChooser: Adw.Bin {
+  Box {
+    orientation: vertical;
+    spacing: 0;
+    css-name: "datechooser";
+
+    CenterBox navigator {
+      [start]
+      Button prev_button {
+        icon-name: "go-previous-symbolic";
+        tooltip-text: "Previous Month";
+      }
+
+      [center]
+      Label month_label {
+        css-classes: ["heading"];
+      }
+
+      [end]
+      Button next_button {
+        icon-name: "go-next-symbolic";
+        tooltip-text: "Next Month";
+      }
+    }
+
+    Grid headers_grid {
+      row-homogeneous: true;
+      column-homogeneous: true;
+      margin-start: 12;
+      margin-end: 12;
+    }
+
+    Grid day_grid {
+      row-homogeneous: true;
+      column-homogeneous: true;
+      margin-start: 12;
+      margin-end: 12;
+      margin-bottom: 12;
+    }
+  }
+}

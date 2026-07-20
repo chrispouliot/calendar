@@ -1,3 +1,65 @@
+mod ui;
+mod window;
+
+use adw::prelude::*;
+use adw::{Application, gio};
+use gtk::gdk;
+
+const APP_ID: &str = "dev.chris.calendar";
+
 fn main() {
-    println!("Hello, world!");
+    // Register embedded GResource before any template loading.
+    gio::resources_register_include!("calendar.gresource").expect("Failed to register GResource");
+
+    let app = Application::new(Some(APP_ID), gio::ApplicationFlags::empty());
+
+    add_application_actions(&app);
+    app.connect_activate(build_ui);
+
+    app.run();
+}
+
+fn build_ui(app: &Application) {
+    load_css();
+    let win = window::CalendarWindow::new(app);
+    gtk::prelude::GtkWindowExt::present(&win);
+}
+
+fn load_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_resource("/dev/chris/calendar/style.css");
+
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
+fn add_application_actions(app: &Application) {
+    let quit = gio::SimpleAction::new("quit", None);
+    let app_clone = app.clone();
+    quit.connect_activate(move |_, _| {
+        app_clone.quit();
+    });
+    app.add_action(&quit);
+    app.set_accels_for_action("app.quit", &["<primary>q"]);
+
+    let about = gio::SimpleAction::new("about", None);
+    let app_clone = app.clone();
+    about.connect_activate(move |_, _| {
+        let about_window = adw::AboutWindow::new();
+        about_window.set_application_name("Calendar");
+        about_window.set_application_icon(APP_ID);
+        about_window.set_version("0.1.0");
+
+        if let Some(window) = app_clone.active_window() {
+            about_window.set_transient_for(Some(&window));
+        }
+
+        about_window.present();
+    });
+    app.add_action(&about);
 }

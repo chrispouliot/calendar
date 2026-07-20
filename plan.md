@@ -507,22 +507,22 @@ data/
 
 Goal: launch a real Adwaita app window.
 
-Status: Not started
+Status: In progress
 
 Tasks:
 
-- [ ] Replace `src/main.rs` hello world with an `adw::Application`.
-- [ ] Choose an application ID.
-- [ ] Add startup/activate handling.
-- [ ] Add initial actions:
-  - [ ] quit
-  - [ ] about
+- [x] Replace `src/main.rs` hello world with an `adw::Application`.
+- [x] Choose an application ID.
+- [x] Add startup/activate handling.
+- [x] Add initial actions:
+  - [x] quit
+  - [x] about
   - [ ] new-event
   - [ ] today
   - [ ] next-date
   - [ ] previous-date
   - [ ] change-view
-- [ ] Add a placeholder `ApplicationWindow`.
+- [x] Add a placeholder `ApplicationWindow`.
 
 Verification:
 
@@ -537,22 +537,24 @@ Expected result: a blank Libadwaita window launches.
 
 Goal: use Blueprint templates and embedded GResources like GNOME Calendar.
 
-Status: Not started
+Status: Complete
 
 Tasks:
 
-- [ ] Add `build.rs`.
-- [ ] Add `blueprint-compiler` invocation.
-- [ ] Add `data/resources.gresource.xml`.
-- [ ] Add `data/ui/window.blp`.
-- [ ] Register resources at application startup.
-- [ ] Convert the window to a `CompositeTemplate` loaded from resource.
+- [x] Add `build.rs`.
+- [x] Add `blueprint-compiler` invocation.
+- [x] Add `data/resources.gresource.xml`.
+- [x] Add `data/ui/window.blp`.
+- [x] Register resources at application startup.
+- [x] Convert the window to a `CompositeTemplate` loaded from resource.
 
 Verification:
 
 ```text
-cargo check
-cargo run
+cargo check      (passes)
+cargo fmt --all --check  (passes)
+cargo clippy --all-targets --all-features -- -D warnings  (passes)
+cargo run        (passes manual runtime verification)
 ```
 
 Expected result: the app launches from a Blueprint-defined window.
@@ -561,42 +563,49 @@ Expected result: the app launches from a Blueprint-defined window.
 
 Goal: mirror GNOME Calendar's structural UI.
 
-Status: Not started
+Status: Complete
 
 Tasks:
 
-- [ ] Add main window layout:
-  - [ ] `Adw.ApplicationWindow`
-  - [ ] `Adw.ToastOverlay`
-  - [ ] `Adw.OverlaySplitView`
-  - [ ] sidebar
-  - [ ] `Adw.ToolbarView`
-  - [ ] `Adw.HeaderBar`
-  - [ ] `Adw.ViewStack`
-- [ ] Add placeholder pages:
-  - [ ] Month
-  - [ ] Week
-  - [ ] Agenda
-- [ ] Add header controls:
-  - [ ] previous
-  - [ ] today
-  - [ ] next
-  - [ ] view switcher
-  - [ ] new event
-  - [ ] search placeholder
-  - [ ] menu placeholder
-- [ ] Add sidebar placeholders:
-  - [ ] mini date chooser
-  - [ ] calendar list
+- [x] Add main window layout:
+  - [x] `Adw.ApplicationWindow` (was baseline; unchanged)
+  - [x] `Adw.ToastOverlay`
+  - [x] `Adw.OverlaySplitView`
+  - [x] sidebar
+  - [x] `Adw.ToolbarView`
+  - [x] `Adw.HeaderBar`
+  - [x] `Adw.ViewStack`
+- [x] Add placeholder pages:
+  - [x] Month (icon + label placeholder)
+  - [x] Week (icon + label placeholder)
+  - [x] Agenda (icon + label placeholder)
+- [x] Add header controls:
+  - [x] previous (button with action `win.previous-date`)
+  - [x] today (button with action `win.today`)
+  - [x] next (button with action `win.next-date`)
+  - [x] view switcher (`Adw.ViewSwitcher` bound to stack)
+  - [x] new event (button with action `win.new-event`)
+  - [x] search placeholder (button in header bar end)
+  - [x] menu placeholder (`PopoverMenu` with About and Quit)
+- [x] Add sidebar placeholders:
+  - [x] custom Adwaita-style mini date chooser with month navigation and selection
+  - [x] calendar list (heading + "No calendars yet" label)
+- [x] Sidebar toggle works via property bind on `split_view.show-sidebar`
+- [x] Responsive breakpoint (max-width: 700sp): collapses split view, narrows view switcher
+- [x] Window actions registered as no-ops for `win.previous-date`, `win.next-date`, `win.today`, `win.new-event`
 
 Verification:
 
 ```text
-cargo check
-cargo run
+cargo check            (passes)
+cargo fmt --all --check (passes)
+cargo clippy --all-targets --all-features -- -D warnings  (passes)
+cargo run              (passes manual runtime verification)
 ```
 
 Expected result: window visually resembles GNOME Calendar's layout with placeholder views.
+
+Note: Actions have no behaviour yet; wiring to real navigation/event-creation will come in later phases.
 
 ### Phase 4: Core model and in-memory backend
 

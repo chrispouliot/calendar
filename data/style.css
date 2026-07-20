@@ -1,0 +1,44 @@
+/* Date chooser styling */
+
+datechooser {
+  padding: 6px;
+}
+
+datechooser navigator label {
+  font-weight: bold;
+}
+
+datechooser .weekday {
+  color: alpha(currentColor, 0.55);
+  font-size: smaller;
+  font-weight: bold;
+}
+
+datechooser button.flat.circular {
+  font-size: 10pt;
+  font-weight: normal;
+  min-height: 26px;
+  min-width: 26px;
+  margin: 2px;
+  padding: 3px;
+  transition: none;
+}
+
+datechooser button.flat.circular.selected {
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+  font-weight: bold;
+}
+
+datechooser button.flat.circular.today {
+  color: var(--accent-color);
+}
+
+datechooser button.flat.circular.today.selected {
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+}
+
+datechooser button.flat.circular.other-month {
+  color: alpha(currentColor, 0.35);
+}

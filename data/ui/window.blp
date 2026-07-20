@@ -1,0 +1,233 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $CalendarWindow: Adw.ApplicationWindow {
+  title: "Calendar";
+  default-width: 900;
+  default-height: 650;
+  width-request: 360;
+  height-request: 600;
+
+  Adw.ToastOverlay overlay {
+    child: Adw.OverlaySplitView split_view {
+      pin-sidebar: true;
+      show-sidebar: false;
+
+      [sidebar]
+      Adw.ToolbarView {
+        [top]
+        Adw.HeaderBar {}
+
+        Box {
+          orientation: vertical;
+          spacing: 8;
+
+          Adw.Bin date_chooser_bin {
+            vexpand: false;
+          }
+
+          Label {
+            label: "Calendars";
+            css-classes: ["heading"];
+            halign: start;
+            margin-start: 12;
+            margin-top: 16;
+            margin-bottom: 4;
+          }
+
+          Label {
+            label: "No calendars yet";
+            css-classes: ["dim-label"];
+            halign: start;
+            margin-start: 12;
+          }
+        }
+      }
+
+      [content]
+      Adw.ToolbarView main_toolbar {
+        styles ["view"]
+
+        [top]
+        Adw.HeaderBar header_bar {
+          [start]
+          ToggleButton sidebar_button {
+            icon-name: "sidebar-show-symbolic";
+            tooltip-text: "Toggle Sidebar";
+            active: bind split_view.show-sidebar bidirectional;
+          }
+
+          title-widget: Label {
+            label: "Calendar";
+            css-classes: ["title"];
+          };
+
+          [end]
+          Button search_button {
+            icon-name: "edit-find-symbolic";
+            tooltip-text: "Search";
+          }
+
+          [end]
+          MenuButton menu_button {
+            icon-name: "open-menu-symbolic";
+            tooltip-text: "Main Menu";
+            primary: true;
+            popover: win_menu;
+          }
+        }
+
+        Adw.ViewStack views_stack {
+          hexpand: true;
+          vexpand: true;
+
+          Adw.ViewStackPage month_page {
+            name: "month";
+            title: "_Month";
+            use-underline: true;
+            icon-name: "calendar-month-symbolic";
+
+            child: Box {
+              orientation: vertical;
+              vexpand: true;
+              valign: center;
+              halign: center;
+              spacing: 12;
+
+              Image {
+                icon-name: "calendar-month-symbolic";
+                pixel-size: 64;
+              }
+
+              Label {
+                label: "Month View";
+                css-classes: ["title-1"];
+              }
+            };
+          }
+
+          Adw.ViewStackPage week_page {
+            name: "week";
+            title: "_Week";
+            use-underline: true;
+            icon-name: "calendar-week-symbolic";
+
+            child: Box {
+              orientation: vertical;
+              vexpand: true;
+              valign: center;
+              halign: center;
+              spacing: 12;
+
+              Image {
+                icon-name: "calendar-week-symbolic";
+                pixel-size: 64;
+              }
+
+              Label {
+                label: "Week View";
+                css-classes: ["title-1"];
+              }
+            };
+          }
+
+          Adw.ViewStackPage agenda_page {
+            name: "agenda";
+            title: "_Agenda";
+            use-underline: true;
+            icon-name: "calendar-agenda-symbolic";
+
+            child: Box {
+              orientation: vertical;
+              vexpand: true;
+              valign: center;
+              halign: center;
+              spacing: 12;
+
+              Image {
+                icon-name: "calendar-agenda-symbolic";
+                pixel-size: 64;
+              }
+
+              Label {
+                label: "Agenda View";
+                css-classes: ["title-1"];
+              }
+            };
+          }
+        }
+
+        [bottom]
+        ActionBar {
+          [start]
+          Button previous_date_button {
+            icon-name: "go-previous-symbolic";
+            tooltip-text: "Previous";
+            action-name: "win.previous-date";
+          }
+
+          [start]
+          Button next_date_button {
+            icon-name: "go-next-symbolic";
+            tooltip-text: "Next";
+            action-name: "win.next-date";
+          }
+
+          [start]
+          Button today_button {
+            child: Adw.ButtonContent {
+              label: "_Today";
+              use-underline: true;
+              icon-name: "calendar-today-symbolic";
+              can-shrink: true;
+              tooltip-text: "Go to Today";
+            };
+            action-name: "win.today";
+          }
+
+          [center]
+          Adw.ViewSwitcher view_switcher {
+            stack: views_stack;
+            policy: wide;
+          }
+
+          [end]
+          Button new_event_button {
+            icon-name: "list-add-symbolic";
+            tooltip-text: "Add Event";
+            action-name: "win.new-event";
+          }
+        }
+      }
+    };
+  }
+
+  Adw.Breakpoint {
+    condition ("max-width: 700sp")
+
+    setters {
+      split_view.collapsed: true;
+      view_switcher.policy: narrow;
+    }
+  }
+}
+
+PopoverMenu win_menu {
+  menu-model: menu;
+}
+
+menu menu {
+  section {
+    item {
+      label: "_About Calendar";
+      action: "app.about";
+    }
+  }
+
+  section {
+    item {
+      label: "_Quit";
+      action: "app.quit";
+    }
+  }
+}
