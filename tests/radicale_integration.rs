@@ -72,6 +72,11 @@ fn phase11_discovers_calendar_created_on_radicale() {
         work.writable,
         "owner_only must grant Ada write access to Work"
     );
+    let initial_sync_token = work
+        .sync_token
+        .clone()
+        .filter(|token| !token.is_empty())
+        .expect("Work must provide an initial nonempty sync token");
 
     let resource_url = format!("{work_url}standup.ics");
     let response = reqwest::blocking::Client::new()
@@ -113,14 +118,20 @@ fn phase11_discovers_calendar_created_on_radicale() {
         .upsert_calendar_sync_state(&CalendarSyncState {
             calendar_id: calendar.id,
             remote_url: work_url.clone(),
-            sync_token: None,
+            sync_token: Some(initial_sync_token.clone()),
         })
         .unwrap();
 
     let client = CaldavClient::new(fixture.origin(), "ada".into(), "testpass".into());
     let imported = pull_calendar_snapshot(&client, &mut repository, calendar.id)
-        .expect("pulling Radicale's complete snapshot must import the event");
+        .expect("incrementally pulling Radicale's changes must import the event");
     assert_eq!(imported.added, 1);
+    let imported_sync_token = repository
+        .get_calendar_sync_state(calendar.id)
+        .and_then(|state| state.sync_token)
+        .filter(|token| !token.is_empty())
+        .expect("incremental pull must persist Radicale's advanced nonempty sync token");
+    assert_ne!(imported_sync_token, initial_sync_token);
     let state = repository
         .find_event_sync_state_by_remote_href(calendar.id, &resource_url)
         .expect("imported event must have state keyed by its absolute resource URL");
@@ -159,10 +170,16 @@ fn phase11_discovers_calendar_created_on_radicale() {
     );
 
     let emptied = pull_calendar_snapshot(&client, &mut repository, calendar.id)
-        .expect("pulling Radicale's empty complete snapshot must reconcile deletion");
+        .expect("incrementally pulling Radicale's deletion must reconcile the event");
     assert_eq!(emptied.deleted, 1);
     assert!(repository.get_event(state.event_id).is_none());
     assert!(repository.get_event_sync_state(state.event_id).is_none());
+    let deleted_sync_token = repository
+        .get_calendar_sync_state(calendar.id)
+        .and_then(|state| state.sync_token)
+        .filter(|token| !token.is_empty())
+        .expect("incremental deletion pull must persist Radicale's advanced nonempty sync token");
+    assert_ne!(deleted_sync_token, imported_sync_token);
 
     let event_id = Uuid::parse_str("e1100310-0000-0000-0000-000000000001").unwrap();
     let remote_uid = "pending-lifecycle-2026@example.test";
@@ -201,6 +218,12 @@ fn phase11_discovers_calendar_created_on_radicale() {
 
     pull_calendar_snapshot(&client, &mut repository, calendar.id)
         .expect("pulling after create must obtain Radicale's current ETag");
+    let created_sync_token = repository
+        .get_calendar_sync_state(calendar.id)
+        .and_then(|state| state.sync_token)
+        .filter(|token| !token.is_empty())
+        .expect("pull after create must retain Radicale's nonempty sync token");
+    assert_ne!(created_sync_token, deleted_sync_token);
     let created_state = repository
         .get_event_sync_state(event_id)
         .expect("the created event must remain synchronized after pull");
@@ -242,6 +265,12 @@ fn phase11_discovers_calendar_created_on_radicale() {
 
     pull_calendar_snapshot(&client, &mut repository, calendar.id)
         .expect("pulling after update must obtain Radicale's current ETag");
+    let updated_sync_token = repository
+        .get_calendar_sync_state(calendar.id)
+        .and_then(|state| state.sync_token)
+        .filter(|token| !token.is_empty())
+        .expect("pull after update must retain Radicale's nonempty sync token");
+    assert_ne!(updated_sync_token, created_sync_token);
     let updated_state = repository
         .get_event_sync_state(event_id)
         .expect("updated event must retain sync state");

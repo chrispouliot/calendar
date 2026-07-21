@@ -42,13 +42,34 @@ pub fn pull_calendar_snapshot(
     let sync_state = repository
         .get_calendar_sync_state(calendar_id)
         .ok_or(PullSyncError::MissingCalendarSyncState)?;
-    let resources = client
-        .fetch_resources(&sync_state.remote_url)
-        .map_err(PullSyncError::Caldav)?;
 
-    repository
-        .reconcile_remote_snapshot(calendar_id, &resources)
-        .map_err(PullSyncError::Repository)
+    let Some(sync_token) = sync_state
+        .sync_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    else {
+        let resources = client
+            .fetch_resources(&sync_state.remote_url)
+            .map_err(PullSyncError::Caldav)?;
+        return repository
+            .reconcile_remote_snapshot(calendar_id, &resources)
+            .map_err(PullSyncError::Repository);
+    };
+
+    match client.fetch_changes(&sync_state.remote_url, sync_token) {
+        Ok(changes) => repository
+            .reconcile_remote_changes(calendar_id, &changes)
+            .map_err(PullSyncError::Repository),
+        Err(CaldavError::HttpStatus { status: 403 }) => {
+            let resources = client
+                .fetch_resources(&sync_state.remote_url)
+                .map_err(PullSyncError::Caldav)?;
+            repository
+                .reconcile_remote_snapshot_clearing_sync_token(calendar_id, &resources)
+                .map_err(PullSyncError::Repository)
+        }
+        Err(error) => Err(PullSyncError::Caldav(error)),
+    }
 }
 
 /// Push durable local changes to CalDAV in repository order.

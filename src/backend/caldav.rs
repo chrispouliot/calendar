@@ -4,9 +4,10 @@ use icalendar::{
     Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, EventLike,
 };
 use quick_xml::escape::unescape;
-use quick_xml::events::Event as XmlEvent;
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event as XmlEvent};
 use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
+use quick_xml::writer::Writer;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, USER_AGENT};
 use reqwest::{Method, Url};
@@ -39,6 +40,7 @@ pub struct CaldavDiscovery {
 
 #[derive(Debug)]
 pub enum CaldavError {
+    InvalidSyncToken,
     HttpStatus { status: u16 },
     Transport,
     Url,
@@ -48,6 +50,7 @@ pub enum CaldavError {
 impl std::fmt::Display for CaldavError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidSyncToken => write!(formatter, "sync token must not be blank"),
             Self::HttpStatus { status } => {
                 write!(formatter, "CalDAV request returned HTTP {status}")
             }
@@ -135,6 +138,27 @@ impl CaldavClient {
             resource.href = resolve_href(&calendar_url, &resource.href)?.to_string();
         }
         Ok(resources)
+    }
+
+    pub fn fetch_changes(
+        &self,
+        calendar_url: &str,
+        prior_sync_token: &str,
+    ) -> Result<SyncCollection, CaldavError> {
+        if prior_sync_token.trim().is_empty() {
+            return Err(CaldavError::InvalidSyncToken);
+        }
+        let calendar_url = Url::parse(calendar_url)
+            .map_err(|_| CaldavError::Url)
+            .and_then(validate_http_url)?;
+        let client = self.http_client()?;
+        let body = sync_collection_request(prior_sync_token)?;
+        let response = self.request_method(&client, REPORT, &calendar_url, "1", &body)?;
+        let mut collection = parse_sync_collection(&response).map_err(CaldavError::Xml)?;
+        for change in &mut collection.changes {
+            change.href = resolve_href(&calendar_url, &change.href)?.to_string();
+        }
+        Ok(collection)
     }
 
     pub fn create_resource(
@@ -300,6 +324,65 @@ fn response_body(response: reqwest::blocking::Response) -> Result<String, Caldav
 
 fn resolve_href(base: &Url, href: &str) -> Result<Url, CaldavError> {
     base.join(href).map_err(|_| CaldavError::Url)
+}
+
+fn sync_collection_request(prior_sync_token: &str) -> Result<String, CaldavError> {
+    let mut writer = Writer::new(Vec::new());
+    writer
+        .write_event(XmlEvent::Decl(BytesDecl::new("1.0", Some("utf-8"), None)))
+        .map_err(sync_request_error)?;
+
+    let mut root = BytesStart::new("d:sync-collection");
+    root.push_attribute(("xmlns:d", "DAV:"));
+    root.push_attribute(("xmlns:c", "urn:ietf:params:xml:ns:caldav"));
+    writer
+        .write_event(XmlEvent::Start(root))
+        .map_err(sync_request_error)?;
+
+    writer
+        .write_event(XmlEvent::Start(BytesStart::new("d:sync-token")))
+        .map_err(sync_request_error)?;
+    writer
+        .write_event(XmlEvent::Text(BytesText::new(prior_sync_token)))
+        .map_err(sync_request_error)?;
+    writer
+        .write_event(XmlEvent::End(BytesEnd::new("d:sync-token")))
+        .map_err(sync_request_error)?;
+
+    writer
+        .write_event(XmlEvent::Start(BytesStart::new("d:sync-level")))
+        .map_err(sync_request_error)?;
+    writer
+        .write_event(XmlEvent::Text(BytesText::new("1")))
+        .map_err(sync_request_error)?;
+    writer
+        .write_event(XmlEvent::End(BytesEnd::new("d:sync-level")))
+        .map_err(sync_request_error)?;
+
+    writer
+        .write_event(XmlEvent::Start(BytesStart::new("d:prop")))
+        .map_err(sync_request_error)?;
+    write_empty_element(&mut writer, "d:getetag")?;
+    write_empty_element(&mut writer, "c:calendar-data")?;
+    writer
+        .write_event(XmlEvent::End(BytesEnd::new("d:prop")))
+        .map_err(sync_request_error)?;
+    writer
+        .write_event(XmlEvent::End(BytesEnd::new("d:sync-collection")))
+        .map_err(sync_request_error)?;
+
+    String::from_utf8(writer.into_inner())
+        .map_err(|_| CaldavError::Xml(malformed("generated sync request is not UTF-8")))
+}
+
+fn write_empty_element(writer: &mut Writer<Vec<u8>>, name: &str) -> Result<(), CaldavError> {
+    writer
+        .write_event(XmlEvent::Empty(BytesStart::new(name)))
+        .map_err(sync_request_error)
+}
+
+fn sync_request_error(error: std::io::Error) -> CaldavError {
+    CaldavError::Xml(malformed(&error.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -627,6 +710,12 @@ pub struct ResourceRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncCollection {
+    pub sync_token: String,
+    pub changes: Vec<ResourceRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError(String);
 
 impl std::fmt::Display for ParseError {
@@ -656,6 +745,30 @@ pub fn parse_multistatus(xml: &str) -> Result<Vec<ResourceRecord>, ParseError> {
     let root = parse_xml(xml)?;
     let responses = multistatus_responses(&root)?;
     Ok(responses.into_iter().map(resource_record).collect())
+}
+
+pub fn parse_sync_collection(xml: &str) -> Result<SyncCollection, ParseError> {
+    let root = parse_xml(xml)?;
+    let responses = multistatus_responses(&root)?;
+    let mut sync_tokens = root
+        .children
+        .iter()
+        .filter(|child| child.is_named(NamespaceKind::Dav, b"sync-token"));
+    let sync_token = sync_tokens
+        .next()
+        .ok_or_else(|| malformed("missing root DAV:sync-token"))?
+        .text_value();
+    if sync_tokens.next().is_some() {
+        return Err(malformed("multiple root DAV:sync-token elements"));
+    }
+    if sync_token.trim().is_empty() {
+        return Err(malformed("empty root DAV:sync-token"));
+    }
+
+    Ok(SyncCollection {
+        sync_token,
+        changes: responses.into_iter().map(resource_record).collect(),
+    })
 }
 
 pub fn parse_current_user_principal(xml: &str) -> Result<String, ParseError> {

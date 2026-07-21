@@ -232,12 +232,46 @@ impl SqliteRepository {
         calendar_id: Uuid,
         resources: &[super::caldav::ResourceRecord],
     ) -> Result<RemoteSnapshotSummary, RepositoryError> {
+        self.reconcile_remote_snapshot_inner(calendar_id, resources, false)
+    }
+
+    pub(crate) fn reconcile_remote_snapshot_clearing_sync_token(
+        &mut self,
+        calendar_id: Uuid,
+        resources: &[super::caldav::ResourceRecord],
+    ) -> Result<RemoteSnapshotSummary, RepositoryError> {
+        self.reconcile_remote_snapshot_inner(calendar_id, resources, true)
+    }
+
+    fn reconcile_remote_snapshot_inner(
+        &mut self,
+        calendar_id: Uuid,
+        resources: &[super::caldav::ResourceRecord],
+        clear_sync_token: bool,
+    ) -> Result<RemoteSnapshotSummary, RepositoryError> {
         let calendar = self.get_calendar(calendar_id).ok_or(RepositoryError)?;
         if !matches!(calendar.source, CalendarSource::CalDav { .. }) {
             return Err(RepositoryError);
         }
 
         let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let pending_operations = pending_sync_operations_in_transaction(&tx, calendar_id)?;
+        let pending_protected_hrefs: HashSet<String> = pending_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PendingSyncOperation::Update { remote_href, .. }
+                | PendingSyncOperation::Delete { remote_href, .. } => Some(remote_href.clone()),
+                PendingSyncOperation::Create { .. } => None,
+            })
+            .collect();
+        let pending_protected_event_ids: HashSet<Uuid> = pending_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PendingSyncOperation::Update { event_id, .. }
+                | PendingSyncOperation::Delete { event_id, .. } => Some(*event_id),
+                PendingSyncOperation::Create { .. } => None,
+            })
+            .collect();
         let tracked_states = {
             let mut statement = tx
                 .prepare(
@@ -268,6 +302,10 @@ impl SqliteRepository {
 
         for resource in resources {
             seen_hrefs.insert(resource.href.clone());
+            if pending_protected_hrefs.contains(&resource.href) {
+                summary.skipped += 1;
+                continue;
+            }
             let tracked = tracked_by_href.get(&resource.href);
 
             if resource.response_status == Some(404) {
@@ -322,10 +360,158 @@ impl SqliteRepository {
         }
 
         for state in &tracked_states {
-            if !seen_hrefs.contains(&state.remote_href) {
+            if !seen_hrefs.contains(&state.remote_href)
+                && !pending_protected_hrefs.contains(&state.remote_href)
+                && !pending_protected_event_ids.contains(&state.event_id)
+            {
                 delete_remote_event(&tx, state)?;
                 summary.deleted += 1;
+            } else if !seen_hrefs.contains(&state.remote_href)
+                && (pending_protected_hrefs.contains(&state.remote_href)
+                    || pending_protected_event_ids.contains(&state.event_id))
+            {
+                summary.skipped += 1;
             }
+        }
+
+        if clear_sync_token {
+            let updated = tx
+                .execute(
+                    "UPDATE sync_metadata
+                     SET sync_token = NULL
+                     WHERE calendar_id = ?1 AND remote_url IS NOT NULL",
+                    params![calendar_id],
+                )
+                .map_err(|_| RepositoryError)?;
+            if updated == 0 {
+                return Err(RepositoryError);
+            }
+        }
+
+        tx.commit().map_err(|_| RepositoryError)?;
+        Ok(summary)
+    }
+
+    pub fn reconcile_remote_changes(
+        &mut self,
+        calendar_id: Uuid,
+        changes: &super::caldav::SyncCollection,
+    ) -> Result<RemoteSnapshotSummary, RepositoryError> {
+        let calendar = self.get_calendar(calendar_id).ok_or(RepositoryError)?;
+        if !matches!(calendar.source, CalendarSource::CalDav { .. }) {
+            return Err(RepositoryError);
+        }
+        if self.get_calendar_sync_state(calendar_id).is_none()
+            || changes.sync_token.trim().is_empty()
+        {
+            return Err(RepositoryError);
+        }
+
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let pending_operations = pending_sync_operations_in_transaction(&tx, calendar_id)?;
+        let pending_protected_hrefs: HashSet<String> = pending_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PendingSyncOperation::Update { remote_href, .. }
+                | PendingSyncOperation::Delete { remote_href, .. } => Some(remote_href.clone()),
+                PendingSyncOperation::Create { .. } => None,
+            })
+            .collect();
+        let tracked_states = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT calendar_id, event_id, remote_href, remote_uid, etag
+                     FROM event_sync_metadata
+                     WHERE calendar_id = ?1",
+                )
+                .map_err(|_| RepositoryError)?;
+            statement
+                .query_map(params![calendar_id], event_sync_state_from_row)
+                .map_err(|_| RepositoryError)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| RepositoryError)?
+        };
+        let tracked_by_href: HashMap<String, EventSyncState> = tracked_states
+            .iter()
+            .cloned()
+            .map(|state| (state.remote_href.clone(), state))
+            .collect();
+
+        let mut summary = RemoteSnapshotSummary {
+            added: 0,
+            updated: 0,
+            deleted: 0,
+            skipped: 0,
+        };
+
+        for resource in &changes.changes {
+            if pending_protected_hrefs.contains(&resource.href) {
+                summary.skipped += 1;
+                continue;
+            }
+            let tracked = tracked_by_href.get(&resource.href);
+
+            if resource.response_status == Some(404) {
+                if let Some(state) = tracked {
+                    delete_remote_event(&tx, state)?;
+                    summary.deleted += 1;
+                } else {
+                    summary.skipped += 1;
+                }
+                continue;
+            }
+
+            if resource
+                .response_status
+                .is_some_and(|status| !(200..300).contains(&status))
+            {
+                summary.skipped += 1;
+                continue;
+            }
+
+            let Some(calendar_data) = resource.calendar_data.as_deref() else {
+                summary.skipped += 1;
+                continue;
+            };
+
+            let event_id = tracked.map_or_else(Uuid::new_v4, |state| state.event_id);
+            let mapped =
+                match super::caldav::map_icalendar_event(calendar_data, event_id, calendar_id) {
+                    Ok(mapped) => mapped,
+                    Err(_) => {
+                        summary.skipped += 1;
+                        continue;
+                    }
+                };
+            let state = EventSyncState {
+                calendar_id,
+                event_id,
+                remote_href: resource.href.clone(),
+                remote_uid: mapped.remote_uid,
+                etag: resource.etag.clone(),
+            };
+
+            if tracked.is_some() {
+                replace_remote_event(&tx, &mapped.event)?;
+                upsert_event_sync_state_in_transaction(&tx, &state)?;
+                summary.updated += 1;
+            } else {
+                insert_event(&tx, &mapped.event)?;
+                upsert_event_sync_state_in_transaction(&tx, &state)?;
+                summary.added += 1;
+            }
+        }
+
+        let updated = tx
+            .execute(
+                "UPDATE sync_metadata
+                 SET sync_token = ?1
+                 WHERE calendar_id = ?2 AND remote_url IS NOT NULL",
+                params![changes.sync_token, calendar_id],
+            )
+            .map_err(|_| RepositoryError)?;
+        if updated == 0 {
+            return Err(RepositoryError);
         }
 
         tx.commit().map_err(|_| RepositoryError)?;
@@ -1426,6 +1612,24 @@ fn pending_sync_operation_in_transaction(
     )
     .optional()
     .map_err(|_| RepositoryError)
+}
+
+fn pending_sync_operations_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    calendar_id: Uuid,
+) -> Result<Vec<PendingSyncOperation>, RepositoryError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT event_id, calendar_id, operation_kind, remote_href, remote_uid, base_etag
+             FROM pending_sync_operations
+             WHERE calendar_id = ?1",
+        )
+        .map_err(|_| RepositoryError)?;
+    statement
+        .query_map(params![calendar_id], pending_sync_operation_from_row)
+        .map_err(|_| RepositoryError)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| RepositoryError)
 }
 
 fn delete_pending_sync_operation_in_transaction(

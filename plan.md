@@ -1124,7 +1124,7 @@ Tasks:
 - [ ] Add recurrence mapping.
 - [x] Queue and upload supported local create/update/delete operations.
 - [x] Preserve pending local intent on ETag conflicts without overwriting remote data.
-- [ ] Add incremental sync-token reports.
+- [x] Add incremental sync-token reports with invalid-token fallback.
 
 Likely crates to evaluate:
 
@@ -1146,8 +1146,8 @@ metadata; authenticated DAV discovery; full-snapshot pulls; safe non-recurring
 iCalendar mapping/serialization; atomic local edit and SQLite reconciliation;
 conditional uploads; and conflict-preserving ETag handling. The ignored
 Radicale integration test verifies discovery, import, create, update, conflict,
-and deletion. Login UI/secret storage, recurrence mapping, incremental sync,
-and automatic scheduling remain.
+deletion, and incremental token advancement. Login UI/secret storage,
+recurrence mapping, and automatic scheduling remain.
 
 ### Phase 12: Reminders and notifications
 
