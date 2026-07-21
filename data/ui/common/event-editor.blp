@@ -1,0 +1,125 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $EventEditor: Adw.Dialog {
+  title: _("Event Details");
+  content-width: 560;
+  content-height: 680;
+
+  child: Box {
+    orientation: vertical;
+
+    Adw.HeaderBar {
+      title-widget: Label {
+        label: _("Event Details");
+        styles ["title"]
+      };
+    }
+
+    ScrolledWindow {
+      vexpand: true;
+      hscrollbar-policy: never;
+      child: Box {
+        orientation: vertical;
+        spacing: 18;
+        margin-top: 18;
+        margin-bottom: 18;
+        margin-start: 18;
+        margin-end: 18;
+
+        ListBox {
+          styles ["boxed-list"]
+
+          Adw.EntryRow title_entry {
+            title: _("Title");
+          }
+
+          Adw.EntryRow location_entry {
+            title: _("Location");
+          }
+
+          Adw.ComboRow calendar_row {
+            title: _("Calendar");
+          }
+        }
+
+        Adw.InlineViewSwitcher schedule_switcher {
+          stack: schedule_stack;
+          homogeneous: true;
+        }
+
+        Adw.ViewStack schedule_stack {
+          vhomogeneous: false;
+
+          Adw.ViewStackPage {
+            name: "all-day";
+            title: _("_All Day");
+            use-underline: true;
+
+            child: Adw.PreferencesGroup {
+              $DateChooserRow start_date_row {
+                title: _("Start Date");
+              }
+              $DateChooserRow end_date_row {
+                title: _("End Date");
+              }
+            };
+          }
+
+          Adw.ViewStackPage {
+            name: "time-slot";
+            title: _("_Time Slot");
+            use-underline: true;
+
+            child: Box {
+              orientation: vertical;
+              spacing: 12;
+
+              $DateTimeChooser start_date_time {}
+              $DateTimeChooser end_date_time {}
+            };
+          }
+        }
+
+        Label description_heading {
+          label: _("Description");
+          halign: start;
+          styles ["heading"]
+        }
+
+        TextView description_view {
+          top-margin: 8;
+          bottom-margin: 8;
+          left-margin: 10;
+          right-margin: 10;
+          wrap-mode: word_char;
+          height-request: 110;
+          accepts-tab: false;
+          styles ["card"]
+        }
+
+        Label error_label {
+          wrap: true;
+          xalign: 0.0;
+          css-classes: ["error"];
+          visible: false;
+        }
+      };
+    }
+
+    ActionBar {
+      [end]
+      Button cancel_button {
+        label: _("_Cancel");
+        use-underline: true;
+      }
+
+      [end]
+      Button save_button {
+        label: _("_Save");
+        use-underline: true;
+        styles ["suggested-action"]
+      }
+    }
+  };
+}

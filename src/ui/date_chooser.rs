@@ -1,8 +1,11 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::calendar_grid::{MonthCell, month_grid};
+use chrono::{Datelike, NaiveDate};
 use gtk::glib;
 use std::cell::{Cell, RefCell};
+
+type DateSelectedFn = Box<dyn Fn(NaiveDate)>;
 
 mod imp {
     use super::*;
@@ -40,6 +43,7 @@ mod imp {
 
         // Day buttons created once at construction.
         pub day_buttons: RefCell<Vec<gtk::Button>>,
+        pub on_date_selected: RefCell<Option<DateSelectedFn>>,
     }
 
     #[glib::object_subclass]
@@ -102,6 +106,12 @@ mod imp {
                             imp.display_month.set(cell.month);
 
                             imp.populate_grid();
+                            if let Some(callback) = imp.on_date_selected.borrow().as_ref()
+                                && let Some(date) =
+                                    NaiveDate::from_ymd_opt(cell.year, cell.month, cell.day)
+                            {
+                                callback(date);
+                            }
                         }
                     });
 
@@ -161,6 +171,29 @@ glib::wrapper! {
 impl DateChooser {
     pub fn new() -> Self {
         glib::Object::new()
+    }
+
+    pub fn set_date(&self, date: NaiveDate) {
+        let imp = self.imp();
+        imp.selected_year.set(date.year());
+        imp.selected_month.set(date.month());
+        imp.selected_day.set(date.day());
+        imp.display_year.set(date.year());
+        imp.display_month.set(date.month());
+        imp.populate_grid();
+    }
+
+    pub fn date(&self) -> Option<NaiveDate> {
+        let imp = self.imp();
+        NaiveDate::from_ymd_opt(
+            imp.selected_year.get(),
+            imp.selected_month.get(),
+            imp.selected_day.get(),
+        )
+    }
+
+    pub fn set_on_date_selected<F: Fn(NaiveDate) + 'static>(&self, callback: F) {
+        *self.imp().on_date_selected.borrow_mut() = Some(Box::new(callback));
     }
 
     fn previous_month(&self) {

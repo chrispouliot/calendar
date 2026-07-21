@@ -13,7 +13,6 @@ use uuid::Uuid;
 type SaveFn = Box<dyn Fn(String, Uuid, NaiveDate)>;
 
 /// Edit-Details callback: invoked when the user presses Edit Details.
-/// Phase 6 has no full editor — the host window shows a toast.
 type EditDetailsFn = Box<dyn Fn()>;
 
 mod imp {
@@ -276,9 +275,19 @@ impl QuickAddPopover {
         *self.imp().on_save.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Register the Edit Details placeholder callback.
+    /// Register the Edit Details callback.
     pub fn set_on_edit_details<F: Fn() + 'static>(&self, f: F) {
         *self.imp().on_edit_details.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Return the current create-mode values before the popover is closed.
+    pub fn details(&self) -> Option<(String, Uuid, NaiveDate)> {
+        let imp = self.imp();
+        Some((
+            imp.title_entry.text().to_string(),
+            (*imp.selected_calendar_id.borrow())?,
+            imp.current_date.get()?,
+        ))
     }
 }
 

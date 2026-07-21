@@ -1009,23 +1009,23 @@ remains visible and opens in the preview. (Passes.)
 
 Goal: complete GNOME Calendar's primary view set.
 
-Status: Not started
+Status: Complete
 
 Tasks:
 
-- [ ] Week view:
-  - [ ] seven-day columns
-  - [ ] hour rows
-  - [ ] all-day section
-  - [ ] timed event blocks
-- [ ] Agenda view:
-  - [ ] events grouped by day
-  - [ ] upcoming/range filtering
-- [ ] Shared view controller/trait:
-  - [ ] active date
-  - [ ] next/previous date
-  - [ ] event activation
-  - [ ] create event request
+- [x] Week view:
+  - [x] seven-day columns
+  - [x] hour rows
+  - [x] all-day section
+  - [x] timed event blocks
+- [x] Agenda view:
+  - [x] events grouped by day
+  - [x] upcoming/range filtering
+- [x] Shared view state and behavior:
+  - [x] active date
+  - [x] next/previous date
+  - [x] event activation
+  - [x] create event request
 
 Verification:
 
@@ -1035,6 +1035,9 @@ cargo run
 ```
 
 Manual check: switching views preserves active date and event visibility.
+
+Implemented and manually verified, including Week overlap layout/current-time
+rendering and bidirectional Agenda range loading with stable scroll anchoring.
 
 ### Phase 9: Detailed event editor
 

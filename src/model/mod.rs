@@ -50,6 +50,28 @@ pub struct ReminderSpec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmptyQuickAddTitle;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidEvent;
+
+/// Normalize and validate a complete event candidate before persistence.
+pub fn validate_event(mut candidate: Event) -> Result<Event, InvalidEvent> {
+    if candidate.title.trim().is_empty() {
+        return Err(InvalidEvent);
+    }
+
+    match &candidate.schedule {
+        EventSchedule::AllDay {
+            start_date,
+            end_date_exclusive,
+        } if end_date_exclusive <= start_date => return Err(InvalidEvent),
+        EventSchedule::Timed { start, end, .. } if end <= start => return Err(InvalidEvent),
+        _ => {}
+    }
+
+    candidate.title = candidate.title.trim().to_string();
+    Ok(candidate)
+}
+
 /// Build the base all-day one-day `Event` for a quick-add popover.
 ///
 /// Pure: no clock, no ID generation (caller supplies both UUIDs), no

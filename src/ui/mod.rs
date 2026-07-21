@@ -1,5 +1,8 @@
 pub mod agenda_view;
 pub mod date_chooser;
+pub mod date_chooser_row;
+pub mod date_time_chooser;
+pub mod event_editor;
 pub mod event_popover;
 pub mod month_view;
 pub mod quick_add_popover;

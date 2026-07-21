@@ -6,9 +6,9 @@ use calendar::model::{Calendar, Event, EventSchedule};
 use chrono::{Datelike, NaiveDate, Timelike};
 use gtk::glib;
 
-/// Edit-Details callback: invoked when the user presses the action button.
-/// Phase 6 has no full editor — the host window shows a toast.
-type EditDetailsFn = Box<dyn Fn()>;
+/// Edit-Details callback: invoked with the persisted event ID when the user
+/// presses the action button.
+type EditDetailsFn = Box<dyn Fn(uuid::Uuid)>;
 
 mod imp {
     use super::*;
@@ -34,6 +34,7 @@ mod imp {
         pub action_button: TemplateChild<gtk::Button>,
 
         pub on_edit_details: RefCell<Option<EditDetailsFn>>,
+        pub event_id: RefCell<Option<uuid::Uuid>>,
     }
 
     #[glib::object_subclass]
@@ -57,8 +58,10 @@ mod imp {
     impl EventPopover {
         #[template_callback]
         fn on_action_button_clicked(&self) {
-            if let Some(cb) = self.on_edit_details.borrow().as_ref() {
-                cb();
+            if let Some(id) = *self.event_id.borrow()
+                && let Some(cb) = self.on_edit_details.borrow().as_ref()
+            {
+                cb(id);
             }
             self.obj().popdown();
         }
@@ -101,8 +104,8 @@ impl EventPopover {
         glib::Object::new()
     }
 
-    /// Register the Edit Details placeholder callback.
-    pub fn set_on_edit_details<F: Fn() + 'static>(&self, f: F) {
+    /// Register the Edit Details callback.
+    pub fn set_on_edit_details<F: Fn(uuid::Uuid) + 'static>(&self, f: F) {
         *self.imp().on_edit_details.borrow_mut() = Some(Box::new(f));
     }
 
@@ -113,6 +116,7 @@ impl EventPopover {
     /// read-only flag to select the correct action icon and tooltip.
     pub fn set_event(&self, event: &Event, calendar: Option<&Calendar>, today: NaiveDate) {
         let imp = self.imp();
+        *imp.event_id.borrow_mut() = Some(event.id);
 
         imp.summary_label.set_label(&event.title);
 

@@ -3,8 +3,11 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo::rerun-if-changed=data/ui/window.blp");
     println!("cargo::rerun-if-changed=data/ui/common/date-chooser.blp");
+    println!("cargo::rerun-if-changed=data/ui/common/date-chooser-row.blp");
+    println!("cargo::rerun-if-changed=data/ui/common/date-time-chooser.blp");
     println!("cargo::rerun-if-changed=data/ui/common/quick-add-popover.blp");
     println!("cargo::rerun-if-changed=data/ui/common/event-popover.blp");
+    println!("cargo::rerun-if-changed=data/ui/common/event-editor.blp");
     println!("cargo::rerun-if-changed=data/ui/views/month-view.blp");
     println!("cargo::rerun-if-changed=data/ui/views/week-view.blp");
     println!("cargo::rerun-if-changed=data/ui/views/agenda-view.blp");
@@ -29,8 +32,11 @@ fn main() {
             "data/ui",
             "data/ui/window.blp",
             "data/ui/common/date-chooser.blp",
+            "data/ui/common/date-chooser-row.blp",
+            "data/ui/common/date-time-chooser.blp",
             "data/ui/common/quick-add-popover.blp",
             "data/ui/common/event-popover.blp",
+            "data/ui/common/event-editor.blp",
             "data/ui/views/month-view.blp",
             "data/ui/views/week-view.blp",
             "data/ui/views/agenda-view.blp",

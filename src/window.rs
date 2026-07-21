@@ -48,6 +48,9 @@ mod imp {
         // The event preview popover, created once and parented to the window.
         pub event_popover: RefCell<Option<crate::ui::event_popover::EventPopover>>,
 
+        // The reusable detailed editor, presented transiently for create/edit.
+        pub event_editor: RefCell<Option<crate::ui::event_editor::EventEditor>>,
+
         /// Shared navigation state for the three pages in `views_stack`.
         pub view_state: RefCell<Option<ViewState>>,
     }
@@ -186,6 +189,7 @@ mod imp {
             let popover_weak = popover.downgrade();
             popover.set_on_save({
                 let win_weak = win_weak.clone();
+                let popover_weak = popover_weak.clone();
                 move |title, calendar_id, date| {
                     if let Some(win) = win_weak.upgrade() {
                         win.imp()
@@ -195,10 +199,10 @@ mod imp {
             });
             let win_weak2 = win_weak.clone();
             popover.set_on_edit_details(move || {
-                if let Some(win) = win_weak2.upgrade() {
-                    win.imp()
-                        .overlay
-                        .add_toast(adw::Toast::new("Full event editor is not implemented yet."));
+                if let Some(win) = win_weak2.upgrade()
+                    && let Some(popover) = popover_weak.upgrade()
+                {
+                    win.imp().open_event_editor_from_quick_add(&popover);
                 }
             });
 
@@ -208,12 +212,20 @@ mod imp {
             let event_popover = crate::ui::event_popover::EventPopover::new();
             event_popover.set_parent(win.upcast_ref::<gtk::Widget>());
 
+            let editor = crate::ui::event_editor::EventEditor::new();
+            editor.set_on_save({
+                let win_weak = win_weak.clone();
+                move |event, editing| {
+                    win_weak
+                        .upgrade()
+                        .is_some_and(|win| win.imp().persist_editor_event(&event, editing))
+                }
+            });
+
             let win_weak3 = win_weak.clone();
-            event_popover.set_on_edit_details(move || {
+            event_popover.set_on_edit_details(move |event_id| {
                 if let Some(win) = win_weak3.upgrade() {
-                    win.imp()
-                        .overlay
-                        .add_toast(adw::Toast::new("Full event editor is not implemented yet."));
+                    win.imp().open_event_editor_for_event(event_id);
                 }
             });
 
@@ -228,6 +240,7 @@ mod imp {
             });
 
             *self.event_popover.borrow_mut() = Some(event_popover);
+            *self.event_editor.borrow_mut() = Some(editor);
 
             // ── Window actions ──
 
@@ -544,8 +557,7 @@ impl imp::CalendarWindow {
         app: Option<gtk::Application>,
         db_path: &std::path::Path,
     ) {
-        let dialog = adw::MessageDialog::new(
-            Some(parent),
+        let dialog = adw::AlertDialog::new(
             Some("Cannot Open Calendar Database"),
             Some(&format!(
                 "The calendar data could not be opened at\n\n  {}\n\n\
@@ -561,7 +573,7 @@ impl imp::CalendarWindow {
                 app.quit();
             }
         });
-        gtk::prelude::GtkWindowExt::present(&dialog);
+        dialog.present(Some(parent.upcast_ref::<gtk::Widget>()));
     }
 
     // ── Quick-Add helpers ──
@@ -646,6 +658,85 @@ impl imp::CalendarWindow {
             Err(RepositoryError) => {
                 self.overlay
                     .add_toast(adw::Toast::new("Could not save event."));
+            }
+        }
+    }
+
+    fn open_event_editor_from_quick_add(
+        &self,
+        popover: &crate::ui::quick_add_popover::QuickAddPopover,
+    ) {
+        let Some((title, calendar_id, date)) = popover.details() else {
+            return;
+        };
+        let Some(editor) = self.event_editor.borrow().clone() else {
+            return;
+        };
+        let calendars = self
+            .repository
+            .borrow()
+            .as_ref()
+            .expect("repository must be initialised")
+            .list_calendars();
+        editor.set_calendars(&calendars);
+        editor.set_create_defaults(&title, calendar_id, date);
+        popover.popdown();
+        adw::prelude::AdwDialogExt::present(&editor, Some(self.obj().upcast_ref::<gtk::Widget>()));
+    }
+
+    fn open_event_editor_for_event(&self, event_id: Uuid) {
+        let (event, calendar, calendars) = {
+            let repo_guard = self.repository.borrow();
+            let repo = repo_guard.as_ref().expect("repository must be initialised");
+            let Some(event) = repo.get_event(event_id) else {
+                return;
+            };
+            let calendar = repo.get_calendar(event.calendar_id);
+            let calendars = repo.list_calendars();
+            (event, calendar, calendars)
+        };
+        if calendar.as_ref().is_none_or(|calendar| calendar.read_only) {
+            self.overlay
+                .add_toast(adw::Toast::new("This event is on a read-only calendar."));
+            return;
+        }
+        let Some(editor) = self.event_editor.borrow().clone() else {
+            return;
+        };
+        editor.set_calendars(&calendars);
+        editor.set_event(&event);
+        adw::prelude::AdwDialogExt::present(&editor, Some(self.obj().upcast_ref::<gtk::Widget>()));
+    }
+
+    fn persist_editor_event(&self, event: &Event, editing: bool) -> bool {
+        let result = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard.as_mut().expect("repository must be initialised");
+            let Some(calendar) = repo.get_calendar(event.calendar_id) else {
+                self.overlay
+                    .add_toast(adw::Toast::new("Choose an available calendar."));
+                return false;
+            };
+            if calendar.read_only {
+                self.overlay
+                    .add_toast(adw::Toast::new("Choose a writable calendar."));
+                return false;
+            }
+            if editing {
+                repo.update_event(event)
+            } else {
+                repo.save_event(event)
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.render_all_from_state();
+                true
+            }
+            Err(RepositoryError) => {
+                self.overlay
+                    .add_toast(adw::Toast::new("Could not save event."));
+                false
             }
         }
     }

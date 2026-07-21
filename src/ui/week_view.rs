@@ -68,11 +68,32 @@ mod grid_imp {
     }
 
     impl WidgetImpl for WeekGrid {
-        fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let mut minimum = 0;
+            let mut natural = 0;
+            for timed_button in self.timed_buttons.borrow().iter() {
+                let child_for_size = if orientation == gtk::Orientation::Vertical {
+                    for_size
+                        .try_into()
+                        .ok()
+                        .map(|width: u32| {
+                            ((width as f64 / 7.0 / timed_button.lane_count as f64) - 4.0).max(0.0)
+                                as i32
+                        })
+                        .unwrap_or(for_size)
+                } else {
+                    for_size
+                };
+                let (child_minimum, child_natural, _, _) =
+                    timed_button.button.measure(orientation, child_for_size);
+                minimum = minimum.max(child_minimum);
+                natural = natural.max(child_natural);
+            }
+
             if orientation == gtk::Orientation::Vertical {
                 (TIMELINE_HEIGHT, TIMELINE_HEIGHT, -1, -1)
             } else {
-                (0, 0, -1, -1)
+                (minimum.saturating_mul(7), natural.saturating_mul(7), -1, -1)
             }
         }
 
@@ -182,6 +203,7 @@ impl WeekGrid {
             }
         }
         *imp.timed_buttons.borrow_mut() = buttons;
+        self.queue_resize();
         self.queue_draw();
     }
 
@@ -618,11 +640,12 @@ fn create_event_button(
     let button = gtk::Button::builder()
         .css_classes([css_class, "flat"])
         .halign(gtk::Align::Fill)
-        .valign(gtk::Align::Start)
+        .valign(gtk::Align::Fill)
         .can_focus(true)
         .tooltip_text(&chip.title)
         .build();
     button.set_cursor_from_name(Some("pointer"));
+    apply_event_color(&button, &chip.color);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -631,17 +654,15 @@ fn create_event_button(
         .margin_end(4)
         .margin_top(2)
         .margin_bottom(2)
+        .valign(gtk::Align::Start)
         .build();
-    let color = sanitize_color(&chip.color);
-    let swatch = gtk::Label::builder().label("●").build();
-    swatch.set_markup(&format!("<span foreground=\"#{color}\">●</span>"));
     let title = gtk::Label::builder()
         .label(&chip.title)
         .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .hexpand(true)
         .build();
-    content.append(&swatch);
     content.append(&title);
     button.set_child(Some(&content));
 
@@ -679,10 +700,38 @@ fn weekday_name(index: usize) -> &'static str {
     ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][index]
 }
 
+fn apply_event_color(button: &gtk::Button, color: &str) {
+    let color = sanitize_color(color);
+
+    // Keep the provider on this button's style context so it is released with
+    // the event card instead of accumulating on the display.
+    let css = format!(
+        "button {{\
+            border-color: alpha(#{color}, 0.68);\
+            border-left-color: #{color};\
+            background-color: alpha(#{color}, 0.18);\
+        }}\
+        button:hover {{\
+            background-color: alpha(#{color}, 0.32);\
+        }}\
+        button:focus-visible {{\
+            outline: 2px solid #{color};\
+            outline-offset: -2px;\
+        }}"
+    );
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(&css);
+    #[allow(deprecated)]
+    button
+        .style_context()
+        .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
+
 fn sanitize_color(color: &str) -> String {
-    color
-        .trim_start_matches('#')
-        .chars()
-        .filter(|character| character.is_ascii_hexdigit())
-        .collect()
+    let value = color.trim().strip_prefix('#').unwrap_or(color.trim());
+    if value.len() == 6 && value.chars().all(|character| character.is_ascii_hexdigit()) {
+        value.to_ascii_lowercase()
+    } else {
+        "808080".to_string()
+    }
 }

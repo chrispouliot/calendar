@@ -56,16 +56,16 @@ fn add_application_actions(app: &Application) {
     let app_weak = app.downgrade();
     about.connect_activate(move |_, _| {
         if let Some(app) = app_weak.upgrade() {
-            let about_window = adw::AboutWindow::new();
-            about_window.set_application_name("Calendar");
-            about_window.set_application_icon(APP_ID);
-            about_window.set_version("0.1.0");
+            let about_dialog = adw::AboutDialog::new();
+            about_dialog.set_application_name("Calendar");
+            about_dialog.set_application_icon(APP_ID);
+            about_dialog.set_version("0.1.0");
 
             if let Some(window) = app.active_window() {
-                about_window.set_transient_for(Some(&window));
+                about_dialog.present(Some(window.upcast_ref::<gtk::Widget>()));
+            } else {
+                about_dialog.present(None::<&gtk::Widget>);
             }
-
-            about_window.present();
         }
     });
     app.add_action(&about);

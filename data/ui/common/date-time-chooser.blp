@@ -1,0 +1,46 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $DateTimeChooser: Adw.PreferencesGroup {
+  $DateChooserRow date_row {}
+
+  Adw.ActionRow time_row {
+    activatable: true;
+
+    MenuButton time_button {
+      icon-name: "clock-alt-symbolic";
+      valign: center;
+      tooltip-text: _("Edit Time");
+
+      popover: Popover time_popover {
+        position: bottom;
+        child: Box {
+          orientation: horizontal;
+          spacing: 8;
+          margin-top: 12;
+          margin-bottom: 12;
+          margin-start: 12;
+          margin-end: 12;
+
+          SpinButton hour_spin {
+            width-request: 58;
+            numeric: true;
+            digits: 0;
+          }
+
+          Label { label: ":"; }
+
+          SpinButton minute_spin {
+            width-request: 58;
+            numeric: true;
+            digits: 0;
+          }
+        };
+      };
+
+      styles [
+        "flat",
+      ]
+    }
+  }
+}

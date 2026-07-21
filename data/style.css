@@ -180,9 +180,10 @@ calendar-view.week-view .weekview-grid {
 
 calendar-view.week-view button.weekview-event,
 calendar-view.week-view button.weekview-all-day-event {
-  border: 1px solid alpha(currentColor, 0.18);
+  border: 1px solid alpha(var(--window-fg-color), 0.18);
+  border-left-width: 3px;
   border-radius: 5px;
-  background-color: alpha(var(--accent-bg-color), 0.18);
+  background-color: alpha(var(--window-fg-color), 0.08);
   font-size: 0.9rem;
   font-weight: 600;
   padding: 0;
@@ -190,7 +191,7 @@ calendar-view.week-view button.weekview-all-day-event {
 
 calendar-view.week-view button.weekview-event:hover,
 calendar-view.week-view button.weekview-all-day-event:hover {
-  background-color: alpha(var(--accent-bg-color), 0.32);
+  background-color: alpha(var(--window-fg-color), 0.16);
 }
 
 calendar-view.week-view button.weekview-event:focus-visible,

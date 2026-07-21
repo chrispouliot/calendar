@@ -1,0 +1,21 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $DateChooserRow: Adw.ActionRow {
+  activatable: true;
+
+  MenuButton date_button {
+    icon-name: "calendar-month-symbolic";
+    valign: center;
+    tooltip-text: _("Edit Date");
+
+    popover: Popover date_popover {
+      position: bottom;
+      child: Adw.Bin date_chooser_bin {};
+    };
+
+    styles [
+      "flat",
+    ]
+  }
+}
