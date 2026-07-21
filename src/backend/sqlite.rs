@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
+use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -13,6 +14,7 @@ use crate::model::{
 use super::{
     AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository,
     PendingSyncOperationRepository, RemoteSnapshotSummary, RepositoryError, SyncStateRepository,
+    caldav::{CaldavDiscovery, DiscoveredCalendar},
 };
 
 pub struct SqliteRepository {
@@ -197,6 +199,111 @@ impl SqliteRepository {
             }
         }
         Ok(false)
+    }
+
+    /// Atomically persist an account and the calendars returned by CalDAV
+    /// discovery. Remote calendar identity is scoped to its account.
+    pub fn provision_caldav_account(
+        &mut self,
+        account: &Account,
+        discovery: &CaldavDiscovery,
+    ) -> Result<Vec<Calendar>, RepositoryError> {
+        let mut hrefs = HashSet::new();
+        for discovered in &discovery.calendars {
+            validate_discovered_href(&discovered.href)?;
+            if !hrefs.insert(discovered.href.as_str()) {
+                return Err(RepositoryError);
+            }
+        }
+
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        tx.execute(
+            "INSERT INTO accounts (id, name, server_url, username, enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 server_url = excluded.server_url,
+                 username = excluded.username,
+                 enabled = excluded.enabled",
+            params![
+                account.id,
+                account.name,
+                account.server_url,
+                account.username,
+                account.enabled as i32,
+            ],
+        )
+        .map_err(|_| RepositoryError)?;
+
+        let mut provisioned = Vec::with_capacity(discovery.calendars.len());
+        for discovered in &discovery.calendars {
+            let existing = tx
+                .query_row(
+                    "SELECT c.id, c.visible
+                     FROM calendars AS c
+                     JOIN sync_metadata AS s ON s.calendar_id = c.id
+                     WHERE c.source = 'CalDav'
+                       AND c.account_id = ?1
+                       AND s.remote_url = ?2
+                     ORDER BY c.id
+                     LIMIT 1",
+                    params![account.id, discovered.href],
+                    |row| Ok((row.get::<_, Uuid>(0)?, row.get::<_, i32>(1)? != 0)),
+                )
+                .optional()
+                .map_err(|_| RepositoryError)?;
+
+            let (calendar_id, visible) = existing.unwrap_or((Uuid::new_v4(), true));
+            let calendar = Calendar {
+                id: calendar_id,
+                name: discovered_calendar_name(discovered),
+                color: normalize_discovered_color(discovered.color.as_deref()),
+                visible,
+                read_only: !discovered.writable,
+                source: CalendarSource::CalDav {
+                    account_id: account.id,
+                },
+            };
+            let (source, account_id) = calendar_source_values(&calendar.source);
+            tx.execute(
+                "INSERT INTO calendars (id, name, color, visible, read_only, source, account_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     name = excluded.name,
+                     color = excluded.color,
+                     visible = excluded.visible,
+                     read_only = excluded.read_only,
+                     source = excluded.source,
+                     account_id = excluded.account_id",
+                params![
+                    calendar.id,
+                    calendar.name,
+                    calendar.color,
+                    calendar.visible as i32,
+                    calendar.read_only as i32,
+                    source,
+                    account_id,
+                ],
+            )
+            .map_err(|_| RepositoryError)?;
+
+            upsert_calendar_sync_state_in_transaction(
+                &tx,
+                &CalendarSyncState {
+                    calendar_id,
+                    remote_url: discovered.href.clone(),
+                    sync_token: discovered.sync_token.clone(),
+                },
+            )?;
+            provisioned.push((discovered.href.as_str(), calendar));
+        }
+
+        tx.commit().map_err(|_| RepositoryError)?;
+        provisioned.sort_by(|left, right| left.0.cmp(right.0));
+        Ok(provisioned
+            .into_iter()
+            .map(|(_, calendar)| calendar)
+            .collect())
     }
 
     /// Finalize an upload while keeping its identity metadata and durable
@@ -764,6 +871,36 @@ fn calendar_source_values(source: &CalendarSource) -> (&'static str, Option<Uuid
     }
 }
 
+fn validate_discovered_href(href: &str) -> Result<(), RepositoryError> {
+    let url = Url::parse(href).map_err(|_| RepositoryError)?;
+    if url.host_str().is_none() || !matches!(url.scheme(), "http" | "https") {
+        return Err(RepositoryError);
+    }
+    Ok(())
+}
+
+fn discovered_calendar_name(discovered: &DiscoveredCalendar) -> String {
+    discovered
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("CalDAV Calendar")
+        .to_owned()
+}
+
+fn normalize_discovered_color(color: Option<&str>) -> String {
+    let Some(color) = color.map(str::trim) else {
+        return "#3584e4".to_owned();
+    };
+    let value = color.strip_prefix('#').unwrap_or(color);
+    if (value.len() == 6 || value.len() == 8) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return format!("#{}", &value[..6]).to_ascii_lowercase();
+    }
+    "#3584e4".to_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Calendar rows
 // ---------------------------------------------------------------------------
@@ -1288,6 +1425,42 @@ fn calendar_sync_state_from_row(row: &rusqlite::Row) -> rusqlite::Result<Calenda
         remote_url: row.get(1)?,
         sync_token: row.get(2)?,
     })
+}
+
+fn upsert_calendar_sync_state_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    state: &CalendarSyncState,
+) -> Result<(), RepositoryError> {
+    let updated = tx
+        .execute(
+            "UPDATE sync_metadata
+             SET remote_url = ?1, sync_token = ?2
+             WHERE id = (
+                 SELECT id FROM sync_metadata
+                 WHERE calendar_id = ?3
+                 ORDER BY id LIMIT 1
+             )",
+            params![
+                state.remote_url,
+                state.sync_token.as_deref(),
+                state.calendar_id
+            ],
+        )
+        .map_err(|_| RepositoryError)?;
+    if updated == 0 {
+        tx.execute(
+            "INSERT INTO sync_metadata (id, calendar_id, remote_url, sync_token)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                state.calendar_id,
+                state.calendar_id,
+                state.remote_url,
+                state.sync_token.as_deref(),
+            ],
+        )
+        .map_err(|_| RepositoryError)?;
+    }
+    Ok(())
 }
 
 fn event_sync_state_from_row(row: &rusqlite::Row) -> rusqlite::Result<EventSyncState> {
