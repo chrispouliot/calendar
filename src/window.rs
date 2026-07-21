@@ -842,7 +842,7 @@ impl imp::CalendarWindow {
         let result = {
             let mut repo = self.repository.borrow_mut();
             let repo = repo.as_mut().expect("repository must be initialised");
-            repo.save_event(&event)
+            repo.create_event_with_sync(&event)
         }; // mutable guard dropped before render / popover work
         match result {
             Ok(()) => {
@@ -921,9 +921,9 @@ impl imp::CalendarWindow {
                 return false;
             }
             if editing {
-                repo.update_event(event)
+                repo.update_event_with_sync(event)
             } else {
-                repo.save_event(event)
+                repo.create_event_with_sync(event)
             }
         };
         match result {
@@ -958,12 +958,14 @@ impl imp::CalendarWindow {
                     .add_toast(adw::Toast::new("This event is on a read-only calendar."));
                 return false;
             }
-            let Some(undo) = repo.delete_event_with_undo(event_id) else {
-                self.overlay
-                    .add_toast(adw::Toast::new("Could not delete event."));
-                return false;
-            };
-            undo
+            match repo.delete_event_with_sync_undo(event_id) {
+                Ok(undo) => undo,
+                Err(RepositoryError) => {
+                    self.overlay
+                        .add_toast(adw::Toast::new("Could not delete event."));
+                    return false;
+                }
+            }
         };
 
         self.render_all_from_state();
@@ -998,7 +1000,7 @@ impl imp::CalendarWindow {
         let result = {
             let mut repo_guard = self.repository.borrow_mut();
             let repo = repo_guard.as_mut().expect("repository must be initialised");
-            repo.undo_delete_event(undo)
+            repo.undo_event_with_sync(undo)
         };
         match result {
             Ok(()) => {

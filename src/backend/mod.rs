@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::model::{
     Account, Calendar, CalendarSyncState, DateTimeRange, Event, EventSchedule, EventSyncState,
-    RangeOverlap,
+    PendingSyncOperation, RangeOverlap,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,10 @@ pub struct RemoteSnapshotSummary {
 pub struct EventDeletionUndo {
     pub event: Event,
     restored: bool,
+    pub(crate) event_sync_state: Option<EventSyncState>,
+    pub(crate) prior_pending_operation: Option<PendingSyncOperation>,
+    pub(crate) sync_undo: bool,
+    pub(crate) delete_tombstone: bool,
 }
 
 /// Storage abstraction for calendars. Methods take `&mut self` so a single
@@ -118,6 +122,21 @@ pub trait SyncStateRepository {
     ) -> Option<EventSyncState>;
 
     fn list_event_sync_states(&self, calendar_id: Uuid) -> Vec<EventSyncState>;
+}
+
+/// Storage abstraction for durable CalDAV upload intent.
+pub trait PendingSyncOperationRepository {
+    fn upsert_pending_sync_operation(
+        &mut self,
+        operation: &PendingSyncOperation,
+    ) -> Result<(), RepositoryError>;
+
+    fn get_pending_sync_operation(&self, event_id: Uuid) -> Option<PendingSyncOperation>;
+
+    fn list_pending_sync_operations(&self, calendar_id: Uuid) -> Vec<PendingSyncOperation>;
+
+    /// Returns true iff an operation with the event ID was present.
+    fn remove_pending_sync_operation(&mut self, event_id: Uuid) -> bool;
 }
 
 /// Combined in-memory implementation usable by tests and by application
@@ -220,6 +239,10 @@ impl EventRepository for InMemoryRepository {
         self.events.remove(&id).map(|event| EventDeletionUndo {
             event,
             restored: false,
+            event_sync_state: None,
+            prior_pending_operation: None,
+            sync_undo: false,
+            delete_tombstone: false,
         })
     }
 

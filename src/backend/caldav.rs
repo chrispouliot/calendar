@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, TimeZone};
+use chrono::{DateTime, FixedOffset, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use icalendar::{
     Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, EventLike,
@@ -8,7 +8,7 @@ use quick_xml::events::Event as XmlEvent;
 use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
 use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, USER_AGENT};
 use reqwest::{Method, Url};
 use std::str::FromStr;
 use std::time::Duration;
@@ -137,6 +137,65 @@ impl CaldavClient {
         Ok(resources)
     }
 
+    pub fn create_resource(
+        &self,
+        resource_url: &str,
+        calendar_data: &str,
+    ) -> Result<ResourceWriteResult, CaldavError> {
+        self.write_resource(resource_url, calendar_data, None, Some("*"))
+    }
+
+    pub fn update_resource(
+        &self,
+        resource_url: &str,
+        calendar_data: &str,
+        base_etag: &str,
+    ) -> Result<ResourceWriteResult, CaldavError> {
+        self.write_resource(resource_url, calendar_data, Some(base_etag), None)
+    }
+
+    pub fn delete_resource(&self, resource_url: &str, base_etag: &str) -> Result<(), CaldavError> {
+        let resource_url = Url::parse(resource_url)
+            .map_err(|_| CaldavError::Url)
+            .and_then(validate_http_url)?;
+        let client = self.http_client()?;
+        let response = self
+            .authenticated_request(&client, Method::DELETE, &resource_url)
+            .header(IF_MATCH, base_etag)
+            .send()
+            .map_err(|_| CaldavError::Transport)?;
+        response_status(response).map(|_| ())
+    }
+
+    fn write_resource(
+        &self,
+        resource_url: &str,
+        calendar_data: &str,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<ResourceWriteResult, CaldavError> {
+        let resource_url = Url::parse(resource_url)
+            .map_err(|_| CaldavError::Url)
+            .and_then(validate_http_url)?;
+        let client = self.http_client()?;
+        let mut request = self
+            .authenticated_request(&client, Method::PUT, &resource_url)
+            .header(CONTENT_TYPE, "text/calendar; charset=utf-8");
+        if let Some(if_match) = if_match {
+            request = request.header(IF_MATCH, if_match);
+        }
+        if let Some(if_none_match) = if_none_match {
+            request = request.header(IF_NONE_MATCH, if_none_match);
+        }
+        let response = request
+            .body(calendar_data.to_owned())
+            .send()
+            .map_err(|_| CaldavError::Transport)?;
+        Ok(ResourceWriteResult {
+            etag: response_status(response)?,
+        })
+    }
+
     fn http_client(&self) -> Result<Client, CaldavError> {
         Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -179,17 +238,32 @@ impl CaldavClient {
     ) -> Result<String, CaldavError> {
         let method =
             Method::from_bytes(method_name.as_bytes()).map_err(|_| CaldavError::Transport)?;
-        let response = client
-            .request(method, url.clone())
+        let response = self
+            .authenticated_request(client, method, url)
             .header("Depth", depth)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header(USER_AGENT, USER_AGENT_VALUE)
-            .basic_auth(&self.username, Some(&self.password))
             .body(body.to_owned())
             .send()
             .map_err(|_| CaldavError::Transport)?;
         response_body(response)
     }
+
+    fn authenticated_request(
+        &self,
+        client: &Client,
+        method: Method,
+        url: &Url,
+    ) -> reqwest::blocking::RequestBuilder {
+        client
+            .request(method, url.clone())
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .basic_auth(&self.username, Some(&self.password))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceWriteResult {
+    pub etag: Option<String>,
 }
 
 fn validate_http_url(url: Url) -> Result<Url, CaldavError> {
@@ -197,6 +271,21 @@ fn validate_http_url(url: Url) -> Result<Url, CaldavError> {
         return Err(CaldavError::Url);
     }
     Ok(url)
+}
+
+fn response_status(response: reqwest::blocking::Response) -> Result<Option<String>, CaldavError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(CaldavError::HttpStatus {
+            status: status.as_u16(),
+        });
+    }
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    Ok(etag)
 }
 
 fn response_body(response: reqwest::blocking::Response) -> Result<String, CaldavError> {
@@ -249,6 +338,125 @@ impl std::fmt::Display for EventMappingError {
 }
 
 impl std::error::Error for EventMappingError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventSerializationError {
+    EmptyUid,
+    InvalidSchedule,
+    UnsupportedRecurrence,
+    UnsupportedReminders,
+    Serialization,
+}
+
+impl std::fmt::Display for EventSerializationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyUid => write!(formatter, "event has no remote UID"),
+            Self::InvalidSchedule => write!(formatter, "event schedule is invalid"),
+            Self::UnsupportedRecurrence => write!(formatter, "event recurrence is unsupported"),
+            Self::UnsupportedReminders => write!(formatter, "event reminders are unsupported"),
+            Self::Serialization => write!(formatter, "failed to serialize iCalendar data"),
+        }
+    }
+}
+
+impl std::error::Error for EventSerializationError {}
+
+pub fn serialize_icalendar_event(
+    event: &crate::model::Event,
+    remote_uid: &str,
+) -> Result<String, EventSerializationError> {
+    if remote_uid.trim().is_empty() {
+        return Err(EventSerializationError::EmptyUid);
+    }
+    if event.recurrence.is_some() {
+        return Err(EventSerializationError::UnsupportedRecurrence);
+    }
+    if !event.reminders.is_empty() {
+        return Err(EventSerializationError::UnsupportedReminders);
+    }
+
+    let mut serialized_event = icalendar::Event::new();
+    serialized_event.uid(remote_uid);
+    serialized_event.summary(&event.title);
+    serialized_event.location(&event.location);
+    serialized_event.description(&event.description);
+
+    match &event.schedule {
+        crate::model::EventSchedule::AllDay {
+            start_date,
+            end_date_exclusive,
+        } => {
+            if end_date_exclusive <= start_date {
+                return Err(EventSerializationError::InvalidSchedule);
+            }
+            serialized_event.starts(*start_date);
+            serialized_event.ends(*end_date_exclusive);
+        }
+        crate::model::EventSchedule::Timed {
+            start,
+            end,
+            timezone,
+        } => {
+            if end <= start {
+                return Err(EventSerializationError::InvalidSchedule);
+            }
+            let (start, end) = serialize_timed_values(*start, *end, timezone.as_deref())?;
+            serialized_event.starts(start);
+            serialized_event.ends(end);
+        }
+    }
+
+    let serialized_event = serialized_event.done();
+    let mut calendar = Calendar::new();
+    calendar.push(serialized_event);
+    std::convert::TryInto::<String>::try_into(&calendar)
+        .map_err(|_| EventSerializationError::Serialization)
+}
+
+fn serialize_timed_values(
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    timezone: Option<&str>,
+) -> Result<(CalendarDateTime, CalendarDateTime), EventSerializationError> {
+    match timezone {
+        None => {
+            if start.offset().local_minus_utc() != 0 || end.offset().local_minus_utc() != 0 {
+                return Err(EventSerializationError::InvalidSchedule);
+            }
+            Ok((
+                CalendarDateTime::from(start.with_timezone(&Utc)),
+                CalendarDateTime::from(end.with_timezone(&Utc)),
+            ))
+        }
+        Some(tzid) => {
+            let timezone =
+                Tz::from_str(tzid).map_err(|_| EventSerializationError::InvalidSchedule)?;
+            let start = serialize_tz_value(start, tzid, timezone)?;
+            let end = serialize_tz_value(end, tzid, timezone)?;
+            Ok((start, end))
+        }
+    }
+}
+
+fn serialize_tz_value(
+    value: DateTime<FixedOffset>,
+    tzid: &str,
+    timezone: Tz,
+) -> Result<CalendarDateTime, EventSerializationError> {
+    let local = value.with_timezone(&timezone).naive_local();
+    let resolved = timezone
+        .from_local_datetime(&local)
+        .single()
+        .ok_or(EventSerializationError::InvalidSchedule)?;
+    if resolved.offset().fix().local_minus_utc() != value.offset().local_minus_utc() {
+        return Err(EventSerializationError::InvalidSchedule);
+    }
+    Ok(CalendarDateTime::WithTimezone {
+        date_time: local,
+        tzid: tzid.to_owned(),
+    })
+}
 
 /// Map the one-event, non-recurring subset accepted by the local event model.
 ///

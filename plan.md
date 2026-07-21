@@ -1111,7 +1111,8 @@ Status: In progress
 Tasks:
 
 - [x] Add account/source model.
-- [ ] Add CalDAV discovery/login flow.
+- [x] Add authenticated CalDAV discovery backend.
+- [ ] Add account/login UI and secure credential storage.
 - [x] Discover calendars from server.
 - [x] Sync remote events into the local cache.
 - [x] Store remote metadata:
@@ -1119,9 +1120,11 @@ Tasks:
   - [x] UID
   - [x] ETag
   - [x] sync-token if supported
-- [ ] Map iCalendar to app event model.
-- [ ] Handle local edits and upload.
-- [ ] Handle conflict strategy.
+- [x] Map supported non-recurring iCalendar events to/from the app model.
+- [ ] Add recurrence mapping.
+- [x] Queue and upload supported local create/update/delete operations.
+- [x] Preserve pending local intent on ETag conflicts without overwriting remote data.
+- [ ] Add incremental sync-token reports.
 
 Likely crates to evaluate:
 
@@ -1138,12 +1141,13 @@ Verification:
 
 Use integration tests against a local CalDAV server such as Radicale or another test fixture.
 
-Implemented so far: durable account/source and sync metadata, namespace-aware
-DAV discovery, authenticated calendar discovery, full-snapshot VEVENT pulls,
-safe non-recurring iCalendar mapping, and atomic SQLite reconciliation. The
-ignored Radicale integration test verifies discovery, import, ETag storage, and
-remote deletion. Login UI/secret storage, recurrence mapping, incremental sync,
-local uploads, and conflict handling remain.
+Implemented so far: durable account/source, pending-operation, and sync
+metadata; authenticated DAV discovery; full-snapshot pulls; safe non-recurring
+iCalendar mapping/serialization; atomic local edit and SQLite reconciliation;
+conditional uploads; and conflict-preserving ETag handling. The ignored
+Radicale integration test verifies discovery, import, create, update, conflict,
+and deletion. Login UI/secret storage, recurrence mapping, incremental sync,
+and automatic scheduling remain.
 
 ### Phase 12: Reminders and notifications
 

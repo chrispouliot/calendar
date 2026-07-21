@@ -7,12 +7,12 @@ use uuid::Uuid;
 
 use crate::model::{
     Account, Calendar, CalendarSource, CalendarSyncState, DateTimeRange, Event, EventSchedule,
-    EventSyncState, RecurrenceSpec,
+    EventSyncState, PendingSyncOperation, RecurrenceSpec,
 };
 
 use super::{
     AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository,
-    RemoteSnapshotSummary, RepositoryError, SyncStateRepository,
+    PendingSyncOperationRepository, RemoteSnapshotSummary, RepositoryError, SyncStateRepository,
 };
 
 pub struct SqliteRepository {
@@ -115,7 +115,29 @@ impl SqliteRepository {
                  CREATE INDEX IF NOT EXISTS event_sync_metadata_calendar_idx
                      ON event_sync_metadata(calendar_id);
 
-                CREATE TABLE IF NOT EXISTS calendar_seed_state (
+                  CREATE TABLE IF NOT EXISTS pending_sync_operations (
+                      event_id BLOB PRIMARY KEY,
+                      calendar_id BLOB NOT NULL,
+                      operation_kind TEXT NOT NULL
+                          CHECK (operation_kind IN ('create', 'update', 'delete')),
+                      remote_href TEXT,
+                      remote_uid TEXT NOT NULL,
+                      base_etag TEXT,
+                      CHECK (
+                          (operation_kind = 'create'
+                              AND remote_href IS NULL
+                              AND base_etag IS NULL)
+                          OR (operation_kind IN ('update', 'delete')
+                              AND remote_href IS NOT NULL)
+                      ),
+                      FOREIGN KEY (calendar_id) REFERENCES calendars(id)
+                          ON DELETE CASCADE
+                  );
+
+                  CREATE INDEX IF NOT EXISTS pending_sync_operations_calendar_idx
+                      ON pending_sync_operations(calendar_id, event_id);
+
+                 CREATE TABLE IF NOT EXISTS calendar_seed_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1)
                 );",
             )
@@ -175,6 +197,34 @@ impl SqliteRepository {
             }
         }
         Ok(false)
+    }
+
+    /// Finalize an upload while keeping its identity metadata and durable
+    /// intent in the same SQLite transaction.
+    pub(crate) fn finalize_event_upload(
+        &mut self,
+        state: &EventSyncState,
+    ) -> Result<(), RepositoryError> {
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        upsert_event_sync_state_in_transaction(&tx, state)?;
+        tx.execute(
+            "DELETE FROM pending_sync_operations WHERE event_id = ?1",
+            params![state.event_id],
+        )
+        .map_err(|_| RepositoryError)?;
+        tx.commit().map_err(|_| RepositoryError)
+    }
+
+    /// Remove a completed delete intent transactionally. The event and its
+    /// sync metadata may already have been removed by the local delete.
+    pub(crate) fn finalize_event_delete(&mut self, event_id: Uuid) -> Result<(), RepositoryError> {
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        tx.execute(
+            "DELETE FROM pending_sync_operations WHERE event_id = ?1",
+            params![event_id],
+        )
+        .map_err(|_| RepositoryError)?;
+        tx.commit().map_err(|_| RepositoryError)
     }
 
     pub fn reconcile_remote_snapshot(
@@ -324,6 +374,200 @@ impl SqliteRepository {
             .map_err(|_| RepositoryError)?;
         tx.commit().map_err(|_| RepositoryError)?;
         Ok(true)
+    }
+
+    pub fn create_event_with_sync(&mut self, event: &Event) -> Result<(), RepositoryError> {
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let calendar = calendar_in_transaction(&tx, event.calendar_id)?;
+        if calendar.read_only {
+            return Err(RepositoryError);
+        }
+
+        insert_event(&tx, event)?;
+        if matches!(calendar.source, CalendarSource::CalDav { .. }) {
+            upsert_pending_sync_operation_in_transaction(
+                &tx,
+                &PendingSyncOperation::Create {
+                    calendar_id: event.calendar_id,
+                    event_id: event.id,
+                    remote_uid: event.id.to_string(),
+                },
+            )?;
+        }
+        tx.commit().map_err(|_| RepositoryError)
+    }
+
+    pub fn update_event_with_sync(&mut self, event: &Event) -> Result<(), RepositoryError> {
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let existing_calendar_id: Option<Uuid> = tx
+            .query_row(
+                "SELECT calendar_id FROM events WHERE id = ?1",
+                params![event.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| RepositoryError)?;
+        let Some(existing_calendar_id) = existing_calendar_id else {
+            return Err(RepositoryError);
+        };
+        let existing_calendar = calendar_in_transaction(&tx, existing_calendar_id)?;
+        let calendar = calendar_in_transaction(&tx, event.calendar_id)?;
+        if existing_calendar.read_only || calendar.read_only {
+            return Err(RepositoryError);
+        }
+
+        let pending = pending_sync_operation_in_transaction(&tx, event.id)?;
+        let sync_state = event_sync_state_in_transaction(&tx, event.id)?;
+        update_event_in_transaction(&tx, event)?;
+
+        if matches!(calendar.source, CalendarSource::Local) {
+            delete_pending_sync_operation_in_transaction(&tx, event.id)?;
+        } else {
+            let operation = match pending {
+                Some(PendingSyncOperation::Create { .. })
+                | Some(PendingSyncOperation::Update { .. }) => pending,
+                Some(PendingSyncOperation::Delete { .. }) => return Err(RepositoryError),
+                None => sync_state.map(|state| PendingSyncOperation::Update {
+                    calendar_id: event.calendar_id,
+                    event_id: event.id,
+                    remote_href: state.remote_href,
+                    remote_uid: state.remote_uid,
+                    base_etag: state.etag,
+                }),
+            };
+            let operation = operation.unwrap_or(PendingSyncOperation::Create {
+                calendar_id: event.calendar_id,
+                event_id: event.id,
+                remote_uid: event.id.to_string(),
+            });
+            upsert_pending_sync_operation_in_transaction(&tx, &operation)?;
+        }
+
+        tx.commit().map_err(|_| RepositoryError)
+    }
+
+    pub fn delete_event_with_sync_undo(
+        &mut self,
+        id: Uuid,
+    ) -> Result<EventDeletionUndo, RepositoryError> {
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let event = tx
+            .query_row(
+                "SELECT id, calendar_id, title, location, description, \
+                 schedule_type, start_date, end_date_exclusive, \
+                 start_datetime, end_datetime, timezone, \
+                 start_unix, recurrence_enabled FROM events WHERE id = ?1",
+                params![id],
+                event_from_row,
+            )
+            .optional()
+            .map_err(|_| RepositoryError)?
+            .ok_or(RepositoryError)?;
+        let calendar = calendar_in_transaction(&tx, event.calendar_id)?;
+        if calendar.read_only {
+            return Err(RepositoryError);
+        }
+
+        let prior_pending_operation = pending_sync_operation_in_transaction(&tx, id)?;
+        let event_sync_state = event_sync_state_in_transaction(&tx, id)?;
+        let mut delete_operation = None;
+        let mut delete_tombstone = false;
+
+        if matches!(calendar.source, CalendarSource::CalDav { .. }) {
+            match &prior_pending_operation {
+                Some(PendingSyncOperation::Create { .. }) => {}
+                Some(PendingSyncOperation::Update {
+                    calendar_id,
+                    event_id,
+                    remote_href,
+                    remote_uid,
+                    base_etag,
+                }) => {
+                    delete_operation = Some(PendingSyncOperation::Delete {
+                        calendar_id: *calendar_id,
+                        event_id: *event_id,
+                        remote_href: remote_href.clone(),
+                        remote_uid: remote_uid.clone(),
+                        base_etag: base_etag.clone(),
+                    });
+                    delete_tombstone = true;
+                }
+                Some(PendingSyncOperation::Delete { .. }) => return Err(RepositoryError),
+                None => {
+                    if let Some(state) = &event_sync_state {
+                        delete_operation = Some(PendingSyncOperation::Delete {
+                            calendar_id: state.calendar_id,
+                            event_id: state.event_id,
+                            remote_href: state.remote_href.clone(),
+                            remote_uid: state.remote_uid.clone(),
+                            base_etag: state.etag.clone(),
+                        });
+                        delete_tombstone = true;
+                    }
+                }
+            }
+        }
+
+        tx.execute("DELETE FROM events WHERE id = ?1", params![id])
+            .map_err(|_| RepositoryError)?;
+        delete_pending_sync_operation_in_transaction(&tx, id)?;
+        if let Some(operation) = &delete_operation {
+            upsert_pending_sync_operation_in_transaction(&tx, operation)?;
+        }
+        tx.commit().map_err(|_| RepositoryError)?;
+
+        Ok(EventDeletionUndo {
+            event,
+            restored: false,
+            event_sync_state,
+            prior_pending_operation,
+            sync_undo: true,
+            delete_tombstone,
+        })
+    }
+
+    pub fn undo_event_with_sync(
+        &mut self,
+        undo: &mut EventDeletionUndo,
+    ) -> Result<(), RepositoryError> {
+        if undo.restored {
+            return Err(RepositoryError);
+        }
+
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let calendar = calendar_in_transaction(&tx, undo.event.calendar_id)?;
+        if calendar.read_only {
+            return Err(RepositoryError);
+        }
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                params![undo.event.id],
+                |row| row.get(0),
+            )
+            .map_err(|_| RepositoryError)?;
+        if exists {
+            return Err(RepositoryError);
+        }
+
+        if undo.sync_undo && undo.delete_tombstone {
+            let current_pending = pending_sync_operation_in_transaction(&tx, undo.event.id)?;
+            if !matches!(current_pending, Some(PendingSyncOperation::Delete { .. })) {
+                return Err(RepositoryError);
+            }
+        }
+
+        insert_event(&tx, &undo.event)?;
+        delete_pending_sync_operation_in_transaction(&tx, undo.event.id)?;
+        if let Some(state) = &undo.event_sync_state {
+            upsert_event_sync_state_in_transaction(&tx, state)?;
+        }
+        if let Some(operation) = &undo.prior_pending_operation {
+            upsert_pending_sync_operation_in_transaction(&tx, operation)?;
+        }
+        tx.commit().map_err(|_| RepositoryError)?;
+        undo.restored = true;
+        Ok(())
     }
 }
 
@@ -657,14 +901,102 @@ impl EventRepository for SqliteRepository {
     fn update_event(&mut self, event: &Event) -> Result<(), RepositoryError> {
         let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
 
-        let affected = tx
-            .execute("DELETE FROM events WHERE id = ?1", params![event.id])
+        let existing_calendar_id: Option<Uuid> = tx
+            .query_row(
+                "SELECT calendar_id FROM events WHERE id = ?1",
+                params![event.id],
+                |row| row.get(0),
+            )
+            .optional()
             .map_err(|_| RepositoryError)?;
-        if affected == 0 {
+        let Some(existing_calendar_id) = existing_calendar_id else {
+            return Err(RepositoryError);
+        };
+
+        let has_sync_metadata: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM event_sync_metadata WHERE event_id = ?1
+                 )",
+                params![event.id],
+                |row| row.get::<_, i32>(0).map(|value| value != 0),
+            )
+            .map_err(|_| RepositoryError)?;
+        if has_sync_metadata && existing_calendar_id != event.calendar_id {
             return Err(RepositoryError);
         }
 
-        insert_event(&tx, event)?;
+        let recurrence_enabled = if event.recurrence.is_some() { 1 } else { 0 };
+        let affected = match &event.schedule {
+            EventSchedule::AllDay {
+                start_date,
+                end_date_exclusive,
+            } => tx.execute(
+                "UPDATE events SET
+                         calendar_id = ?1,
+                         title = ?2,
+                         location = ?3,
+                         description = ?4,
+                         schedule_type = 'all_day',
+                         start_date = ?5,
+                         end_date_exclusive = ?6,
+                         start_datetime = NULL,
+                         end_datetime = NULL,
+                         timezone = NULL,
+                         start_unix = 0,
+                         end_unix = 0,
+                         recurrence_enabled = ?7
+                     WHERE id = ?8",
+                params![
+                    event.calendar_id,
+                    event.title,
+                    event.location,
+                    event.description,
+                    start_date,
+                    end_date_exclusive,
+                    recurrence_enabled,
+                    event.id,
+                ],
+            ),
+            EventSchedule::Timed {
+                start,
+                end,
+                timezone,
+            } => tx.execute(
+                "UPDATE events SET
+                         calendar_id = ?1,
+                         title = ?2,
+                         location = ?3,
+                         description = ?4,
+                         schedule_type = 'timed',
+                         start_date = NULL,
+                         end_date_exclusive = NULL,
+                         start_datetime = ?5,
+                         end_datetime = ?6,
+                         timezone = ?7,
+                         start_unix = ?8,
+                         end_unix = ?9,
+                         recurrence_enabled = ?10
+                     WHERE id = ?11",
+                params![
+                    event.calendar_id,
+                    event.title,
+                    event.location,
+                    event.description,
+                    start,
+                    end,
+                    timezone,
+                    start.timestamp(),
+                    end.timestamp(),
+                    recurrence_enabled,
+                    event.id,
+                ],
+            ),
+        }
+        .map_err(|_| RepositoryError)?;
+        if affected == 0 {
+            return Err(RepositoryError);
+        }
 
         tx.commit().map_err(|_| RepositoryError)?;
         Ok(())
@@ -697,6 +1029,10 @@ impl EventRepository for SqliteRepository {
             Some(EventDeletionUndo {
                 event,
                 restored: false,
+                event_sync_state: None,
+                prior_pending_operation: None,
+                sync_undo: false,
+                delete_tombstone: false,
             })
         } else {
             None
@@ -899,8 +1235,376 @@ impl SyncStateRepository for SqliteRepository {
 }
 
 // ---------------------------------------------------------------------------
+// PendingSyncOperationRepository
+// ---------------------------------------------------------------------------
+
+fn pending_sync_operation_from_row(row: &rusqlite::Row) -> rusqlite::Result<PendingSyncOperation> {
+    let event_id: Uuid = row.get(0)?;
+    let calendar_id: Uuid = row.get(1)?;
+    let operation_kind: String = row.get(2)?;
+    let remote_href: Option<String> = row.get(3)?;
+    let remote_uid: String = row.get(4)?;
+    let base_etag: Option<String> = row.get(5)?;
+
+    match operation_kind.as_str() {
+        "create" => Ok(PendingSyncOperation::Create {
+            calendar_id,
+            event_id,
+            remote_uid,
+        }),
+        "update" => Ok(PendingSyncOperation::Update {
+            calendar_id,
+            event_id,
+            remote_href: remote_href.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("missing remote_href".to_string())
+            })?,
+            remote_uid,
+            base_etag,
+        }),
+        "delete" => Ok(PendingSyncOperation::Delete {
+            calendar_id,
+            event_id,
+            remote_href: remote_href.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("missing remote_href".to_string())
+            })?,
+            remote_uid,
+            base_etag,
+        }),
+        _ => Err(rusqlite::Error::InvalidColumnName(
+            "unknown operation_kind".to_string(),
+        )),
+    }
+}
+
+impl PendingSyncOperationRepository for SqliteRepository {
+    fn upsert_pending_sync_operation(
+        &mut self,
+        operation: &PendingSyncOperation,
+    ) -> Result<(), RepositoryError> {
+        let (calendar_id, event_id, operation_kind, remote_href, remote_uid, base_etag) =
+            match operation {
+                PendingSyncOperation::Create {
+                    calendar_id,
+                    event_id,
+                    remote_uid,
+                } => (*calendar_id, *event_id, "create", None, remote_uid, None),
+                PendingSyncOperation::Update {
+                    calendar_id,
+                    event_id,
+                    remote_href,
+                    remote_uid,
+                    base_etag,
+                } => (
+                    *calendar_id,
+                    *event_id,
+                    "update",
+                    Some(remote_href),
+                    remote_uid,
+                    base_etag.as_ref(),
+                ),
+                PendingSyncOperation::Delete {
+                    calendar_id,
+                    event_id,
+                    remote_href,
+                    remote_uid,
+                    base_etag,
+                } => (
+                    *calendar_id,
+                    *event_id,
+                    "delete",
+                    Some(remote_href),
+                    remote_uid,
+                    base_etag.as_ref(),
+                ),
+            };
+
+        self.conn
+            .execute(
+                "INSERT INTO pending_sync_operations
+                     (event_id, calendar_id, operation_kind, remote_href, remote_uid, base_etag)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(event_id) DO UPDATE SET
+                     calendar_id = excluded.calendar_id,
+                     operation_kind = excluded.operation_kind,
+                     remote_href = excluded.remote_href,
+                     remote_uid = excluded.remote_uid,
+                     base_etag = excluded.base_etag",
+                params![
+                    event_id,
+                    calendar_id,
+                    operation_kind,
+                    remote_href,
+                    remote_uid,
+                    base_etag,
+                ],
+            )
+            .map_err(|_| RepositoryError)?;
+        Ok(())
+    }
+
+    fn get_pending_sync_operation(&self, event_id: Uuid) -> Option<PendingSyncOperation> {
+        self.conn
+            .query_row(
+                "SELECT event_id, calendar_id, operation_kind, remote_href, remote_uid, base_etag
+                 FROM pending_sync_operations
+                 WHERE event_id = ?1",
+                params![event_id],
+                pending_sync_operation_from_row,
+            )
+            .ok()
+    }
+
+    fn list_pending_sync_operations(&self, calendar_id: Uuid) -> Vec<PendingSyncOperation> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT event_id, calendar_id, operation_kind, remote_href, remote_uid, base_etag
+             FROM pending_sync_operations
+             WHERE calendar_id = ?1
+             ORDER BY event_id ASC",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![calendar_id], pending_sync_operation_from_row)
+            .into_iter()
+            .flat_map(|rows| rows.filter_map(|row| row.ok()))
+            .collect()
+    }
+
+    fn remove_pending_sync_operation(&mut self, event_id: Uuid) -> bool {
+        self.conn
+            .execute(
+                "DELETE FROM pending_sync_operations WHERE event_id = ?1",
+                params![event_id],
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helper – single-row insert of an event
 // ---------------------------------------------------------------------------
+
+fn calendar_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    id: Uuid,
+) -> Result<Calendar, RepositoryError> {
+    tx.query_row(
+        "SELECT id, name, color, visible, read_only, source, account_id
+         FROM calendars WHERE id = ?1",
+        params![id],
+        calendar_from_row,
+    )
+    .optional()
+    .map_err(|_| RepositoryError)?
+    .ok_or(RepositoryError)
+}
+
+fn event_sync_state_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: Uuid,
+) -> Result<Option<EventSyncState>, RepositoryError> {
+    tx.query_row(
+        "SELECT calendar_id, event_id, remote_href, remote_uid, etag
+         FROM event_sync_metadata WHERE event_id = ?1",
+        params![event_id],
+        event_sync_state_from_row,
+    )
+    .optional()
+    .map_err(|_| RepositoryError)
+}
+
+fn pending_sync_operation_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: Uuid,
+) -> Result<Option<PendingSyncOperation>, RepositoryError> {
+    tx.query_row(
+        "SELECT event_id, calendar_id, operation_kind, remote_href, remote_uid, base_etag
+         FROM pending_sync_operations WHERE event_id = ?1",
+        params![event_id],
+        pending_sync_operation_from_row,
+    )
+    .optional()
+    .map_err(|_| RepositoryError)
+}
+
+fn delete_pending_sync_operation_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: Uuid,
+) -> Result<(), RepositoryError> {
+    tx.execute(
+        "DELETE FROM pending_sync_operations WHERE event_id = ?1",
+        params![event_id],
+    )
+    .map_err(|_| RepositoryError)?;
+    Ok(())
+}
+
+fn upsert_pending_sync_operation_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &PendingSyncOperation,
+) -> Result<(), RepositoryError> {
+    let (calendar_id, event_id, operation_kind, remote_href, remote_uid, base_etag) =
+        match operation {
+            PendingSyncOperation::Create {
+                calendar_id,
+                event_id,
+                remote_uid,
+            } => (*calendar_id, *event_id, "create", None, remote_uid, None),
+            PendingSyncOperation::Update {
+                calendar_id,
+                event_id,
+                remote_href,
+                remote_uid,
+                base_etag,
+            } => (
+                *calendar_id,
+                *event_id,
+                "update",
+                Some(remote_href),
+                remote_uid,
+                base_etag.as_ref(),
+            ),
+            PendingSyncOperation::Delete {
+                calendar_id,
+                event_id,
+                remote_href,
+                remote_uid,
+                base_etag,
+            } => (
+                *calendar_id,
+                *event_id,
+                "delete",
+                Some(remote_href),
+                remote_uid,
+                base_etag.as_ref(),
+            ),
+        };
+    tx.execute(
+        "INSERT INTO pending_sync_operations
+             (event_id, calendar_id, operation_kind, remote_href, remote_uid, base_etag)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(event_id) DO UPDATE SET
+             calendar_id = excluded.calendar_id,
+             operation_kind = excluded.operation_kind,
+             remote_href = excluded.remote_href,
+             remote_uid = excluded.remote_uid,
+             base_etag = excluded.base_etag",
+        params![
+            event_id,
+            calendar_id,
+            operation_kind,
+            remote_href,
+            remote_uid,
+            base_etag,
+        ],
+    )
+    .map_err(|_| RepositoryError)?;
+    Ok(())
+}
+
+fn update_event_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    event: &Event,
+) -> Result<(), RepositoryError> {
+    let existing_calendar_id: Option<Uuid> = tx
+        .query_row(
+            "SELECT calendar_id FROM events WHERE id = ?1",
+            params![event.id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| RepositoryError)?;
+    let Some(existing_calendar_id) = existing_calendar_id else {
+        return Err(RepositoryError);
+    };
+
+    let has_sync_metadata: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM event_sync_metadata WHERE event_id = ?1
+             )",
+            params![event.id],
+            |row| row.get::<_, i32>(0).map(|value| value != 0),
+        )
+        .map_err(|_| RepositoryError)?;
+    if has_sync_metadata && existing_calendar_id != event.calendar_id {
+        return Err(RepositoryError);
+    }
+
+    let recurrence_enabled = if event.recurrence.is_some() { 1 } else { 0 };
+    let affected = match &event.schedule {
+        EventSchedule::AllDay {
+            start_date,
+            end_date_exclusive,
+        } => tx.execute(
+            "UPDATE events SET
+                     calendar_id = ?1,
+                     title = ?2,
+                     location = ?3,
+                     description = ?4,
+                     schedule_type = 'all_day',
+                     start_date = ?5,
+                     end_date_exclusive = ?6,
+                     start_datetime = NULL,
+                     end_datetime = NULL,
+                     timezone = NULL,
+                     start_unix = 0,
+                     end_unix = 0,
+                     recurrence_enabled = ?7
+                 WHERE id = ?8",
+            params![
+                event.calendar_id,
+                event.title,
+                event.location,
+                event.description,
+                start_date,
+                end_date_exclusive,
+                recurrence_enabled,
+                event.id,
+            ],
+        ),
+        EventSchedule::Timed {
+            start,
+            end,
+            timezone,
+        } => tx.execute(
+            "UPDATE events SET
+                     calendar_id = ?1,
+                     title = ?2,
+                     location = ?3,
+                     description = ?4,
+                     schedule_type = 'timed',
+                     start_date = NULL,
+                     end_date_exclusive = NULL,
+                     start_datetime = ?5,
+                     end_datetime = ?6,
+                     timezone = ?7,
+                     start_unix = ?8,
+                     end_unix = ?9,
+                     recurrence_enabled = ?10
+                 WHERE id = ?11",
+            params![
+                event.calendar_id,
+                event.title,
+                event.location,
+                event.description,
+                start,
+                end,
+                timezone,
+                start.timestamp(),
+                end.timestamp(),
+                recurrence_enabled,
+                event.id,
+            ],
+        ),
+    }
+    .map_err(|_| RepositoryError)?;
+    if affected == 0 {
+        return Err(RepositoryError);
+    }
+    Ok(())
+}
 
 fn insert_event(conn: &Connection, event: &Event) -> Result<(), RepositoryError> {
     let recurrence_enabled = if event.recurrence.is_some() { 1 } else { 0 };

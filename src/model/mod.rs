@@ -56,6 +56,30 @@ pub struct EventSyncState {
     pub etag: Option<String>,
 }
 
+/// Durable intent to upload a local CalDAV change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSyncOperation {
+    Create {
+        calendar_id: Uuid,
+        event_id: Uuid,
+        remote_uid: String,
+    },
+    Update {
+        calendar_id: Uuid,
+        event_id: Uuid,
+        remote_href: String,
+        remote_uid: String,
+        base_etag: Option<String>,
+    },
+    Delete {
+        calendar_id: Uuid,
+        event_id: Uuid,
+        remote_href: String,
+        remote_uid: String,
+        base_etag: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventSchedule {
     AllDay {
