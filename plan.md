@@ -1077,15 +1077,15 @@ edit, delete, undo, layout, and restart checks pass.
 
 Goal: local calendar management independent of EDS.
 
-Status: Not started
+Status: Complete
 
 Tasks:
 
-- [ ] Sidebar calendar list with visibility toggles.
-- [ ] Calendar management dialog.
-- [ ] Add/edit/delete local calendars.
-- [ ] Calendar colors applied to event chips.
-- [ ] Persist visibility/color/name.
+- [x] Sidebar calendar list with visibility toggles.
+- [x] Calendar management dialog.
+- [x] Add/edit/delete local calendars.
+- [x] Calendar colors applied to event chips.
+- [x] Persist visibility/color/name.
 
 Verification:
 
@@ -1096,23 +1096,29 @@ cargo run
 
 Manual check: toggling calendar visibility updates all views.
 
+Implemented with compact GNOME Calendar-style sidebar rows, a native
+`AdwDialog` management flow, validated local-calendar CRUD, persistent
+visibility/name/color changes, and calendar-colored event chips. Automated
+repository checks and manual add, edit, delete, color, visibility, and clean
+shutdown checks pass.
+
 ### Phase 11: CalDAV backend
 
 Goal: own network sync backend.
 
-Status: Not started
+Status: In progress
 
 Tasks:
 
-- [ ] Add account/source model.
+- [x] Add account/source model.
 - [ ] Add CalDAV discovery/login flow.
 - [ ] Discover calendars from server.
 - [ ] Sync events.
-- [ ] Store remote metadata:
-  - [ ] URL
-  - [ ] UID
-  - [ ] ETag
-  - [ ] sync-token if supported
+- [x] Store remote metadata:
+  - [x] URL
+  - [x] UID
+  - [x] ETag
+  - [x] sync-token if supported
 - [ ] Map iCalendar to app event model.
 - [ ] Handle local edits and upload.
 - [ ] Handle conflict strategy.
@@ -1155,6 +1161,30 @@ cargo run
 ```
 
 Manual check: create event with reminder and receive notification.
+
+### Phase 13: Background service
+
+Goal: keep calendars synchronized and deliver reminders while the GTK
+application is closed.
+
+Status: Not started
+
+Tasks:
+
+- [ ] Extract reusable sync and reminder runners from the application process.
+- [ ] Add a headless, D-Bus-activated or systemd user service.
+- [ ] Schedule periodic sync and react to network availability with backoff.
+- [ ] Coordinate SQLite access and prevent overlapping account sync runs.
+- [ ] Recompute and schedule reminder notifications after remote changes.
+- [ ] Support notification actions without requiring an open application window.
+- [ ] Package and install the service metadata with the application.
+
+Verification:
+
+- Close the GTK application, change an event on the CalDAV server, and verify
+  that the local cache updates in the background.
+- Close the GTK application and verify that a scheduled reminder still produces
+  a desktop notification.
 
 ## Recommended first work unit
 

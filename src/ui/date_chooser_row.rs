@@ -76,7 +76,7 @@ mod imp {
 glib::wrapper! {
     pub struct DateChooserRow(ObjectSubclass<imp::DateChooserRow>)
         @extends adw::ActionRow, adw::PreferencesRow, gtk::ListBoxRow, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget, gtk::Actionable;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Actionable;
 }
 
 impl DateChooserRow {

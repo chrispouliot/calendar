@@ -26,6 +26,8 @@ mod imp {
         pub views_stack: TemplateChild<adw::ViewStack>,
         #[template_child]
         pub date_chooser_bin: TemplateChild<adw::Bin>,
+        #[template_child]
+        pub calendar_list_bin: TemplateChild<adw::Bin>,
 
         // Phase 5: Month view and navigation title.
         #[template_child]
@@ -53,6 +55,10 @@ mod imp {
 
         // The reusable detailed editor, presented transiently for create/edit.
         pub event_editor: RefCell<Option<crate::ui::event_editor::EventEditor>>,
+
+        // Reusable local calendar management dialog.
+        pub calendar_management:
+            RefCell<Option<crate::ui::calendar_management::CalendarManagementDialog>>,
 
         /// Shared navigation state for the three pages in `views_stack`.
         pub view_state: RefCell<Option<ViewState>>,
@@ -112,10 +118,22 @@ mod imp {
             // ── Sidebar date chooser ──
             let chooser = crate::ui::date_chooser::DateChooser::new();
             self.date_chooser_bin.set_child(Some(&chooser));
+            let win = self.obj();
+
+            // ── Sidebar calendar list ──
+            let calendar_list = crate::ui::calendar_list::CalendarList::new();
+            calendar_list.set_on_visibility_changed({
+                let win_weak = win.downgrade();
+                move |calendar_id, visible| {
+                    win_weak
+                        .upgrade()
+                        .is_some_and(|win| win.imp().set_calendar_visibility(calendar_id, visible))
+                }
+            });
+            self.calendar_list_bin.set_child(Some(&calendar_list));
 
             // ── Create and place MonthView ──
             let month_view = crate::ui::month_view::MonthView::new();
-            let win = self.obj();
             let win_weak = win.downgrade();
 
             // Connect the day-activation callback: first click on an empty
@@ -291,8 +309,71 @@ mod imp {
             });
             win.add_action(&new_event);
 
+            let calendars = crate::ui::calendar_management::CalendarManagementDialog::new();
+            calendars.set_list_calendars({
+                let win_weak = win.downgrade();
+                move || {
+                    win_weak
+                        .upgrade()
+                        .map(|win| win.imp().list_calendars())
+                        .unwrap_or_default()
+                }
+            });
+            calendars.set_on_save({
+                let win_weak = win.downgrade();
+                move |calendar| {
+                    win_weak
+                        .upgrade()
+                        .ok_or_else(|| "The calendar window is no longer available.".to_string())
+                        .and_then(|win| win.imp().save_managed_calendar(calendar))
+                }
+            });
+            calendars.set_on_update({
+                let win_weak = win.downgrade();
+                move |calendar| {
+                    win_weak
+                        .upgrade()
+                        .ok_or_else(|| "The calendar window is no longer available.".to_string())
+                        .and_then(|win| win.imp().update_managed_calendar(calendar))
+                }
+            });
+            calendars.set_on_delete({
+                let win_weak = win.downgrade();
+                move |calendar_id| {
+                    win_weak
+                        .upgrade()
+                        .ok_or_else(|| "The calendar window is no longer available.".to_string())
+                        .and_then(|win| win.imp().delete_managed_calendar(calendar_id))
+                }
+            });
+            *self.calendar_management.borrow_mut() = Some(calendars);
+
+            let show_calendars = gio::SimpleAction::new("show-calendars", None);
+            let win_weak = win.downgrade();
+            show_calendars.connect_activate(move |_, _| {
+                if let Some(win) = win_weak.upgrade()
+                    && let Some(dialog) = win.imp().calendar_management.borrow().clone()
+                {
+                    dialog.refresh();
+                    adw::prelude::AdwDialogExt::present(
+                        &dialog,
+                        Some(win.upcast_ref::<gtk::Widget>()),
+                    );
+                }
+            });
+            win.add_action(&show_calendars);
+
             // ── Initial render from the shared local-today state ──
             self.render_all_from_state();
+        }
+
+        fn dispose(&self) {
+            if let Some(popover) = self.quick_add.borrow_mut().take() {
+                popover.unparent();
+            }
+            if let Some(popover) = self.event_popover.borrow_mut().take() {
+                popover.unparent();
+            }
         }
     }
 
@@ -305,7 +386,7 @@ mod imp {
 glib::wrapper! {
     pub struct CalendarWindow(ObjectSubclass<imp::CalendarWindow>)
         @extends adw::ApplicationWindow, gtk::ApplicationWindow, gtk::Window, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget, gtk::Native, gtk::Root,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Native, gtk::Root,
                    gtk::ShortcutManager, gio::ActionGroup, gio::ActionMap;
 }
 
@@ -516,7 +597,113 @@ impl imp::CalendarWindow {
         self.render_month_view();
         self.render_week_view();
         self.render_agenda_view();
+        self.render_calendar_list();
         self.update_title();
+    }
+
+    fn render_calendar_list(&self) {
+        let calendars = self
+            .repository
+            .borrow()
+            .as_ref()
+            .expect("repository must be initialised")
+            .list_calendars();
+        if let Some(child) = self.calendar_list_bin.child()
+            && let Ok(calendar_list) = child.downcast::<crate::ui::calendar_list::CalendarList>()
+        {
+            calendar_list.set_calendars(&calendars);
+        }
+    }
+
+    fn list_calendars(&self) -> Vec<Calendar> {
+        self.repository
+            .borrow()
+            .as_ref()
+            .expect("repository must be initialised")
+            .list_calendars()
+    }
+
+    fn save_managed_calendar(&self, calendar: &Calendar) -> Result<(), String> {
+        let result = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard
+                .as_mut()
+                .ok_or_else(|| "Calendar storage is unavailable.".to_string())?;
+            repo.save_calendar(calendar)
+        };
+        result.map_err(|_| "Could not save the calendar.".to_string())?;
+        self.render_all_from_state();
+        Ok(())
+    }
+
+    fn update_managed_calendar(&self, calendar: &Calendar) -> Result<(), String> {
+        let result = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard
+                .as_mut()
+                .ok_or_else(|| "Calendar storage is unavailable.".to_string())?;
+            let Some(previous) = repo.get_calendar(calendar.id) else {
+                return Err("The calendar no longer exists.".to_string());
+            };
+            if previous.read_only
+                && (previous.name != calendar.name || previous.color != calendar.color)
+            {
+                return Err("Read-only calendars cannot be renamed or recolored.".to_string());
+            }
+            repo.update_calendar(calendar)
+        };
+        result.map_err(|_| "Could not update the calendar.".to_string())?;
+        self.render_all_from_state();
+        Ok(())
+    }
+
+    fn delete_managed_calendar(&self, calendar_id: Uuid) -> Result<(), String> {
+        let deleted = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard
+                .as_mut()
+                .ok_or_else(|| "Calendar storage is unavailable.".to_string())?;
+            let Some(calendar) = repo.get_calendar(calendar_id) else {
+                return Err("The calendar no longer exists.".to_string());
+            };
+            if calendar.read_only || calendar.source != CalendarSource::Local {
+                return Err("Only writable local calendars can be removed.".to_string());
+            }
+            repo.delete_calendar(calendar_id)
+        };
+        if !deleted {
+            return Err("Could not remove the calendar.".to_string());
+        }
+        self.render_all_from_state();
+        Ok(())
+    }
+
+    /// Persist one visibility change without changing any other calendar
+    /// fields. The list row restores its prior state when this returns false.
+    fn set_calendar_visibility(&self, calendar_id: Uuid, visible: bool) -> bool {
+        let result = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard.as_mut().expect("repository must be initialised");
+            let Some(mut calendar) = repo.get_calendar(calendar_id) else {
+                self.overlay
+                    .add_toast(adw::Toast::new("Could not update calendar visibility."));
+                return false;
+            };
+            calendar.visible = visible;
+            repo.update_calendar(&calendar)
+        };
+
+        match result {
+            Ok(()) => {
+                self.render_all_from_state();
+                true
+            }
+            Err(RepositoryError) => {
+                self.overlay
+                    .add_toast(adw::Toast::new("Could not update calendar visibility."));
+                false
+            }
+        }
     }
 
     /// Build the application-specific database path beneath the

@@ -2,6 +2,15 @@ use chrono::{DateTime, FixedOffset, NaiveDate};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub id: Uuid,
+    pub name: String,
+    pub server_url: String,
+    pub username: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Calendar {
     pub id: Uuid,
     pub name: String,
@@ -14,6 +23,7 @@ pub struct Calendar {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CalendarSource {
     Local,
+    CalDav { account_id: Uuid },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +36,24 @@ pub struct Event {
     pub schedule: EventSchedule,
     pub recurrence: Option<RecurrenceSpec>,
     pub reminders: Vec<ReminderSpec>,
+}
+
+/// Durable identity for a calendar on its remote CalDAV server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarSyncState {
+    pub calendar_id: Uuid,
+    pub remote_url: String,
+    pub sync_token: Option<String>,
+}
+
+/// Durable identity for a locally stored event on its remote CalDAV server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSyncState {
+    pub calendar_id: Uuid,
+    pub event_id: Uuid,
+    pub remote_href: String,
+    pub remote_uid: String,
+    pub etag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +81,9 @@ pub struct EmptyQuickAddTitle;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidEvent;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidCalendar;
+
 /// Normalize and validate a complete event candidate before persistence.
 pub fn validate_event(mut candidate: Event) -> Result<Event, InvalidEvent> {
     if candidate.title.trim().is_empty() {
@@ -69,6 +100,26 @@ pub fn validate_event(mut candidate: Event) -> Result<Event, InvalidEvent> {
     }
 
     candidate.title = candidate.title.trim().to_string();
+    Ok(candidate)
+}
+
+/// Normalize and validate a complete calendar candidate before persistence.
+pub fn validate_calendar(mut candidate: Calendar) -> Result<Calendar, InvalidCalendar> {
+    let trimmed_name = candidate.name.trim();
+    let color = candidate
+        .color
+        .strip_prefix('#')
+        .unwrap_or(&candidate.color);
+
+    if trimmed_name.is_empty()
+        || color.len() != 6
+        || !color.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(InvalidCalendar);
+    }
+
+    candidate.name = trimmed_name.to_string();
+    candidate.color = format!("#{color}").to_ascii_lowercase();
     Ok(candidate)
 }
 

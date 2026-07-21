@@ -1,3 +1,5 @@
+pub mod caldav;
+
 mod sqlite;
 
 pub use sqlite::SqliteRepository;
@@ -5,7 +7,10 @@ pub use sqlite::SqliteRepository;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::model::{Calendar, DateTimeRange, Event, EventSchedule, RangeOverlap};
+use crate::model::{
+    Account, Calendar, CalendarSyncState, DateTimeRange, Event, EventSchedule, EventSyncState,
+    RangeOverlap,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepositoryError;
@@ -25,11 +30,31 @@ pub trait CalendarRepository {
     /// the prior value rather than duplicating it.
     fn save_calendar(&mut self, calendar: &Calendar) -> Result<(), RepositoryError>;
 
+    /// Replace an existing calendar. Returns Err if the UUID does not already
+    /// exist.
+    fn update_calendar(&mut self, calendar: &Calendar) -> Result<(), RepositoryError>;
+
     fn list_calendars(&self) -> Vec<Calendar>;
     fn get_calendar(&self, id: Uuid) -> Option<Calendar>;
 
     /// Returns true iff a calendar with that ID was present.
     fn delete_calendar(&mut self, id: Uuid) -> bool;
+}
+
+/// Storage abstraction for non-secret CalDAV account configuration.
+pub trait AccountRepository {
+    /// Save an account, replacing the prior value when its UUID already exists.
+    fn save_account(&mut self, account: &Account) -> Result<(), RepositoryError>;
+
+    /// Replace an existing account. Returns Err if the UUID does not already
+    /// exist.
+    fn update_account(&mut self, account: &Account) -> Result<(), RepositoryError>;
+
+    fn list_accounts(&self) -> Vec<Account>;
+    fn get_account(&self, id: Uuid) -> Option<Account>;
+
+    /// Returns true iff an account with that ID was present.
+    fn delete_account(&mut self, id: Uuid) -> bool;
 }
 
 /// Storage abstraction for events.
@@ -64,12 +89,64 @@ pub trait EventRepository {
     fn timed_events_in_range(&self, range: &DateTimeRange) -> Vec<Event>;
 }
 
+/// Storage abstraction for durable CalDAV calendar and event identities.
+pub trait SyncStateRepository {
+    fn upsert_calendar_sync_state(
+        &mut self,
+        state: &CalendarSyncState,
+    ) -> Result<(), RepositoryError>;
+
+    fn get_calendar_sync_state(&self, calendar_id: Uuid) -> Option<CalendarSyncState>;
+
+    fn upsert_event_sync_state(&mut self, state: &EventSyncState) -> Result<(), RepositoryError>;
+
+    fn get_event_sync_state(&self, event_id: Uuid) -> Option<EventSyncState>;
+
+    fn find_event_sync_state_by_remote_href(
+        &self,
+        calendar_id: Uuid,
+        remote_href: &str,
+    ) -> Option<EventSyncState>;
+
+    fn list_event_sync_states(&self, calendar_id: Uuid) -> Vec<EventSyncState>;
+}
+
 /// Combined in-memory implementation usable by tests and by application
 /// startup. Constructed with `InMemoryRepository::new()`.
 #[derive(Default)]
 pub struct InMemoryRepository {
+    accounts: HashMap<Uuid, Account>,
     calendars: HashMap<Uuid, Calendar>,
     events: HashMap<Uuid, Event>,
+}
+
+impl AccountRepository for InMemoryRepository {
+    fn save_account(&mut self, account: &Account) -> Result<(), RepositoryError> {
+        self.accounts.insert(account.id, account.clone());
+        Ok(())
+    }
+
+    fn update_account(&mut self, account: &Account) -> Result<(), RepositoryError> {
+        if !self.accounts.contains_key(&account.id) {
+            return Err(RepositoryError);
+        }
+        self.accounts.insert(account.id, account.clone());
+        Ok(())
+    }
+
+    fn list_accounts(&self) -> Vec<Account> {
+        let mut accounts: Vec<Account> = self.accounts.values().cloned().collect();
+        accounts.sort_by_key(|account| account.id);
+        accounts
+    }
+
+    fn get_account(&self, id: Uuid) -> Option<Account> {
+        self.accounts.get(&id).cloned()
+    }
+
+    fn delete_account(&mut self, id: Uuid) -> bool {
+        self.accounts.remove(&id).is_some()
+    }
 }
 
 impl InMemoryRepository {
@@ -80,6 +157,14 @@ impl InMemoryRepository {
 
 impl CalendarRepository for InMemoryRepository {
     fn save_calendar(&mut self, calendar: &Calendar) -> Result<(), RepositoryError> {
+        self.calendars.insert(calendar.id, calendar.clone());
+        Ok(())
+    }
+
+    fn update_calendar(&mut self, calendar: &Calendar) -> Result<(), RepositoryError> {
+        if !self.calendars.contains_key(&calendar.id) {
+            return Err(RepositoryError);
+        }
         self.calendars.insert(calendar.id, calendar.clone());
         Ok(())
     }

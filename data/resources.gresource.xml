@@ -2,8 +2,11 @@
 <gresources>
   <gresource prefix="/dev/chris/calendar">
     <file compressed="true">ui/window.ui</file>
+    <file compressed="true">ui/calendar-management.ui</file>
     <file compressed="true">ui/common/date-chooser.ui</file>
     <file compressed="true">ui/common/date-chooser-row.ui</file>
+    <file compressed="true">ui/common/calendar-list.ui</file>
+    <file compressed="true">ui/common/calendar-row.ui</file>
     <file compressed="true">ui/common/date-time-chooser.ui</file>
     <file compressed="true">ui/common/quick-add-popover.ui</file>
     <file compressed="true">ui/common/event-popover.ui</file>
@@ -14,6 +17,7 @@
     <file compressed="true">style.css</file>
   </gresource>
   <gresource prefix="/dev/chris/calendar">
+    <file compressed="true">icons/scalable/actions/checkmark-small-symbolic.svg</file>
     <file compressed="true">icons/scalable/emblems/calendar-month-symbolic.svg</file>
     <file compressed="true">icons/scalable/emblems/calendar-week-symbolic.svg</file>
     <file compressed="true">icons/scalable/emblems/calendar-agenda-symbolic.svg</file>

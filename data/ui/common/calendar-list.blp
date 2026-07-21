@@ -1,0 +1,29 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $CalendarList: Adw.Bin {
+  child: Box {
+    orientation: vertical;
+
+    ScrolledWindow list_scroll {
+      vexpand: true;
+      hscrollbar-policy: never;
+      propagate-natural-height: true;
+      max-content-height: 260;
+
+      child: ListBox calendars_list_box {
+        hexpand: true;
+        selection-mode: none;
+        css-classes: ["navigation-sidebar", "calendar-list"];
+      };
+    }
+
+    Label no_calendars_label {
+      label: "No calendars yet";
+      css-classes: ["dim-label"];
+      halign: start;
+      margin-start: 12;
+      margin-end: 12;
+    }
+  };
+}

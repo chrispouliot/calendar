@@ -180,7 +180,7 @@ mod imp {
 glib::wrapper! {
     pub struct EventEditor(ObjectSubclass<imp::EventEditor>)
         @extends adw::Dialog, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget, gtk::ShortcutManager;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::ShortcutManager;
 }
 
 impl Default for EventEditor {

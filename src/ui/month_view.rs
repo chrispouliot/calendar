@@ -299,7 +299,7 @@ mod imp {
 glib::wrapper! {
     pub struct MonthView(ObjectSubclass<imp::MonthView>)
         @extends adw::Bin, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 // ── Public API ──

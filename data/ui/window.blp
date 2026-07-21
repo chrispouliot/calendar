@@ -38,11 +38,8 @@ template $CalendarWindow: Adw.ApplicationWindow {
             margin-bottom: 4;
           }
 
-          Label {
-            label: "No calendars yet";
-            css-classes: ["dim-label"];
-            halign: start;
-            margin-start: 12;
+          Adw.Bin calendar_list_bin {
+            vexpand: true;
           }
         }
       }
@@ -181,6 +178,13 @@ PopoverMenu win_menu {
 }
 
 menu menu {
+  section {
+    item {
+      label: "_Calendars";
+      action: "win.show-calendars";
+    }
+  }
+
   section {
     item {
       label: "_About Calendar";

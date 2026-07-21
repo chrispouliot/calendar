@@ -148,7 +148,7 @@ mod imp {
 glib::wrapper! {
     pub struct QuickAddPopover(ObjectSubclass<imp::QuickAddPopover>)
         @extends gtk::Popover, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget, gtk::Native, gtk::ShortcutManager;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Native, gtk::ShortcutManager;
 }
 
 impl Default for QuickAddPopover {

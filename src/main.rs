@@ -25,6 +25,7 @@ fn build_ui(app: &Application) {
     }
     load_css();
     let win = window::CalendarWindow::new(app);
+    app.set_accels_for_action("win.show-calendars", &["F8"]);
     gtk::prelude::GtkWindowExt::present(&win);
 }
 

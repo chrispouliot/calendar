@@ -4,9 +4,15 @@ use chrono::{DateTime, FixedOffset, NaiveDate};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::model::{Calendar, CalendarSource, DateTimeRange, Event, EventSchedule, RecurrenceSpec};
+use crate::model::{
+    Account, Calendar, CalendarSource, CalendarSyncState, DateTimeRange, Event, EventSchedule,
+    EventSyncState, RecurrenceSpec,
+};
 
-use super::{CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError};
+use super::{
+    AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError,
+    SyncStateRepository,
+};
 
 pub struct SqliteRepository {
     conn: Connection,
@@ -15,6 +21,14 @@ pub struct SqliteRepository {
 impl SqliteRepository {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
         let conn = Connection::open(path).map_err(|_| RepositoryError)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|_| RepositoryError)?;
+        let foreign_keys: i32 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .map_err(|_| RepositoryError)?;
+        if foreign_keys != 1 {
+            return Err(RepositoryError);
+        }
         // Enable WAL mode for better concurrent-reader behaviour (future-proofing).
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|_| RepositoryError)?;
@@ -26,13 +40,24 @@ impl SqliteRepository {
     fn init_schema(&self) -> Result<(), RepositoryError> {
         self.conn
             .execute_batch(
-                "CREATE TABLE IF NOT EXISTS calendars (
+                "CREATE TABLE IF NOT EXISTS accounts (
+                    id BLOB PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    server_url TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    enabled INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS calendars (
                     id BLOB PRIMARY KEY,
                     name TEXT NOT NULL,
                     color TEXT NOT NULL,
                     visible INTEGER NOT NULL,
                     read_only INTEGER NOT NULL,
-                    source TEXT NOT NULL
+                    source TEXT NOT NULL,
+                    account_id BLOB,
+                    FOREIGN KEY (account_id) REFERENCES accounts(id)
+                        ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS events (
@@ -52,6 +77,7 @@ impl SqliteRepository {
                     end_unix INTEGER NOT NULL DEFAULT 0,
                     recurrence_enabled INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (calendar_id) REFERENCES calendars(id)
+                        ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS reminders (
@@ -61,12 +87,32 @@ impl SqliteRepository {
                         ON DELETE CASCADE
                 );
 
-                CREATE TABLE IF NOT EXISTS sync_metadata (
-                    id BLOB PRIMARY KEY,
-                    calendar_id BLOB NOT NULL,
-                    FOREIGN KEY (calendar_id) REFERENCES calendars(id)
-                        ON DELETE CASCADE
-                );
+                 CREATE TABLE IF NOT EXISTS sync_metadata (
+                     id BLOB PRIMARY KEY,
+                     calendar_id BLOB NOT NULL,
+                     remote_url TEXT NOT NULL,
+                     sync_token TEXT,
+                     UNIQUE (calendar_id),
+                     FOREIGN KEY (calendar_id) REFERENCES calendars(id)
+                         ON DELETE CASCADE
+                 );
+
+                 CREATE TABLE IF NOT EXISTS event_sync_metadata (
+                     id BLOB PRIMARY KEY,
+                     calendar_id BLOB NOT NULL,
+                     event_id BLOB NOT NULL UNIQUE,
+                     remote_href TEXT NOT NULL,
+                     remote_uid TEXT NOT NULL,
+                     etag TEXT,
+                     UNIQUE (calendar_id, remote_href),
+                     FOREIGN KEY (calendar_id) REFERENCES calendars(id)
+                         ON DELETE CASCADE,
+                     FOREIGN KEY (event_id) REFERENCES events(id)
+                         ON DELETE CASCADE
+                 );
+
+                 CREATE INDEX IF NOT EXISTS event_sync_metadata_calendar_idx
+                     ON event_sync_metadata(calendar_id);
 
                 CREATE TABLE IF NOT EXISTS calendar_seed_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1)
@@ -83,7 +129,51 @@ impl SqliteRepository {
                 [],
             );
         }
+        // Add the Phase 11 account association to databases created before
+        // accounts were introduced. Existing rows remain local calendars.
+        let _ = self.conn.execute(
+            "ALTER TABLE calendars ADD COLUMN account_id BLOB REFERENCES accounts(id) ON DELETE CASCADE",
+            [],
+        );
+
+        // The original Phase 7 placeholder had only id and calendar_id. Add
+        // the identity columns in place so existing placeholder rows remain.
+        for (name, definition) in [("remote_url", "TEXT"), ("sync_token", "TEXT")] {
+            if !self.sync_metadata_has_column(name)? {
+                self.conn
+                    .execute(
+                        &format!("ALTER TABLE sync_metadata ADD COLUMN {name} {definition}"),
+                        [],
+                    )
+                    .map_err(|_| RepositoryError)?;
+            }
+        }
+        // Legacy placeholder rows have a NULL remote_url. They are retained,
+        // while actual sync state rows are unique by calendar.
+        self.conn
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sync_metadata_calendar_state_idx
+                 ON sync_metadata(calendar_id) WHERE remote_url IS NOT NULL",
+                [],
+            )
+            .map_err(|_| RepositoryError)?;
         Ok(())
+    }
+
+    fn sync_metadata_has_column(&self, name: &str) -> Result<bool, RepositoryError> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(sync_metadata)")
+            .map_err(|_| RepositoryError)?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|_| RepositoryError)?;
+        for column in columns {
+            if column.map_err(|_| RepositoryError)? == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Seed the database's default calendars exactly once.
@@ -106,12 +196,10 @@ impl SqliteRepository {
         }
 
         for calendar in defaults {
-            let source = match calendar.source {
-                CalendarSource::Local => "Local",
-            };
+            let (source, account_id) = calendar_source_values(&calendar.source);
             tx.execute(
-                "INSERT INTO calendars (id, name, color, visible, read_only, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO calendars (id, name, color, visible, read_only, source, account_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO NOTHING",
                 params![
                     calendar.id,
@@ -120,6 +208,7 @@ impl SqliteRepository {
                     calendar.visible as i32,
                     calendar.read_only as i32,
                     source,
+                    account_id,
                 ],
             )
             .map_err(|_| RepositoryError)?;
@@ -129,6 +218,13 @@ impl SqliteRepository {
             .map_err(|_| RepositoryError)?;
         tx.commit().map_err(|_| RepositoryError)?;
         Ok(true)
+    }
+}
+
+fn calendar_source_values(source: &CalendarSource) -> (&'static str, Option<Uuid>) {
+    match source {
+        CalendarSource::Local => ("Local", None),
+        CalendarSource::CalDav { account_id } => ("CalDav", Some(*account_id)),
     }
 }
 
@@ -143,8 +239,12 @@ fn calendar_from_row(row: &rusqlite::Row) -> rusqlite::Result<Calendar> {
     let visible: bool = row.get::<_, i32>(3)? != 0;
     let read_only: bool = row.get::<_, i32>(4)? != 0;
     let source_str: String = row.get(5)?;
+    let account_id: Option<Uuid> = row.get(6)?;
     let source = match source_str.as_str() {
         "Local" => CalendarSource::Local,
+        "CalDav" => account_id
+            .map(|account_id| CalendarSource::CalDav { account_id })
+            .unwrap_or(CalendarSource::Local),
         _ => CalendarSource::Local,
     };
     Ok(Calendar {
@@ -155,6 +255,101 @@ fn calendar_from_row(row: &rusqlite::Row) -> rusqlite::Result<Calendar> {
         read_only,
         source,
     })
+}
+
+fn account_from_row(row: &rusqlite::Row) -> rusqlite::Result<Account> {
+    Ok(Account {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        server_url: row.get(2)?,
+        username: row.get(3)?,
+        enabled: row.get::<_, i32>(4)? != 0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// AccountRepository
+// ---------------------------------------------------------------------------
+
+impl AccountRepository for SqliteRepository {
+    fn save_account(&mut self, account: &Account) -> Result<(), RepositoryError> {
+        self.conn
+            .execute(
+                "INSERT INTO accounts (id, name, server_url, username, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    server_url = excluded.server_url,
+                    username = excluded.username,
+                    enabled = excluded.enabled",
+                params![
+                    account.id,
+                    account.name,
+                    account.server_url,
+                    account.username,
+                    account.enabled as i32,
+                ],
+            )
+            .map_err(|_| RepositoryError)?;
+        Ok(())
+    }
+
+    fn update_account(&mut self, account: &Account) -> Result<(), RepositoryError> {
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE accounts SET
+                     name = ?1,
+                     server_url = ?2,
+                     username = ?3,
+                     enabled = ?4
+                 WHERE id = ?5",
+                params![
+                    account.name,
+                    account.server_url,
+                    account.username,
+                    account.enabled as i32,
+                    account.id,
+                ],
+            )
+            .map_err(|_| RepositoryError)?;
+        if affected == 0 {
+            return Err(RepositoryError);
+        }
+        Ok(())
+    }
+
+    fn list_accounts(&self) -> Vec<Account> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, name, server_url, username, enabled
+             FROM accounts ORDER BY id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], account_from_row)
+            .into_iter()
+            .flat_map(|rows| rows.filter_map(|r| r.ok()))
+            .collect()
+    }
+
+    fn get_account(&self, id: Uuid) -> Option<Account> {
+        self.conn
+            .query_row(
+                "SELECT id, name, server_url, username, enabled
+                 FROM accounts WHERE id = ?1",
+                params![id],
+                account_from_row,
+            )
+            .ok()
+    }
+
+    fn delete_account(&mut self, id: Uuid) -> bool {
+        self.conn
+            .execute("DELETE FROM accounts WHERE id = ?1", params![id])
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,19 +422,18 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
 
 impl CalendarRepository for SqliteRepository {
     fn save_calendar(&mut self, calendar: &Calendar) -> Result<(), RepositoryError> {
-        let source = match calendar.source {
-            CalendarSource::Local => "Local",
-        };
+        let (source, account_id) = calendar_source_values(&calendar.source);
         self.conn
             .execute(
-                "INSERT INTO calendars (id, name, color, visible, read_only, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO calendars (id, name, color, visible, read_only, source, account_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     color = excluded.color,
                     visible = excluded.visible,
                     read_only = excluded.read_only,
-                    source = excluded.source",
+                    source = excluded.source,
+                    account_id = excluded.account_id",
                 params![
                     calendar.id,
                     calendar.name,
@@ -247,17 +441,49 @@ impl CalendarRepository for SqliteRepository {
                     calendar.visible as i32,
                     calendar.read_only as i32,
                     source,
+                    account_id,
                 ],
             )
             .map_err(|_| RepositoryError)?;
         Ok(())
     }
 
+    fn update_calendar(&mut self, calendar: &Calendar) -> Result<(), RepositoryError> {
+        let (source, account_id) = calendar_source_values(&calendar.source);
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let affected = tx
+            .execute(
+                "UPDATE calendars SET
+                     name = ?1,
+                     color = ?2,
+                     visible = ?3,
+                     read_only = ?4,
+                     source = ?5,
+                     account_id = ?6
+                 WHERE id = ?7",
+                params![
+                    calendar.name,
+                    calendar.color,
+                    calendar.visible as i32,
+                    calendar.read_only as i32,
+                    source,
+                    account_id,
+                    calendar.id,
+                ],
+            )
+            .map_err(|_| RepositoryError)?;
+        if affected == 0 {
+            return Err(RepositoryError);
+        }
+        tx.commit().map_err(|_| RepositoryError)?;
+        Ok(())
+    }
+
     fn list_calendars(&self) -> Vec<Calendar> {
-        let mut stmt = match self
-            .conn
-            .prepare("SELECT id, name, color, visible, read_only, source FROM calendars")
-        {
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, name, color, visible, read_only, source, account_id
+                 FROM calendars ORDER BY id",
+        ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -270,7 +496,7 @@ impl CalendarRepository for SqliteRepository {
     fn get_calendar(&self, id: Uuid) -> Option<Calendar> {
         self.conn
             .query_row(
-                "SELECT id, name, color, visible, read_only, source \
+                "SELECT id, name, color, visible, read_only, source, account_id \
                  FROM calendars WHERE id = ?1",
                 params![id],
                 calendar_from_row,
@@ -279,10 +505,24 @@ impl CalendarRepository for SqliteRepository {
     }
 
     fn delete_calendar(&mut self, id: Uuid) -> bool {
-        self.conn
-            .execute("DELETE FROM calendars WHERE id = ?1", params![id])
-            .map(|n| n > 0)
-            .unwrap_or(false)
+        let tx = match self.conn.transaction() {
+            Ok(tx) => tx,
+            Err(_) => return false,
+        };
+        if tx
+            .execute("DELETE FROM events WHERE calendar_id = ?1", params![id])
+            .is_err()
+        {
+            return false;
+        }
+        let deleted = match tx.execute("DELETE FROM calendars WHERE id = ?1", params![id]) {
+            Ok(count) if count > 0 => true,
+            Ok(_) | Err(_) => return false,
+        };
+        if tx.commit().is_err() {
+            return false;
+        }
+        deleted
     }
 }
 
@@ -406,6 +646,148 @@ impl EventRepository for SqliteRepository {
         stmt.query_map(params![range_start_unix, range_end_unix], event_from_row)
             .into_iter()
             .flat_map(|rows| rows.filter_map(|r| r.ok()))
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SyncStateRepository
+// ---------------------------------------------------------------------------
+
+fn calendar_sync_state_from_row(row: &rusqlite::Row) -> rusqlite::Result<CalendarSyncState> {
+    Ok(CalendarSyncState {
+        calendar_id: row.get(0)?,
+        remote_url: row.get(1)?,
+        sync_token: row.get(2)?,
+    })
+}
+
+fn event_sync_state_from_row(row: &rusqlite::Row) -> rusqlite::Result<EventSyncState> {
+    Ok(EventSyncState {
+        calendar_id: row.get(0)?,
+        event_id: row.get(1)?,
+        remote_href: row.get(2)?,
+        remote_uid: row.get(3)?,
+        etag: row.get(4)?,
+    })
+}
+
+impl SyncStateRepository for SqliteRepository {
+    fn upsert_calendar_sync_state(
+        &mut self,
+        state: &CalendarSyncState,
+    ) -> Result<(), RepositoryError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE sync_metadata
+                 SET remote_url = ?1, sync_token = ?2
+                 WHERE id = (
+                     SELECT id FROM sync_metadata
+                     WHERE calendar_id = ?3
+                     ORDER BY id LIMIT 1
+                 )",
+                params![
+                    state.remote_url,
+                    state.sync_token.as_deref(),
+                    state.calendar_id
+                ],
+            )
+            .map_err(|_| RepositoryError)?;
+        if updated == 0 {
+            self.conn
+                .execute(
+                    "INSERT INTO sync_metadata
+                         (id, calendar_id, remote_url, sync_token)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        state.calendar_id,
+                        state.calendar_id,
+                        state.remote_url,
+                        state.sync_token.as_deref(),
+                    ],
+                )
+                .map_err(|_| RepositoryError)?;
+        }
+        Ok(())
+    }
+
+    fn get_calendar_sync_state(&self, calendar_id: Uuid) -> Option<CalendarSyncState> {
+        self.conn
+            .query_row(
+                "SELECT calendar_id, remote_url, sync_token
+                 FROM sync_metadata
+                 WHERE calendar_id = ?1 AND remote_url IS NOT NULL",
+                params![calendar_id],
+                calendar_sync_state_from_row,
+            )
+            .ok()
+    }
+
+    fn upsert_event_sync_state(&mut self, state: &EventSyncState) -> Result<(), RepositoryError> {
+        self.conn
+            .execute(
+                "INSERT INTO event_sync_metadata
+                     (id, calendar_id, event_id, remote_href, remote_uid, etag)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(event_id) DO UPDATE SET
+                     calendar_id = excluded.calendar_id,
+                     remote_href = excluded.remote_href,
+                     remote_uid = excluded.remote_uid,
+                     etag = excluded.etag",
+                params![
+                    state.event_id,
+                    state.calendar_id,
+                    state.event_id,
+                    state.remote_href,
+                    state.remote_uid,
+                    state.etag.as_deref(),
+                ],
+            )
+            .map_err(|_| RepositoryError)?;
+        Ok(())
+    }
+
+    fn get_event_sync_state(&self, event_id: Uuid) -> Option<EventSyncState> {
+        self.conn
+            .query_row(
+                "SELECT calendar_id, event_id, remote_href, remote_uid, etag
+                 FROM event_sync_metadata WHERE event_id = ?1",
+                params![event_id],
+                event_sync_state_from_row,
+            )
+            .ok()
+    }
+
+    fn find_event_sync_state_by_remote_href(
+        &self,
+        calendar_id: Uuid,
+        remote_href: &str,
+    ) -> Option<EventSyncState> {
+        self.conn
+            .query_row(
+                "SELECT calendar_id, event_id, remote_href, remote_uid, etag
+                 FROM event_sync_metadata
+                 WHERE calendar_id = ?1 AND remote_href = ?2",
+                params![calendar_id, remote_href],
+                event_sync_state_from_row,
+            )
+            .ok()
+    }
+
+    fn list_event_sync_states(&self, calendar_id: Uuid) -> Vec<EventSyncState> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT calendar_id, event_id, remote_href, remote_uid, etag
+             FROM event_sync_metadata
+             WHERE calendar_id = ?1
+             ORDER BY remote_href ASC, event_id ASC",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![calendar_id], event_sync_state_from_row)
+            .into_iter()
+            .flat_map(|rows| rows.filter_map(|row| row.ok()))
             .collect()
     }
 }

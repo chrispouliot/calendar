@@ -113,7 +113,7 @@ mod imp {
 glib::wrapper! {
     pub struct DateTimeChooser(ObjectSubclass<imp::DateTimeChooser>)
         @extends adw::PreferencesGroup, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl DateTimeChooser {

@@ -2,8 +2,11 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo::rerun-if-changed=data/ui/window.blp");
+    println!("cargo::rerun-if-changed=data/ui/calendar-management.blp");
     println!("cargo::rerun-if-changed=data/ui/common/date-chooser.blp");
     println!("cargo::rerun-if-changed=data/ui/common/date-chooser-row.blp");
+    println!("cargo::rerun-if-changed=data/ui/common/calendar-list.blp");
+    println!("cargo::rerun-if-changed=data/ui/common/calendar-row.blp");
     println!("cargo::rerun-if-changed=data/ui/common/date-time-chooser.blp");
     println!("cargo::rerun-if-changed=data/ui/common/quick-add-popover.blp");
     println!("cargo::rerun-if-changed=data/ui/common/event-popover.blp");
@@ -13,6 +16,7 @@ fn main() {
     println!("cargo::rerun-if-changed=data/ui/views/agenda-view.blp");
     println!("cargo::rerun-if-changed=data/style.css");
     println!("cargo::rerun-if-changed=data/resources.gresource.xml");
+    println!("cargo::rerun-if-changed=data/icons/scalable/actions/checkmark-small-symbolic.svg");
     println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-month-symbolic.svg");
     println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-week-symbolic.svg");
     println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-agenda-symbolic.svg");
@@ -31,8 +35,11 @@ fn main() {
             ui_out_dir.to_str().unwrap(),
             "data/ui",
             "data/ui/window.blp",
+            "data/ui/calendar-management.blp",
             "data/ui/common/date-chooser.blp",
             "data/ui/common/date-chooser-row.blp",
+            "data/ui/common/calendar-list.blp",
+            "data/ui/common/calendar-row.blp",
             "data/ui/common/date-time-chooser.blp",
             "data/ui/common/quick-add-popover.blp",
             "data/ui/common/event-popover.blp",

@@ -241,13 +241,26 @@ button.agenda-event .agenda-event-location {
   background-color: var(--dim-label-color, currentColor);
 }
 
-.calendar-color-swatch.calendar-color-1 { background-color: #3366cc; }
-.calendar-color-swatch.calendar-color-2 { background-color: #cc3333; }
-.calendar-color-swatch.calendar-color-3 { background-color: #33aa55; }
-.calendar-color-swatch.calendar-color-4 { background-color: #dd8833; }
-.calendar-color-swatch.calendar-color-5 { background-color: #9966cc; }
-.calendar-color-swatch.calendar-color-6 { background-color: #339999; }
-.calendar-color-swatch.calendar-color-7 { background-color: #999999; }
+.calendar-color-swatch.calendar-color-1 { background-color: #62a0ea; }
+.calendar-color-swatch.calendar-color-2 { background-color: #f66151; }
+.calendar-color-swatch.calendar-color-3 { background-color: #57e389; }
+.calendar-color-swatch.calendar-color-4 { background-color: #ffbe6f; }
+.calendar-color-swatch.calendar-color-5 { background-color: #dc8add; }
+.calendar-color-swatch.calendar-color-6 { background-color: #5bc8c9; }
+.calendar-color-swatch.calendar-color-7 { background-color: #becedd; }
+
+/* Compact palette buttons retain a clear checked state without a per-dialog
+   CSS provider. */
+button.calendar-color-preset {
+  min-width: 38px;
+  min-height: 38px;
+  padding: 6px;
+}
+
+button.calendar-color-preset:checked {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+}
 
 /* Adwaita EntryRow error state for the title. */
 adw-entry-row.error {
@@ -256,4 +269,15 @@ adw-entry-row.error {
 
 label.no-events {
   font-style: italic;
+}
+
+/* Compact calendar visibility rows, matching the navigation-sidebar list. */
+.calendar-list {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+.calendar-row {
+  min-height: 32px;
+  padding: 2px 8px;
 }

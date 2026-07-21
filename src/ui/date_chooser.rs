@@ -165,7 +165,7 @@ mod imp {
 glib::wrapper! {
     pub struct DateChooser(ObjectSubclass<imp::DateChooser>)
         @extends adw::Bin, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl DateChooser {

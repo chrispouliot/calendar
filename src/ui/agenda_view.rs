@@ -141,7 +141,7 @@ mod imp {
 glib::wrapper! {
     pub struct AgendaView(ObjectSubclass<imp::AgendaView>)
         @extends adw::Bin, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl AgendaView {
@@ -309,11 +309,16 @@ impl AgendaView {
         let mut child = imp.agenda_days_box.first_child();
         for group in groups.iter() {
             let Some(widget) = child else { break };
-            let allocation = widget.allocation();
-            if f64::from(allocation.y() + allocation.height()) > value {
+            let Some(bounds) =
+                widget.compute_bounds(imp.agenda_days_box.upcast_ref::<gtk::Widget>())
+            else {
+                child = widget.next_sibling();
+                continue;
+            };
+            if f64::from(bounds.y() + bounds.height()) > value {
                 return Some(Anchor {
                     date: group_start(group),
-                    offset: value - f64::from(allocation.y()),
+                    offset: value - f64::from(bounds.y()),
                 });
             }
             child = widget.next_sibling();
@@ -345,8 +350,12 @@ impl AgendaView {
         };
         let adjustment = imp.agenda_scroll.vadjustment();
         let max_value = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
-        let value =
-            (f64::from(widget.allocation().y()) + offset).clamp(adjustment.lower(), max_value);
+        let Some(bounds) = widget.compute_bounds(imp.agenda_days_box.upcast_ref::<gtk::Widget>())
+        else {
+            self.finish_programmatic_work();
+            return;
+        };
+        let value = (f64::from(bounds.y()) + offset).clamp(adjustment.lower(), max_value);
         adjustment.set_value(value);
         self.finish_programmatic_work();
     }

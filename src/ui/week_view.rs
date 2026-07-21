@@ -111,7 +111,7 @@ mod grid_imp {
 glib::wrapper! {
     pub struct WeekGrid(ObjectSubclass<grid_imp::WeekGrid>)
         @extends gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl WeekGrid {
@@ -268,7 +268,7 @@ impl WeekGrid {
         let Some(minutes) = self.imp().now_minutes.get() else {
             return;
         };
-        let accent = self.style_context().color();
+        let accent = self.color();
         let y = minutes / 60.0 * HOUR_HEIGHT;
         snapshot.append_color(
             &accent,
@@ -413,7 +413,7 @@ mod imp {
 glib::wrapper! {
     pub struct WeekView(ObjectSubclass<imp::WeekView>)
         @extends adw::Bin, gtk::Widget,
-        @implements gtk::Buildable, gtk::ConstraintTarget;
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl WeekView {
@@ -720,7 +720,8 @@ fn apply_event_color(button: &gtk::Button, color: &str) {
         }}"
     );
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(&css);
+    provider.load_from_string(&css);
+    // No current per-widget replacement exists; keep the provider scoped to this button.
     #[allow(deprecated)]
     button
         .style_context()
