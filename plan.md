@@ -1112,7 +1112,7 @@ Tasks:
 
 - [x] Add account/source model.
 - [x] Add authenticated CalDAV discovery backend.
-- [ ] Add account/login UI and secure credential storage.
+- [x] Add account/login UI and secure credential storage.
 - [x] Discover calendars from server.
 - [x] Sync remote events into the local cache.
 - [x] Store remote metadata:
@@ -1142,12 +1142,14 @@ Verification:
 Use integration tests against a local CalDAV server such as Radicale or another test fixture.
 
 Implemented so far: durable account/source, pending-operation, and sync
-metadata; authenticated DAV discovery; full-snapshot pulls; safe non-recurring
-iCalendar mapping/serialization; atomic local edit and SQLite reconciliation;
-conditional uploads; and conflict-preserving ETag handling. The ignored
-Radicale integration test verifies discovery, import, create, update, conflict,
-deletion, and incremental token advancement. Login UI/secret storage,
-recurrence mapping, and automatic scheduling remain.
+metadata; authenticated DAV discovery with event-calendar filtering; secure
+credential storage; account provisioning and removal UI; nonblocking initial
+event import; full-snapshot pulls; safe non-recurring iCalendar
+mapping/serialization; atomic local edit and SQLite reconciliation; conditional
+uploads; and conflict-preserving ETag handling. The ignored Radicale integration
+test verifies discovery, import, create, update, conflict, deletion, and
+incremental token advancement. Recurrence mapping and automatic scheduling
+remain.
 
 ### Phase 12: Reminders and notifications
 

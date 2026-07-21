@@ -1,9 +1,14 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
+use calendar::backend::caldav::CaldavDiscovery;
+use calendar::backend::credentials::delete_on_worker;
 use calendar::backend::{
-    CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError, SqliteRepository,
+    AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError,
+    SqliteRepository,
 };
-use calendar::model::{Calendar, CalendarSource, EmptyQuickAddTitle, Event, new_quick_add_event};
+use calendar::model::{
+    Account, Calendar, CalendarSource, EmptyQuickAddTitle, Event, new_quick_add_event,
+};
 use calendar::view_state::{ViewKind, ViewState};
 use chrono::{Datelike, NaiveDate};
 use gtk::{gio, glib};
@@ -319,6 +324,15 @@ mod imp {
                         .unwrap_or_default()
                 }
             });
+            calendars.set_list_accounts({
+                let win_weak = win.downgrade();
+                move || {
+                    win_weak
+                        .upgrade()
+                        .map(|win| win.imp().list_accounts())
+                        .unwrap_or_default()
+                }
+            });
             calendars.set_on_save({
                 let win_weak = win.downgrade();
                 move |calendar| {
@@ -344,6 +358,32 @@ mod imp {
                         .upgrade()
                         .ok_or_else(|| "The calendar window is no longer available.".to_string())
                         .and_then(|win| win.imp().delete_managed_calendar(calendar_id))
+                }
+            });
+            calendars.set_on_delete_account({
+                let win_weak = win.downgrade();
+                move |account_id| {
+                    win_weak
+                        .upgrade()
+                        .ok_or_else(|| "The calendar window is no longer available.".to_string())
+                        .and_then(|win| win.imp().delete_managed_account(account_id))
+                }
+            });
+            calendars.set_on_provision_caldav({
+                let win_weak = win.downgrade();
+                move |account, discovery| {
+                    win_weak
+                        .upgrade()
+                        .ok_or_else(|| "The calendar window is no longer available.".to_string())
+                        .and_then(|win| win.imp().provision_managed_caldav(account, discovery))
+                }
+            });
+            calendars.set_on_refresh_views({
+                let win_weak = win.downgrade();
+                move || {
+                    if let Some(win) = win_weak.upgrade() {
+                        win.imp().render_all_from_state();
+                    }
                 }
             });
             *self.calendar_management.borrow_mut() = Some(calendars);
@@ -623,6 +663,14 @@ impl imp::CalendarWindow {
             .list_calendars()
     }
 
+    fn list_accounts(&self) -> Vec<Account> {
+        self.repository
+            .borrow()
+            .as_ref()
+            .expect("repository must be initialised")
+            .list_accounts()
+    }
+
     fn save_managed_calendar(&self, calendar: &Calendar) -> Result<(), String> {
         let result = {
             let mut repo_guard = self.repository.borrow_mut();
@@ -676,6 +724,43 @@ impl imp::CalendarWindow {
         }
         self.render_all_from_state();
         Ok(())
+    }
+
+    fn delete_managed_account(&self, account_id: Uuid) -> Result<(), String> {
+        let deleted = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard
+                .as_mut()
+                .ok_or_else(|| "Account storage is unavailable.".to_string())?;
+            if repo.get_account(account_id).is_none() {
+                return Err("The account no longer exists.".to_string());
+            }
+            repo.delete_account(account_id)
+        };
+        if !deleted {
+            return Err("Could not remove the account.".to_string());
+        }
+
+        self.render_all_from_state();
+        let _ = delete_on_worker(account_id);
+        Ok(())
+    }
+
+    fn provision_managed_caldav(
+        &self,
+        account: &Account,
+        discovery: &CaldavDiscovery,
+    ) -> Result<PathBuf, String> {
+        let result = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard
+                .as_mut()
+                .ok_or_else(|| "Calendar storage is unavailable.".to_string())?;
+            repo.provision_caldav_account(account, discovery)
+        };
+        result.map_err(|_| "Could not add the online account.".to_string())?;
+        self.render_all_from_state();
+        Ok(Self::make_db_path())
     }
 
     /// Persist one visibility change without changing any other calendar

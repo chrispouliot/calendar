@@ -1,4 +1,8 @@
-use std::{fmt, path::Path};
+use std::{
+    fmt,
+    path::Path,
+    sync::mpsc::{self, Receiver},
+};
 
 use oo7::{Keyring, Secret};
 use uuid::Uuid;
@@ -76,6 +80,54 @@ impl CredentialStore {
             .await
             .map_err(|_| CredentialError)
     }
+}
+
+/// Store a credential without making the GTK thread wait for the keyring.
+pub fn store_on_worker(account: Uuid, password: Secret) -> Receiver<Result<(), CredentialError>> {
+    credential_worker("credential-store", move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| CredentialError)?;
+        runtime.block_on(async move {
+            let mut store = CredentialStore::system().await?;
+            store.store(account, password).await
+        })
+    })
+}
+
+/// Best-effort cleanup for a credential whose account could not be provisioned.
+pub fn delete_on_worker(account: Uuid) -> Receiver<Result<(), CredentialError>> {
+    credential_worker("credential-delete", move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| CredentialError)?;
+        runtime.block_on(async move {
+            let mut store = CredentialStore::system().await?;
+            store.delete(account).await
+        })
+    })
+}
+
+fn credential_worker<F>(name: &str, operation: F) -> Receiver<Result<(), CredentialError>>
+where
+    F: FnOnce() -> Result<(), CredentialError> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+            .unwrap_or(Err(CredentialError));
+        let _ = sender.send(result);
+    };
+    if std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(worker)
+        .is_err()
+    {
+        let _ = receiver;
+    }
+    receiver
 }
 
 fn attributes(account: Uuid) -> [(String, String); 2] {

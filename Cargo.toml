@@ -14,6 +14,7 @@ oo7 = { version = "0.7.0-alpha", default-features = false, features = ["tokio", 
 quick-xml = "0.41.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.31.0", features = ["bundled", "chrono", "uuid"] }
+tokio = { version = "1", features = ["rt", "time"] }
 uuid = { version = "1.23.3", default-features = false, features = ["serde", "std", "v4"] }
 
 [dev-dependencies]

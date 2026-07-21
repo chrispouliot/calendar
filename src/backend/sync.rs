@@ -1,18 +1,139 @@
 use reqwest::Url;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use uuid::Uuid;
 
 use super::caldav::{CaldavClient, CaldavError, serialize_icalendar_event};
 use super::{
-    EventRepository, PendingSyncOperationRepository, RemoteSnapshotSummary, RepositoryError,
-    SqliteRepository, SyncStateRepository,
+    CalendarRepository, EventRepository, PendingSyncOperationRepository, RemoteSnapshotSummary,
+    RepositoryError, SqliteRepository, SyncStateRepository,
 };
-use crate::model::{EventSyncState, PendingSyncOperation};
+use crate::model::{Account, CalendarSource, EventSyncState, PendingSyncOperation};
 
 #[derive(Debug)]
 pub enum PullSyncError {
     Caldav(CaldavError),
     MissingCalendarSyncState,
     Repository(RepositoryError),
+}
+
+/// The aggregate result of the initial full pull for one account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitialPullSummary {
+    pub calendars: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub skipped: usize,
+}
+
+/// Errors sent by the initial-pull worker deliberately contain no account or
+/// credential data, so formatting a terminal result cannot disclose secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialPullWorkerError {
+    InvalidCredential,
+    Caldav,
+    MissingCalendarSyncState,
+    Repository,
+    WorkerPanic,
+}
+
+/// Start an initial, full CalDAV baseline for all calendars provisioned for an
+/// account. The returned receiver is ready before any blocking database or
+/// network work begins.
+pub fn initial_pull_after_provisioning_on_worker(
+    database_path: PathBuf,
+    account: Account,
+    password: oo7::Secret,
+) -> Receiver<Result<InitialPullSummary, InitialPullWorkerError>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker_sender = sender.clone();
+    let worker = move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            initial_pull_after_provisioning(&database_path, &account, password)
+        }))
+        .unwrap_or(Err(InitialPullWorkerError::WorkerPanic));
+        let _ = worker_sender.send(result);
+    };
+
+    if std::thread::Builder::new()
+        .name("caldav-initial-pull".to_owned())
+        .spawn(worker)
+        .is_err()
+    {
+        let _ = sender.send(Err(InitialPullWorkerError::WorkerPanic));
+    }
+    receiver
+}
+
+fn initial_pull_after_provisioning(
+    database_path: &std::path::Path,
+    account: &Account,
+    password: oo7::Secret,
+) -> Result<InitialPullSummary, InitialPullWorkerError> {
+    if password.content_type() != oo7::ContentType::Text {
+        return Err(InitialPullWorkerError::InvalidCredential);
+    }
+
+    let mut repository =
+        SqliteRepository::open(database_path).map_err(|_| InitialPullWorkerError::Repository)?;
+    let client = CaldavClient::new_with_secret(
+        account.server_url.clone(),
+        account.username.clone(),
+        password,
+    );
+    let mut summary = InitialPullSummary {
+        calendars: 0,
+        added: 0,
+        updated: 0,
+        deleted: 0,
+        skipped: 0,
+    };
+
+    let calendars = repository
+        .list_calendars()
+        .into_iter()
+        .filter(|calendar| {
+            matches!(
+                calendar.source,
+                CalendarSource::CalDav { account_id } if account_id == account.id
+            )
+        })
+        .collect::<Vec<_>>();
+    for calendar in calendars {
+        let pulled = pull_calendar_full_snapshot(&client, &mut repository, calendar.id)
+            .map_err(initial_pull_error)?;
+        summary.calendars += 1;
+        summary.added += pulled.added;
+        summary.updated += pulled.updated;
+        summary.deleted += pulled.deleted;
+        summary.skipped += pulled.skipped;
+    }
+    Ok(summary)
+}
+
+fn pull_calendar_full_snapshot(
+    client: &CaldavClient,
+    repository: &mut SqliteRepository,
+    calendar_id: Uuid,
+) -> Result<RemoteSnapshotSummary, PullSyncError> {
+    let sync_state = repository
+        .get_calendar_sync_state(calendar_id)
+        .ok_or(PullSyncError::MissingCalendarSyncState)?;
+    let resources = client
+        .fetch_resources(&sync_state.remote_url)
+        .map_err(PullSyncError::Caldav)?;
+    repository
+        .reconcile_remote_snapshot(calendar_id, &resources)
+        .map_err(PullSyncError::Repository)
+}
+
+fn initial_pull_error(error: PullSyncError) -> InitialPullWorkerError {
+    match error {
+        PullSyncError::Caldav(_) => InitialPullWorkerError::Caldav,
+        PullSyncError::MissingCalendarSyncState => InitialPullWorkerError::MissingCalendarSyncState,
+        PullSyncError::Repository(_) => InitialPullWorkerError::Repository,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

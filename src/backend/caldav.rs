@@ -12,6 +12,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, USER_AGENT};
 use reqwest::{Method, Url};
 use std::str::FromStr;
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -27,7 +28,7 @@ const CURRENT_USER_PRINCIPAL_REQUEST: &str = r#"<?xml version="1.0" encoding="ut
 const CALENDAR_HOME_SET_REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-home-set/></d:prop></d:propfind>"#;
 const CALENDAR_LIST_REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="http://apple.com/ns/ical/"><d:prop><d:resourcetype/><d:displayname/><d:sync-token/><a:calendar-color/><d:current-user-privilege-set/></d:prop></d:propfind>"#;
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="http://apple.com/ns/ical/"><d:prop><d:resourcetype/><d:displayname/><d:sync-token/><a:calendar-color/><d:current-user-privilege-set/><c:supported-calendar-component-set/></d:prop></d:propfind>"#;
 const CALENDAR_QUERY_REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"/></c:comp-filter></c:filter></c:calendar-query>"#;
 
@@ -46,6 +47,28 @@ pub enum CaldavError {
     Url,
     Xml(ParseError),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryWorkerError {
+    InvalidCredential,
+    Http,
+    Parse,
+    WorkerPanic,
+}
+
+impl std::fmt::Display for DiscoveryWorkerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidCredential => "invalid CalDAV credential",
+            Self::Http => "CalDAV HTTP request failed",
+            Self::Parse => "invalid CalDAV response",
+            Self::WorkerPanic => "CalDAV worker failed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for DiscoveryWorkerError {}
 
 impl std::fmt::Display for CaldavError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,7 +91,7 @@ impl std::error::Error for CaldavError {}
 pub struct CaldavClient {
     server_url: String,
     username: String,
-    password: String,
+    password: oo7::Secret,
 }
 
 impl std::fmt::Debug for CaldavClient {
@@ -82,6 +105,18 @@ impl std::fmt::Debug for CaldavClient {
 
 impl CaldavClient {
     pub fn new(server_url: String, username: String, password: String) -> Self {
+        Self {
+            server_url,
+            username,
+            password: oo7::Secret::text(password),
+        }
+    }
+
+    pub(crate) fn new_with_secret(
+        server_url: String,
+        username: String,
+        password: oo7::Secret,
+    ) -> Self {
         Self {
             server_url,
             username,
@@ -278,11 +313,46 @@ impl CaldavClient {
         method: Method,
         url: &Url,
     ) -> reqwest::blocking::RequestBuilder {
+        let password = self.password.as_str().unwrap_or("");
         client
             .request(method, url.clone())
             .header(USER_AGENT, USER_AGENT_VALUE)
-            .basic_auth(&self.username, Some(&self.password))
+            .basic_auth(&self.username, Some(password))
     }
+}
+
+pub fn discover_on_worker(
+    server_url: String,
+    username: String,
+    password: oo7::Secret,
+) -> Receiver<Result<CaldavDiscovery, DiscoveryWorkerError>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker_sender = sender.clone();
+    let worker = move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if password.content_type() != oo7::ContentType::Text {
+                return Err(DiscoveryWorkerError::InvalidCredential);
+            }
+
+            CaldavClient::new_with_secret(server_url, username, password)
+                .discover()
+                .map_err(|error| match error {
+                    CaldavError::Xml(_) => DiscoveryWorkerError::Parse,
+                    _ => DiscoveryWorkerError::Http,
+                })
+        }))
+        .unwrap_or(Err(DiscoveryWorkerError::WorkerPanic));
+        let _ = worker_sender.send(result);
+    };
+
+    if std::thread::Builder::new()
+        .name("caldav-discovery".to_owned())
+        .spawn(worker)
+        .is_err()
+    {
+        let _ = sender.send(Err(DiscoveryWorkerError::WorkerPanic));
+    }
+    receiver
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -834,6 +904,7 @@ impl NamespaceKind {
 struct XmlNode {
     namespace: NamespaceKind,
     local_name: Vec<u8>,
+    attributes: Vec<(Vec<u8>, String)>,
     text: String,
     children: Vec<XmlNode>,
 }
@@ -847,6 +918,13 @@ impl XmlNode {
         self.children
             .iter()
             .find(|child| child.is_named(namespace, local_name))
+    }
+
+    fn attribute(&self, name: &[u8]) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|(attribute_name, _)| attribute_name == name)
+            .map(|(_, value)| value.as_str())
     }
 
     fn text_value(&self) -> String {
@@ -875,6 +953,21 @@ fn parse_xml(xml: &str) -> Result<XmlNode, ParseError> {
                 stack.push(XmlNode {
                     namespace,
                     local_name: start.local_name().as_ref().to_vec(),
+                    attributes: start
+                        .attributes()
+                        .map(|attribute| {
+                            let attribute = attribute?;
+                            Ok((
+                                attribute.key.as_ref().to_vec(),
+                                attribute
+                                    .decoded_and_normalized_value(
+                                        quick_xml::XmlVersion::Implicit1_0,
+                                        reader.decoder(),
+                                    )?
+                                    .into_owned(),
+                            ))
+                        })
+                        .collect::<Result<_, quick_xml::Error>>()?,
                     text: String::new(),
                     children: Vec::new(),
                 });
@@ -883,6 +976,21 @@ fn parse_xml(xml: &str) -> Result<XmlNode, ParseError> {
                 let node = XmlNode {
                     namespace,
                     local_name: empty.local_name().as_ref().to_vec(),
+                    attributes: empty
+                        .attributes()
+                        .map(|attribute| {
+                            let attribute = attribute?;
+                            Ok((
+                                attribute.key.as_ref().to_vec(),
+                                attribute
+                                    .decoded_and_normalized_value(
+                                        quick_xml::XmlVersion::Implicit1_0,
+                                        reader.decoder(),
+                                    )?
+                                    .into_owned(),
+                            ))
+                        })
+                        .collect::<Result<_, quick_xml::Error>>()?,
                     text: String::new(),
                     children: Vec::new(),
                 };
@@ -1024,6 +1132,7 @@ fn resource_record(response: &XmlNode) -> ResourceRecord {
 
 fn discovered_calendar(response: &XmlNode) -> Option<DiscoveredCalendar> {
     let mut is_calendar = false;
+    let mut supports_vevent = None;
     let mut display_name = None;
     let mut sync_token = None;
     let mut color = None;
@@ -1035,6 +1144,14 @@ fn discovered_calendar(response: &XmlNode) -> Option<DiscoveredCalendar> {
                     .children
                     .iter()
                     .any(|child| child.is_named(NamespaceKind::Caldav, b"calendar"));
+            }
+            (NamespaceKind::Caldav, b"supported-calendar-component-set") => {
+                let property_supports_vevent = property.children.iter().any(|child| {
+                    child.is_named(NamespaceKind::Caldav, b"comp")
+                        && child.attribute(b"name") == Some("VEVENT")
+                });
+                supports_vevent =
+                    Some(supports_vevent.unwrap_or(false) || property_supports_vevent);
             }
             (NamespaceKind::Dav, b"displayname") => {
                 display_name = Some(property.text_value());
@@ -1051,7 +1168,7 @@ fn discovered_calendar(response: &XmlNode) -> Option<DiscoveredCalendar> {
             _ => {}
         }
     }
-    is_calendar.then_some(DiscoveredCalendar {
+    (is_calendar && supports_vevent != Some(false)).then_some(DiscoveredCalendar {
         href: response_href(response),
         display_name,
         sync_token,

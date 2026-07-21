@@ -112,6 +112,39 @@ fn phase11_discovers_calendars_over_authenticated_propfind_requests() {
     assert_eq!(unauthorized.finish().len(), 1);
 }
 
+#[test]
+fn discovery_excludes_calendars_that_explicitly_lack_vevent_support() {
+    let fixture = Fixture::start(vec![
+        principal_response(),
+        home_response(),
+        mixed_component_calendars_response(),
+    ]);
+    let origin = fixture.origin();
+
+    let discovery = CaldavClient::new(format!("{origin}/dav/root/"), "ada".into(), "s3cret".into())
+        .discover()
+        .expect("mixed calendar component support must be discoverable");
+
+    let requests = fixture.finish();
+    assert_propfind(
+        &requests[2],
+        "/calendars/ada/",
+        "1",
+        &["supported-calendar-component-set"],
+    );
+    assert_eq!(
+        discovery
+            .calendars
+            .iter()
+            .map(|calendar| calendar.href.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            format!("{origin}/calendars/ada/events/"),
+            format!("{origin}/calendars/ada/legacy/"),
+        ]
+    );
+}
+
 struct Fixture {
     origin: String,
     server: JoinHandle<Result<Vec<String>, String>>,
@@ -256,5 +289,13 @@ fn calendars_response() -> String {
         207,
         "Multi-Status",
         r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="http://apple.com/ns/ical/"><d:response><d:href>work/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><d:displayname>Work</d:displayname><d:sync-token>work-token</d:sync-token><a:calendar-color>#336699FF</a:calendar-color><d:current-user-privilege-set><d:privilege><d:write/></d:privilege></d:current-user-privilege-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/calendars/ada/read-only/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype><d:displayname>Read only</d:displayname><d:sync-token>read-token</d:sync-token><d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#,
+    )
+}
+
+fn mixed_component_calendars_response() -> String {
+    http_response(
+        207,
+        "Multi-Status",
+        r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>events/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>tasks/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><c:supported-calendar-component-set><c:comp name="VTODO"/></c:supported-calendar-component-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>legacy/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#,
     )
 }
