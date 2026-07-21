@@ -10,6 +10,7 @@ use gtk::glib;
 use uuid::Uuid;
 
 type SaveFn = Box<dyn Fn(Event, bool) -> bool>;
+type DeleteFn = Box<dyn Fn(Uuid) -> bool>;
 
 #[derive(Clone)]
 pub struct OriginalTimedEvent {
@@ -43,6 +44,12 @@ mod imp {
         #[template_child]
         pub description_view: TemplateChild<gtk::TextView>,
         #[template_child]
+        pub repeat_row: TemplateChild<adw::ActionRow>,
+        #[template_child]
+        pub reminders_row: TemplateChild<adw::ActionRow>,
+        #[template_child]
+        pub delete_event_row: TemplateChild<adw::ButtonRow>,
+        #[template_child]
         pub error_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub cancel_button: TemplateChild<gtk::Button>,
@@ -57,6 +64,7 @@ mod imp {
         pub start_date_time_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
         pub end_date_time_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
         pub on_save: RefCell<Option<SaveFn>>,
+        pub on_delete: RefCell<Option<DeleteFn>>,
     }
 
     #[glib::object_subclass]
@@ -137,6 +145,31 @@ mod imp {
                     adw::prelude::AdwDialogExt::close(&editor);
                 }
             });
+
+            let weak = self.obj().downgrade();
+            self.delete_event_row.connect_activated(move |_| {
+                let Some(editor) = weak.upgrade() else {
+                    return;
+                };
+                let Some(event_id) = editor
+                    .imp()
+                    .editing_event
+                    .borrow()
+                    .as_ref()
+                    .map(|event| event.id)
+                else {
+                    return;
+                };
+                if editor
+                    .imp()
+                    .on_delete
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|callback| callback(event_id))
+                {
+                    adw::prelude::AdwDialogExt::force_close(&editor);
+                }
+            });
         }
     }
 
@@ -165,6 +198,10 @@ impl EventEditor {
         *self.imp().on_save.borrow_mut() = Some(Box::new(callback));
     }
 
+    pub fn set_on_delete<F: Fn(Uuid) -> bool + 'static>(&self, callback: F) {
+        *self.imp().on_delete.borrow_mut() = Some(Box::new(callback));
+    }
+
     /// Set writable repository calendars. The list is deliberately rebuilt on
     /// every open so stale or read-only choices cannot be submitted.
     pub fn set_calendars(&self, calendars: &[Calendar]) {
@@ -187,9 +224,11 @@ impl EventEditor {
     pub fn set_create_defaults(&self, title: &str, calendar_id: Uuid, date: NaiveDate) {
         let imp = self.imp();
         *imp.editing_event.borrow_mut() = None;
+        imp.delete_event_row.set_visible(false);
         imp.title_entry.set_text(title);
         imp.location_entry.set_text("");
         imp.description_view.buffer().set_text("");
+        imp.set_placeholder_state(false, 0);
         *imp.original_timed_event.borrow_mut() = None;
         select_calendar(&imp.calendar_row, &imp.calendars.borrow(), calendar_id);
         imp.schedule_stack.set_visible_child_name("all-day");
@@ -216,9 +255,11 @@ impl EventEditor {
     pub fn set_event(&self, event: &Event) {
         let imp = self.imp();
         *imp.editing_event.borrow_mut() = Some(event.clone());
+        imp.delete_event_row.set_visible(true);
         imp.title_entry.set_text(&event.title);
         imp.location_entry.set_text(&event.location);
         imp.description_view.buffer().set_text(&event.description);
+        imp.set_placeholder_state(event.recurrence.is_some(), event.reminders.len());
         select_calendar(
             &imp.calendar_row,
             &imp.calendars.borrow(),
@@ -286,6 +327,21 @@ impl EventEditor {
 }
 
 impl imp::EventEditor {
+    fn set_placeholder_state(&self, has_recurrence: bool, reminder_count: usize) {
+        self.repeat_row.set_subtitle(if has_recurrence {
+            "Existing recurrence"
+        } else {
+            "Does not repeat"
+        });
+
+        let reminder_subtitle = match reminder_count {
+            0 => "No reminders".to_string(),
+            1 => "1 reminder".to_string(),
+            count => format!("{count} reminders"),
+        };
+        self.reminders_row.set_subtitle(&reminder_subtitle);
+    }
+
     fn schedule_changed(&self) {
         let all_day = self.schedule_stack.visible_child_name().as_deref() == Some("all-day");
         if all_day {

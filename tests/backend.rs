@@ -508,3 +508,65 @@ fn phase4_in_memory_repository_crud_and_range_query() {
         "range query must be ordered by event start time ascending"
     );
 }
+
+#[test]
+fn phase9_delete_event_with_undo() {
+    let mut repo = InMemoryRepository::new();
+    let calendar_id = Uuid::parse_str("99999999-9999-9999-9999-999999999999").unwrap();
+    let event = Event {
+        id: Uuid::parse_str("dddddddd-dddd-dddd-dddd-dddddddddddd").unwrap(),
+        calendar_id,
+        title: "Project handoff".to_string(),
+        location: "Conference room".to_string(),
+        description: "Bring the complete brief.".to_string(),
+        schedule: EventSchedule::Timed {
+            start: at(2026, 9, 9, 14, 0),
+            end: at(2026, 9, 9, 15, 30),
+            timezone: Some("Europe/Berlin".to_string()),
+        },
+        recurrence: None,
+        reminders: Vec::new(),
+    };
+    repo.save_event(&event)
+        .expect("saving the event fixture must succeed");
+
+    let unknown_id = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+    assert!(
+        repo.delete_event_with_undo(unknown_id).is_none(),
+        "deleting an unknown event must report no deletion"
+    );
+    assert_eq!(
+        repo.get_event(event.id),
+        Some(event.clone()),
+        "an unknown deletion must leave existing events unchanged"
+    );
+
+    let mut undo = repo
+        .delete_event_with_undo(event.id)
+        .expect("deleting an existing event must return an undo value");
+    assert_eq!(
+        undo.event, event,
+        "the undo value must retain the complete removed event"
+    );
+    assert!(
+        repo.get_event(event.id).is_none(),
+        "the deleted event must no longer be queryable"
+    );
+
+    repo.undo_delete_event(&mut undo)
+        .expect("applying the deletion undo must succeed once");
+    assert_eq!(
+        repo.get_event(event.id),
+        Some(event.clone()),
+        "applying undo must restore the exact event so it is queryable again"
+    );
+    assert!(
+        repo.undo_delete_event(&mut undo).is_err(),
+        "reapplying a used undo must fail rather than overwrite or duplicate data"
+    );
+    assert_eq!(
+        repo.get_event(event.id),
+        Some(event),
+        "a rejected repeat undo must leave the restored event unchanged"
+    );
+}

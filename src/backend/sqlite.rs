@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::model::{Calendar, CalendarSource, DateTimeRange, Event, EventSchedule, RecurrenceSpec};
 
-use super::{CalendarRepository, EventRepository, RepositoryError};
+use super::{CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError};
 
 pub struct SqliteRepository {
     conn: Connection,
@@ -343,6 +343,27 @@ impl EventRepository for SqliteRepository {
             .execute("DELETE FROM events WHERE id = ?1", params![id])
             .map(|n| n > 0)
             .unwrap_or(false)
+    }
+
+    fn delete_event_with_undo(&mut self, id: Uuid) -> Option<EventDeletionUndo> {
+        let event = self.get_event(id)?;
+        if self.delete_event(id) {
+            Some(EventDeletionUndo {
+                event,
+                restored: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn undo_delete_event(&mut self, undo: &mut EventDeletionUndo) -> Result<(), RepositoryError> {
+        if undo.restored || self.get_event(undo.event.id).is_some() {
+            return Err(RepositoryError);
+        }
+        insert_event(&self.conn, &undo.event)?;
+        undo.restored = true;
+        Ok(())
     }
 
     fn list_events_for_calendar(&self, calendar_id: Uuid) -> Vec<Event> {

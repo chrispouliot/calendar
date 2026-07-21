@@ -10,6 +10,14 @@ use crate::model::{Calendar, DateTimeRange, Event, EventSchedule, RangeOverlap};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepositoryError;
 
+/// The event removed by `delete_event_with_undo`, together with its one-time
+/// restoration state.
+#[derive(Debug)]
+pub struct EventDeletionUndo {
+    pub event: Event,
+    restored: bool,
+}
+
 /// Storage abstraction for calendars. Methods take `&mut self` so a single
 /// in-memory repository can be updated in place.
 pub trait CalendarRepository {
@@ -38,6 +46,13 @@ pub trait EventRepository {
 
     /// Returns true iff an event with that ID was present.
     fn delete_event(&mut self, id: Uuid) -> bool;
+
+    /// Delete an event and return the complete event needed to undo the
+    /// deletion, or `None` when no event with that ID exists.
+    fn delete_event_with_undo(&mut self, id: Uuid) -> Option<EventDeletionUndo>;
+
+    /// Restore a deletion exactly once. Existing events are never replaced.
+    fn undo_delete_event(&mut self, undo: &mut EventDeletionUndo) -> Result<(), RepositoryError>;
 
     /// All events for the given calendar UUID. Order is not pinned.
     fn list_events_for_calendar(&self, calendar_id: Uuid) -> Vec<Event>;
@@ -105,6 +120,22 @@ impl EventRepository for InMemoryRepository {
 
     fn delete_event(&mut self, id: Uuid) -> bool {
         self.events.remove(&id).is_some()
+    }
+
+    fn delete_event_with_undo(&mut self, id: Uuid) -> Option<EventDeletionUndo> {
+        self.events.remove(&id).map(|event| EventDeletionUndo {
+            event,
+            restored: false,
+        })
+    }
+
+    fn undo_delete_event(&mut self, undo: &mut EventDeletionUndo) -> Result<(), RepositoryError> {
+        if undo.restored || self.events.contains_key(&undo.event.id) {
+            return Err(RepositoryError);
+        }
+        self.events.insert(undo.event.id, undo.event.clone());
+        undo.restored = true;
+        Ok(())
     }
 
     fn list_events_for_calendar(&self, calendar_id: Uuid) -> Vec<Event> {

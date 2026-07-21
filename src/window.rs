@@ -1,12 +1,15 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::backend::{CalendarRepository, EventRepository, RepositoryError, SqliteRepository};
+use calendar::backend::{
+    CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError, SqliteRepository,
+};
 use calendar::model::{Calendar, CalendarSource, EmptyQuickAddTitle, Event, new_quick_add_event};
 use calendar::view_state::{ViewKind, ViewState};
 use chrono::{Datelike, NaiveDate};
 use gtk::{gio, glib};
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use uuid::Uuid;
 
 mod imp {
@@ -219,6 +222,14 @@ mod imp {
                     win_weak
                         .upgrade()
                         .is_some_and(|win| win.imp().persist_editor_event(&event, editing))
+                }
+            });
+            editor.set_on_delete({
+                let win_weak = win_weak.clone();
+                move |event_id| {
+                    win_weak
+                        .upgrade()
+                        .is_some_and(|win| win.imp().delete_editor_event(event_id))
                 }
             });
 
@@ -737,6 +748,79 @@ impl imp::CalendarWindow {
                 self.overlay
                     .add_toast(adw::Toast::new("Could not save event."));
                 false
+            }
+        }
+    }
+
+    fn delete_editor_event(&self, event_id: Uuid) -> bool {
+        let undo = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard.as_mut().expect("repository must be initialised");
+            let Some(event) = repo.get_event(event_id) else {
+                self.overlay
+                    .add_toast(adw::Toast::new("Could not delete event."));
+                return false;
+            };
+            let Some(calendar) = repo.get_calendar(event.calendar_id) else {
+                self.overlay
+                    .add_toast(adw::Toast::new("Could not delete event."));
+                return false;
+            };
+            if calendar.read_only {
+                self.overlay
+                    .add_toast(adw::Toast::new("This event is on a read-only calendar."));
+                return false;
+            }
+            let Some(undo) = repo.delete_event_with_undo(event_id) else {
+                self.overlay
+                    .add_toast(adw::Toast::new("Could not delete event."));
+                return false;
+            };
+            undo
+        };
+
+        self.render_all_from_state();
+
+        let pending = Rc::new(RefCell::new(Some(undo)));
+        let toast = adw::Toast::builder()
+            .title("Event deleted")
+            .button_label("Undo")
+            .timeout(5)
+            .build();
+
+        let pending_click = pending.clone();
+        let win_weak = self.obj().downgrade();
+        toast.connect_button_clicked(move |_| {
+            let Some(mut undo) = pending_click.borrow_mut().take() else {
+                return;
+            };
+            if let Some(win) = win_weak.upgrade() {
+                win.imp().restore_deleted_event(&mut undo);
+            }
+        });
+
+        let pending_dismiss = pending.clone();
+        toast.connect_dismissed(move |_| {
+            pending_dismiss.borrow_mut().take();
+        });
+        self.overlay.add_toast(toast);
+        true
+    }
+
+    fn restore_deleted_event(&self, undo: &mut EventDeletionUndo) {
+        let result = {
+            let mut repo_guard = self.repository.borrow_mut();
+            let repo = repo_guard.as_mut().expect("repository must be initialised");
+            repo.undo_delete_event(undo)
+        };
+        match result {
+            Ok(()) => {
+                self.render_all_from_state();
+                self.overlay.add_toast(adw::Toast::new("Event restored."));
+            }
+            Err(RepositoryError) => {
+                self.overlay
+                    .add_toast(adw::Toast::new("Could not restore event."));
             }
         }
     }

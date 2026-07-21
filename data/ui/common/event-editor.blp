@@ -98,6 +98,44 @@ template $EventEditor: Adw.Dialog {
           styles ["card"]
         }
 
+        Adw.PreferencesGroup recurrence_reminder_group {
+          Adw.ActionRow repeat_row {
+            title: _("Repeat");
+            subtitle: _("Does not repeat");
+            activatable: false;
+
+            [suffix]
+            Label {
+              label: _("Additional options unavailable");
+              styles ["dim-label"]
+            }
+          }
+
+          Adw.ActionRow reminders_row {
+            title: _("Reminders");
+            subtitle: _("No reminders");
+            activatable: false;
+
+            [suffix]
+            Label {
+              label: _("Additional options unavailable");
+              styles ["dim-label"]
+            }
+          }
+        }
+
+        Adw.PreferencesGroup delete_group {
+          Adw.ButtonRow delete_event_row {
+            title: _("_Delete Event");
+            use-underline: true;
+            visible: false;
+
+            styles [
+              "destructive-action",
+            ]
+          }
+        }
+
         Label error_label {
           wrap: true;
           xalign: 0.0;

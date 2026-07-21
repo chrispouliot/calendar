@@ -1043,21 +1043,21 @@ rendering and bidirectional Agenda range loading with stable scroll anchoring.
 
 Goal: full create/edit/delete for local events.
 
-Status: Not started
+Status: Complete
 
 Tasks:
 
-- [ ] Add event editor dialog.
-- [ ] Support fields:
-  - [ ] title
-  - [ ] calendar
-  - [ ] start/end
-  - [ ] all-day
-  - [ ] location
-  - [ ] description
-- [ ] Save/update existing events.
-- [ ] Delete with undo toast.
-- [ ] Add recurrence/reminders as placeholders or minimal models first.
+- [x] Add event editor dialog.
+- [x] Support fields:
+  - [x] title
+  - [x] calendar
+  - [x] start/end
+  - [x] all-day
+  - [x] location
+  - [x] description
+- [x] Save/update existing events.
+- [x] Delete with undo toast.
+- [x] Add recurrence/reminders as placeholders or minimal models first.
 
 Verification:
 
@@ -1067,6 +1067,11 @@ cargo run
 ```
 
 Manual check: create, edit, delete, undo delete.
+
+Implemented with a native `AdwDialog`, compact GNOME Calendar-style schedule
+selectors, validated SQLite create/update, immediate delete with a single-use
+undo toast, and honest recurrence/reminder state placeholders. Manual create,
+edit, delete, undo, layout, and restart checks pass.
 
 ### Phase 10: Calendar management
 
