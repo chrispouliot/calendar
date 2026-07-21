@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
@@ -10,8 +11,8 @@ use crate::model::{
 };
 
 use super::{
-    AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError,
-    SyncStateRepository,
+    AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository,
+    RemoteSnapshotSummary, RepositoryError, SyncStateRepository,
 };
 
 pub struct SqliteRepository {
@@ -174,6 +175,111 @@ impl SqliteRepository {
             }
         }
         Ok(false)
+    }
+
+    pub fn reconcile_remote_snapshot(
+        &mut self,
+        calendar_id: Uuid,
+        resources: &[super::caldav::ResourceRecord],
+    ) -> Result<RemoteSnapshotSummary, RepositoryError> {
+        let calendar = self.get_calendar(calendar_id).ok_or(RepositoryError)?;
+        if !matches!(calendar.source, CalendarSource::CalDav { .. }) {
+            return Err(RepositoryError);
+        }
+
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let tracked_states = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT calendar_id, event_id, remote_href, remote_uid, etag
+                     FROM event_sync_metadata
+                     WHERE calendar_id = ?1",
+                )
+                .map_err(|_| RepositoryError)?;
+            statement
+                .query_map(params![calendar_id], event_sync_state_from_row)
+                .map_err(|_| RepositoryError)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| RepositoryError)?
+        };
+        let tracked_by_href: HashMap<String, EventSyncState> = tracked_states
+            .iter()
+            .cloned()
+            .map(|state| (state.remote_href.clone(), state))
+            .collect();
+
+        let mut seen_hrefs = HashSet::new();
+        let mut summary = RemoteSnapshotSummary {
+            added: 0,
+            updated: 0,
+            deleted: 0,
+            skipped: 0,
+        };
+
+        for resource in resources {
+            seen_hrefs.insert(resource.href.clone());
+            let tracked = tracked_by_href.get(&resource.href);
+
+            if resource.response_status == Some(404) {
+                if let Some(state) = tracked {
+                    delete_remote_event(&tx, state)?;
+                    summary.deleted += 1;
+                } else {
+                    summary.skipped += 1;
+                }
+                continue;
+            }
+
+            if resource
+                .response_status
+                .is_some_and(|status| !(200..300).contains(&status))
+            {
+                summary.skipped += 1;
+                continue;
+            }
+
+            let Some(calendar_data) = resource.calendar_data.as_deref() else {
+                summary.skipped += 1;
+                continue;
+            };
+
+            let event_id = tracked.map_or_else(Uuid::new_v4, |state| state.event_id);
+            let mapped =
+                match super::caldav::map_icalendar_event(calendar_data, event_id, calendar_id) {
+                    Ok(mapped) => mapped,
+                    Err(_) => {
+                        summary.skipped += 1;
+                        continue;
+                    }
+                };
+            let state = EventSyncState {
+                calendar_id,
+                event_id,
+                remote_href: resource.href.clone(),
+                remote_uid: mapped.remote_uid,
+                etag: resource.etag.clone(),
+            };
+
+            if tracked.is_some() {
+                replace_remote_event(&tx, &mapped.event)?;
+                upsert_event_sync_state_in_transaction(&tx, &state)?;
+                summary.updated += 1;
+            } else {
+                insert_event(&tx, &mapped.event)?;
+                upsert_event_sync_state_in_transaction(&tx, &state)?;
+                summary.added += 1;
+            }
+        }
+
+        for state in &tracked_states {
+            if !seen_hrefs.contains(&state.remote_href) {
+                delete_remote_event(&tx, state)?;
+                summary.deleted += 1;
+            }
+        }
+
+        tx.commit().map_err(|_| RepositoryError)?;
+        Ok(summary)
     }
 
     /// Seed the database's default calendars exactly once.
@@ -853,5 +959,74 @@ fn insert_event(conn: &Connection, event: &Event) -> Result<(), RepositoryError>
             .map_err(|_| RepositoryError)?;
         }
     }
+    Ok(())
+}
+
+fn replace_remote_event(
+    tx: &rusqlite::Transaction<'_>,
+    event: &Event,
+) -> Result<(), RepositoryError> {
+    let deleted = tx
+        .execute(
+            "DELETE FROM events WHERE id = ?1 AND calendar_id = ?2",
+            params![event.id, event.calendar_id],
+        )
+        .map_err(|_| RepositoryError)?;
+    if deleted == 0 {
+        return Err(RepositoryError);
+    }
+    insert_event(tx, event)
+}
+
+fn delete_remote_event(
+    tx: &rusqlite::Transaction<'_>,
+    state: &EventSyncState,
+) -> Result<(), RepositoryError> {
+    let metadata_deleted = tx
+        .execute(
+            "DELETE FROM event_sync_metadata
+             WHERE calendar_id = ?1 AND event_id = ?2",
+            params![state.calendar_id, state.event_id],
+        )
+        .map_err(|_| RepositoryError)?;
+    if metadata_deleted == 0 {
+        return Err(RepositoryError);
+    }
+
+    let event_deleted = tx
+        .execute(
+            "DELETE FROM events WHERE id = ?1 AND calendar_id = ?2",
+            params![state.event_id, state.calendar_id],
+        )
+        .map_err(|_| RepositoryError)?;
+    if event_deleted == 0 {
+        return Err(RepositoryError);
+    }
+    Ok(())
+}
+
+fn upsert_event_sync_state_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    state: &EventSyncState,
+) -> Result<(), RepositoryError> {
+    tx.execute(
+        "INSERT INTO event_sync_metadata
+             (id, calendar_id, event_id, remote_href, remote_uid, etag)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(event_id) DO UPDATE SET
+             calendar_id = excluded.calendar_id,
+             remote_href = excluded.remote_href,
+             remote_uid = excluded.remote_uid,
+             etag = excluded.etag",
+        params![
+            state.event_id,
+            state.calendar_id,
+            state.event_id,
+            state.remote_href,
+            state.remote_uid,
+            state.etag.as_deref(),
+        ],
+    )
+    .map_err(|_| RepositoryError)?;
     Ok(())
 }

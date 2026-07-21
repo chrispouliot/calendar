@@ -1112,8 +1112,8 @@ Tasks:
 
 - [x] Add account/source model.
 - [ ] Add CalDAV discovery/login flow.
-- [ ] Discover calendars from server.
-- [ ] Sync events.
+- [x] Discover calendars from server.
+- [x] Sync remote events into the local cache.
 - [x] Store remote metadata:
   - [x] URL
   - [x] UID
@@ -1137,6 +1137,13 @@ tokio or GLib async integration approach
 Verification:
 
 Use integration tests against a local CalDAV server such as Radicale or another test fixture.
+
+Implemented so far: durable account/source and sync metadata, namespace-aware
+DAV discovery, authenticated calendar discovery, full-snapshot VEVENT pulls,
+safe non-recurring iCalendar mapping, and atomic SQLite reconciliation. The
+ignored Radicale integration test verifies discovery, import, ETag storage, and
+remote deletion. Login UI/secret storage, recurrence mapping, incremental sync,
+local uploads, and conflict handling remain.
 
 ### Phase 12: Reminders and notifications
 

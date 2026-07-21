@@ -70,6 +70,7 @@
               pkgs.cargo-edit
               pkgs.cargo-watch
               pkgs.git
+              pkgs.radicale
 
               # Native build system and pkg-config discovery
               pkgs.pkg-config

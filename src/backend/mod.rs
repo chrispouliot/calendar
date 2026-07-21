@@ -1,4 +1,5 @@
 pub mod caldav;
+pub mod sync;
 
 mod sqlite;
 
@@ -14,6 +15,14 @@ use crate::model::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepositoryError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteSnapshotSummary {
+    pub added: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub skipped: usize,
+}
 
 /// The event removed by `delete_event_with_undo`, together with its one-time
 /// restoration state.

@@ -7,11 +7,211 @@ use quick_xml::escape::unescape;
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
+use reqwest::blocking::Client;
+use reqwest::header::{CONTENT_TYPE, USER_AGENT};
+use reqwest::{Method, Url};
 use std::str::FromStr;
+use std::time::Duration;
 use uuid::Uuid;
 
 const DAV_NAMESPACE: &[u8] = b"DAV:";
 const CALDAV_NAMESPACE: &[u8] = b"urn:ietf:params:xml:ns:caldav";
+const APPLE_ICAL_NAMESPACE: &[u8] = b"http://apple.com/ns/ical/";
+
+const PROPFIND: &str = "PROPFIND";
+const REPORT: &str = "REPORT";
+const USER_AGENT_VALUE: &str = "calendar-caldav/0.1";
+const CURRENT_USER_PRINCIPAL_REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#;
+const CALENDAR_HOME_SET_REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-home-set/></d:prop></d:propfind>"#;
+const CALENDAR_LIST_REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="http://apple.com/ns/ical/"><d:prop><d:resourcetype/><d:displayname/><d:sync-token/><a:calendar-color/><d:current-user-privilege-set/></d:prop></d:propfind>"#;
+const CALENDAR_QUERY_REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"/></c:comp-filter></c:filter></c:calendar-query>"#;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaldavDiscovery {
+    pub principal_url: String,
+    pub calendar_home_url: String,
+    pub calendars: Vec<DiscoveredCalendar>,
+}
+
+#[derive(Debug)]
+pub enum CaldavError {
+    HttpStatus { status: u16 },
+    Transport,
+    Url,
+    Xml(ParseError),
+}
+
+impl std::fmt::Display for CaldavError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HttpStatus { status } => {
+                write!(formatter, "CalDAV request returned HTTP {status}")
+            }
+            Self::Transport => write!(formatter, "CalDAV HTTP request failed"),
+            Self::Url => write!(formatter, "invalid CalDAV URL"),
+            Self::Xml(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CaldavError {}
+
+/// Credentials remain in this client and its requests only. Because this API
+/// is blocking, callers should use it from a dedicated worker thread.
+pub struct CaldavClient {
+    server_url: String,
+    username: String,
+    password: String,
+}
+
+impl std::fmt::Debug for CaldavClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaldavClient")
+            .field("server_url", &self.server_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CaldavClient {
+    pub fn new(server_url: String, username: String, password: String) -> Self {
+        Self {
+            server_url,
+            username,
+            password,
+        }
+    }
+
+    pub fn discover(&self) -> Result<CaldavDiscovery, CaldavError> {
+        let server_url = Url::parse(&self.server_url).map_err(|_| CaldavError::Url)?;
+        let client = self.http_client()?;
+
+        let principal_href = self.propfind(
+            &client,
+            &server_url,
+            "0",
+            CURRENT_USER_PRINCIPAL_REQUEST,
+            parse_current_user_principal,
+        )?;
+        let principal_url = resolve_href(&server_url, &principal_href)?;
+
+        let home_href = self.propfind(
+            &client,
+            &principal_url,
+            "0",
+            CALENDAR_HOME_SET_REQUEST,
+            parse_calendar_home_set,
+        )?;
+        let calendar_home_url = resolve_href(&principal_url, &home_href)?;
+
+        let calendars_xml =
+            self.request(&client, &calendar_home_url, "1", CALENDAR_LIST_REQUEST)?;
+        let mut calendars =
+            parse_calendar_home_multistatus(&calendars_xml).map_err(CaldavError::Xml)?;
+        for calendar in &mut calendars {
+            calendar.href = resolve_href(&calendar_home_url, &calendar.href)?.to_string();
+        }
+
+        Ok(CaldavDiscovery {
+            principal_url: principal_url.to_string(),
+            calendar_home_url: calendar_home_url.to_string(),
+            calendars,
+        })
+    }
+
+    pub fn fetch_resources(&self, calendar_url: &str) -> Result<Vec<ResourceRecord>, CaldavError> {
+        let calendar_url = Url::parse(calendar_url)
+            .map_err(|_| CaldavError::Url)
+            .and_then(validate_http_url)?;
+        let client = self.http_client()?;
+        let response =
+            self.request_method(&client, REPORT, &calendar_url, "1", CALENDAR_QUERY_REQUEST)?;
+        let mut resources = parse_multistatus(&response).map_err(CaldavError::Xml)?;
+        for resource in &mut resources {
+            resource.href = resolve_href(&calendar_url, &resource.href)?.to_string();
+        }
+        Ok(resources)
+    }
+
+    fn http_client(&self) -> Result<Client, CaldavError> {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .user_agent(USER_AGENT_VALUE)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| CaldavError::Transport)
+    }
+
+    fn propfind(
+        &self,
+        client: &Client,
+        url: &Url,
+        depth: &str,
+        body: &str,
+        parser: fn(&str) -> Result<String, ParseError>,
+    ) -> Result<String, CaldavError> {
+        let response = self.request(client, url, depth, body)?;
+        parser(&response).map_err(CaldavError::Xml)
+    }
+
+    fn request(
+        &self,
+        client: &Client,
+        url: &Url,
+        depth: &str,
+        body: &str,
+    ) -> Result<String, CaldavError> {
+        self.request_method(client, PROPFIND, url, depth, body)
+    }
+
+    fn request_method(
+        &self,
+        client: &Client,
+        method_name: &str,
+        url: &Url,
+        depth: &str,
+        body: &str,
+    ) -> Result<String, CaldavError> {
+        let method =
+            Method::from_bytes(method_name.as_bytes()).map_err(|_| CaldavError::Transport)?;
+        let response = client
+            .request(method, url.clone())
+            .header("Depth", depth)
+            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .basic_auth(&self.username, Some(&self.password))
+            .body(body.to_owned())
+            .send()
+            .map_err(|_| CaldavError::Transport)?;
+        response_body(response)
+    }
+}
+
+fn validate_http_url(url: Url) -> Result<Url, CaldavError> {
+    if url.host_str().is_none() || !matches!(url.scheme(), "http" | "https") {
+        return Err(CaldavError::Url);
+    }
+    Ok(url)
+}
+
+fn response_body(response: reqwest::blocking::Response) -> Result<String, CaldavError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(CaldavError::HttpStatus {
+            status: status.as_u16(),
+        });
+    }
+    response.text().map_err(|_| CaldavError::Transport)
+}
+
+fn resolve_href(base: &Url, href: &str) -> Result<Url, CaldavError> {
+    base.join(href).map_err(|_| CaldavError::Url)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedEvent {
@@ -235,193 +435,65 @@ impl From<quick_xml::Error> for ParseError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredCalendar {
+    pub href: String,
+    pub display_name: Option<String>,
+    pub sync_token: Option<String>,
+    pub color: Option<String>,
+    pub writable: bool,
+}
+
 pub fn parse_multistatus(xml: &str) -> Result<Vec<ResourceRecord>, ParseError> {
-    let mut reader = NsReader::from_str(xml);
-    reader.config_mut().trim_text(false);
-    let mut stack = Vec::new();
-    let mut records = Vec::new();
-    let mut response = None;
-    let mut propstat = None;
-    let mut capture = None;
-    let mut root_seen = false;
+    let root = parse_xml(xml)?;
+    let responses = multistatus_responses(&root)?;
+    Ok(responses.into_iter().map(resource_record).collect())
+}
 
-    loop {
-        let (resolved_namespace, event) = reader.read_resolved_event()?;
-        let namespace = NamespaceKind::from_resolved(resolved_namespace);
-        match event {
-            XmlEvent::Start(start) => {
-                let local_name = start.local_name().as_ref().to_vec();
-                if stack.is_empty() {
-                    if root_seen {
-                        return Err(malformed("multiple XML roots"));
-                    }
-                    root_seen = true;
-                    if namespace != NamespaceKind::Dav || local_name != b"multistatus" {
-                        return Err(malformed("root is not DAV:multistatus"));
-                    }
-                }
-
-                let parent = stack.last();
-                if namespace == NamespaceKind::Dav
-                    && local_name == b"response"
-                    && response.is_none()
-                {
-                    response = Some(ResponseState::default());
-                } else if namespace == NamespaceKind::Dav
-                    && local_name == b"propstat"
-                    && response.is_some()
-                    && propstat.is_none()
-                {
-                    propstat = Some(PropstatState::default());
-                } else if let Some(parent) = parent
-                    && let Some(kind) = capture_kind(
-                        parent,
-                        namespace,
-                        &local_name,
-                        response.is_some(),
-                        propstat.is_some(),
-                    )
-                {
-                    capture = Some(CaptureState {
-                        depth: stack.len() + 1,
-                        kind,
-                        value: String::new(),
-                    });
-                }
-
-                stack.push(Element {
-                    namespace,
-                    local_name,
-                });
+pub fn parse_current_user_principal(xml: &str) -> Result<String, ParseError> {
+    let root = parse_xml(xml)?;
+    let responses = multistatus_responses(&root)?;
+    for response in responses {
+        for property in successful_properties(response) {
+            if property.is_named(NamespaceKind::Dav, b"current-user-principal")
+                && let Some(href) = property.child(NamespaceKind::Dav, b"href")
+            {
+                return nonempty_value(href.text_value(), "missing current-user-principal href");
             }
-            XmlEvent::Empty(empty) => {
-                let local_name = empty.local_name().as_ref().to_vec();
-                if stack.is_empty() {
-                    if root_seen {
-                        return Err(malformed("multiple XML roots"));
-                    }
-                    root_seen = true;
-                    if namespace != NamespaceKind::Dav || local_name != b"multistatus" {
-                        return Err(malformed("root is not DAV:multistatus"));
-                    }
-                }
-                let parent = stack.last();
-                if namespace == NamespaceKind::Dav
-                    && local_name == b"response"
-                    && response.is_none()
-                {
-                    records.push(ResponseState::default().finish());
-                } else if namespace == NamespaceKind::Dav
-                    && local_name == b"propstat"
-                    && response.is_some()
-                    && propstat.is_none()
-                {
-                    let state = PropstatState::default();
-                    if let Some(response) = response.as_mut() {
-                        response.apply_propstat(state);
-                    }
-                } else if let Some(parent) = parent
-                    && let Some(kind) = capture_kind(
-                        parent,
-                        namespace,
-                        &local_name,
-                        response.is_some(),
-                        propstat.is_some(),
-                    )
-                {
-                    finish_capture(
-                        &mut capture,
-                        kind,
-                        String::new(),
-                        &mut response,
-                        &mut propstat,
-                    );
-                }
-            }
-            XmlEvent::Text(value) => {
-                if let Some(capture) = capture.as_mut() {
-                    let decoded = value
-                        .decode()
-                        .map_err(|error| malformed(&error.to_string()))?;
-                    let unescaped = unescape(decoded.as_ref())
-                        .map_err(|error| malformed(&error.to_string()))?;
-                    capture.value.push_str(&unescaped);
-                }
-            }
-            XmlEvent::CData(value) => {
-                if let Some(capture) = capture.as_mut() {
-                    let decoded = value
-                        .decode()
-                        .map_err(|error| malformed(&error.to_string()))?;
-                    capture.value.push_str(&decoded);
-                }
-            }
-            XmlEvent::GeneralRef(value) => {
-                if let Some(capture) = capture.as_mut() {
-                    let decoded = value
-                        .decode()
-                        .map_err(|error| malformed(&error.to_string()))?;
-                    let reference = format!("&{};", decoded);
-                    let unescaped =
-                        unescape(&reference).map_err(|error| malformed(&error.to_string()))?;
-                    capture.value.push_str(&unescaped);
-                }
-            }
-            XmlEvent::End(end) => {
-                let element = stack.pop().ok_or_else(|| malformed("unmatched end tag"))?;
-                if element.namespace != namespace || element.local_name != end.local_name().as_ref()
-                {
-                    return Err(malformed("mismatched end tag"));
-                }
-
-                if capture
-                    .as_ref()
-                    .is_some_and(|capture| capture.depth == stack.len() + 1)
-                    && let Some(completed) = capture.take()
-                {
-                    finish_capture(
-                        &mut capture,
-                        completed.kind,
-                        completed.value,
-                        &mut response,
-                        &mut propstat,
-                    );
-                }
-
-                if namespace == NamespaceKind::Dav && element.local_name == b"propstat" {
-                    let state = propstat
-                        .take()
-                        .ok_or_else(|| malformed("unmatched DAV:propstat"))?;
-                    if let Some(response) = response.as_mut() {
-                        response.apply_propstat(state);
-                    }
-                } else if namespace == NamespaceKind::Dav && element.local_name == b"response" {
-                    let state = response
-                        .take()
-                        .ok_or_else(|| malformed("unmatched DAV:response"))?;
-                    records.push(state.finish());
-                }
-            }
-            XmlEvent::Eof => {
-                if !root_seen
-                    || !stack.is_empty()
-                    || response.is_some()
-                    || propstat.is_some()
-                    || capture.is_some()
-                {
-                    return Err(malformed("truncated multistatus XML"));
-                }
-                return Ok(records);
-            }
-            _ => {}
         }
     }
+    Err(malformed("missing current-user-principal href"))
+}
+
+pub fn parse_calendar_home_set(xml: &str) -> Result<String, ParseError> {
+    let root = parse_xml(xml)?;
+    let responses = multistatus_responses(&root)?;
+    for response in responses {
+        for property in successful_properties(response) {
+            if property.is_named(NamespaceKind::Caldav, b"calendar-home-set")
+                && let Some(href) = property.child(NamespaceKind::Dav, b"href")
+            {
+                return nonempty_value(href.text_value(), "missing calendar-home-set href");
+            }
+        }
+    }
+    Err(malformed("missing calendar-home-set href"))
+}
+
+pub fn parse_calendar_home_multistatus(xml: &str) -> Result<Vec<DiscoveredCalendar>, ParseError> {
+    let root = parse_xml(xml)?;
+    let responses = multistatus_responses(&root)?;
+    Ok(responses
+        .into_iter()
+        .filter_map(discovered_calendar)
+        .collect())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NamespaceKind {
     Dav,
     Caldav,
+    AppleIcal,
     Other,
 }
 
@@ -430,146 +502,257 @@ impl NamespaceKind {
         match namespace {
             ResolveResult::Bound(Namespace(value)) if value == DAV_NAMESPACE => Self::Dav,
             ResolveResult::Bound(Namespace(value)) if value == CALDAV_NAMESPACE => Self::Caldav,
+            ResolveResult::Bound(Namespace(value)) if value == APPLE_ICAL_NAMESPACE => {
+                Self::AppleIcal
+            }
             _ => Self::Other,
         }
     }
 }
 
-struct Element {
+struct XmlNode {
     namespace: NamespaceKind,
     local_name: Vec<u8>,
+    text: String,
+    children: Vec<XmlNode>,
 }
 
-#[derive(Default)]
-struct ResponseState {
-    href: String,
-    response_status: Option<u16>,
-    successful_properties: Vec<Property>,
-}
-
-#[derive(Default)]
-struct PropstatState {
-    status: Option<u16>,
-    properties: Vec<Property>,
-}
-
-struct Property {
-    namespace: NamespaceKind,
-    local_name: Vec<u8>,
-    value: String,
-}
-
-enum CaptureKind {
-    ResponseHref,
-    ResponseStatus,
-    PropstatStatus,
-    Property(NamespaceKind, &'static [u8]),
-}
-
-struct CaptureState {
-    depth: usize,
-    kind: CaptureKind,
-    value: String,
-}
-
-fn capture_kind(
-    parent: &Element,
-    namespace: NamespaceKind,
-    local_name: &[u8],
-    has_response: bool,
-    has_propstat: bool,
-) -> Option<CaptureKind> {
-    if parent.namespace != NamespaceKind::Dav {
-        return None;
+impl XmlNode {
+    fn is_named(&self, namespace: NamespaceKind, local_name: &[u8]) -> bool {
+        self.namespace == namespace && self.local_name == local_name
     }
-    if parent.local_name == b"response" && has_response && namespace == NamespaceKind::Dav {
-        return match local_name {
-            b"href" => Some(CaptureKind::ResponseHref),
-            b"status" => Some(CaptureKind::ResponseStatus),
-            _ => None,
-        };
-    }
-    if parent.local_name == b"propstat" && has_propstat && namespace == NamespaceKind::Dav {
-        return (local_name == b"status").then_some(CaptureKind::PropstatStatus);
-    }
-    if parent.local_name == b"prop" && has_propstat {
-        return match (namespace, local_name) {
-            (NamespaceKind::Dav, b"getetag") => {
-                Some(CaptureKind::Property(NamespaceKind::Dav, b"getetag"))
-            }
-            (NamespaceKind::Caldav, b"calendar-data") => Some(CaptureKind::Property(
-                NamespaceKind::Caldav,
-                b"calendar-data",
-            )),
-            _ => None,
-        };
-    }
-    None
-}
 
-fn finish_capture(
-    capture: &mut Option<CaptureState>,
-    kind: CaptureKind,
-    value: String,
-    response: &mut Option<ResponseState>,
-    propstat: &mut Option<PropstatState>,
-) {
-    match kind {
-        CaptureKind::ResponseHref => {
-            if let Some(response) = response.as_mut() {
-                response.href = value;
-            }
+    fn child(&self, namespace: NamespaceKind, local_name: &[u8]) -> Option<&XmlNode> {
+        self.children
+            .iter()
+            .find(|child| child.is_named(namespace, local_name))
+    }
+
+    fn text_value(&self) -> String {
+        let mut value = self.text.clone();
+        for child in &self.children {
+            value.push_str(&child.text_value());
         }
-        CaptureKind::ResponseStatus => {
-            if let Some(response) = response.as_mut() {
-                response.response_status = parse_status_code(&value);
-            }
-        }
-        CaptureKind::PropstatStatus => {
-            if let Some(propstat) = propstat.as_mut() {
-                propstat.status = parse_status_code(&value);
-            }
-        }
-        CaptureKind::Property(namespace, local_name) => {
-            if let Some(propstat) = propstat.as_mut() {
-                propstat.properties.push(Property {
+        value
+    }
+}
+
+fn parse_xml(xml: &str) -> Result<XmlNode, ParseError> {
+    let mut reader = NsReader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut stack: Vec<XmlNode> = Vec::new();
+    let mut root = None;
+
+    loop {
+        let (resolved_namespace, event) = reader.read_resolved_event()?;
+        let namespace = NamespaceKind::from_resolved(resolved_namespace);
+        match event {
+            XmlEvent::Start(start) => {
+                if stack.is_empty() && root.is_some() {
+                    return Err(malformed("multiple XML roots"));
+                }
+                stack.push(XmlNode {
                     namespace,
-                    local_name: local_name.to_vec(),
-                    value,
+                    local_name: start.local_name().as_ref().to_vec(),
+                    text: String::new(),
+                    children: Vec::new(),
                 });
             }
+            XmlEvent::Empty(empty) => {
+                let node = XmlNode {
+                    namespace,
+                    local_name: empty.local_name().as_ref().to_vec(),
+                    text: String::new(),
+                    children: Vec::new(),
+                };
+                append_node(&mut root, &mut stack, node)?;
+            }
+            XmlEvent::Text(value) => {
+                let decoded = decode_text(
+                    value
+                        .decode()
+                        .map_err(|error| malformed(&error.to_string()))?,
+                )?;
+                append_text(&mut root, &mut stack, decoded)?;
+            }
+            XmlEvent::CData(value) => {
+                let decoded = value
+                    .decode()
+                    .map_err(|error| malformed(&error.to_string()))?
+                    .into_owned();
+                append_text(&mut root, &mut stack, decoded)?;
+            }
+            XmlEvent::GeneralRef(value) => {
+                let decoded = value
+                    .decode()
+                    .map_err(|error| malformed(&error.to_string()))?;
+                let reference = format!("&{};", decoded);
+                let unescaped = unescape(&reference)
+                    .map_err(|error| malformed(&error.to_string()))?
+                    .into_owned();
+                append_text(&mut root, &mut stack, unescaped)?;
+            }
+            XmlEvent::End(end) => {
+                let node = stack.pop().ok_or_else(|| malformed("unmatched end tag"))?;
+                if node.namespace != namespace || node.local_name != end.local_name().as_ref() {
+                    return Err(malformed("mismatched end tag"));
+                }
+                append_node(&mut root, &mut stack, node)?;
+            }
+            XmlEvent::Eof => {
+                if !stack.is_empty() {
+                    return Err(malformed("truncated multistatus XML"));
+                }
+                return root.ok_or_else(|| malformed("missing XML root"));
+            }
+            _ => {}
         }
     }
-    *capture = None;
 }
 
-impl ResponseState {
-    fn apply_propstat(&mut self, propstat: PropstatState) {
-        if propstat
-            .status
-            .is_some_and(|status| (200..300).contains(&status))
-        {
-            self.successful_properties.extend(propstat.properties);
+fn decode_text(decoded: std::borrow::Cow<'_, str>) -> Result<String, ParseError> {
+    unescape(decoded.as_ref())
+        .map(|value| value.into_owned())
+        .map_err(|error| malformed(&error.to_string()))
+}
+
+fn append_text(
+    root: &mut Option<XmlNode>,
+    stack: &mut [XmlNode],
+    text: String,
+) -> Result<(), ParseError> {
+    if let Some(node) = stack.last_mut() {
+        node.text.push_str(&text);
+    } else if !text.trim().is_empty() {
+        return Err(malformed("text outside XML root"));
+    } else if root.is_none() {
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn append_node(
+    root: &mut Option<XmlNode>,
+    stack: &mut [XmlNode],
+    node: XmlNode,
+) -> Result<(), ParseError> {
+    if let Some(parent) = stack.last_mut() {
+        parent.children.push(node);
+    } else if root.replace(node).is_some() {
+        return Err(malformed("multiple XML roots"));
+    }
+    Ok(())
+}
+
+fn multistatus_responses(root: &XmlNode) -> Result<Vec<&XmlNode>, ParseError> {
+    if !root.is_named(NamespaceKind::Dav, b"multistatus") {
+        return Err(malformed("root is not DAV:multistatus"));
+    }
+    Ok(root
+        .children
+        .iter()
+        .filter(|child| child.is_named(NamespaceKind::Dav, b"response"))
+        .collect())
+}
+
+fn successful_properties(response: &XmlNode) -> impl Iterator<Item = &XmlNode> {
+    response
+        .children
+        .iter()
+        .filter(|propstat| propstat.is_named(NamespaceKind::Dav, b"propstat"))
+        .filter(|propstat| {
+            propstat
+                .child(NamespaceKind::Dav, b"status")
+                .and_then(|status| parse_status_code(&status.text_value()))
+                .is_some_and(|status| (200..300).contains(&status))
+        })
+        .flat_map(|propstat| {
+            propstat
+                .child(NamespaceKind::Dav, b"prop")
+                .into_iter()
+                .flat_map(|prop| prop.children.iter())
+        })
+}
+
+fn response_href(response: &XmlNode) -> String {
+    response
+        .child(NamespaceKind::Dav, b"href")
+        .map_or_else(String::new, XmlNode::text_value)
+}
+
+fn resource_record(response: &XmlNode) -> ResourceRecord {
+    let mut record = ResourceRecord {
+        href: response_href(response),
+        response_status: response
+            .child(NamespaceKind::Dav, b"status")
+            .and_then(|status| parse_status_code(&status.text_value())),
+        etag: None,
+        calendar_data: None,
+    };
+    for property in successful_properties(response) {
+        match (property.namespace, property.local_name.as_slice()) {
+            (NamespaceKind::Dav, b"getetag") => record.etag = Some(property.text_value()),
+            (NamespaceKind::Caldav, b"calendar-data") => {
+                record.calendar_data = Some(property.text_value())
+            }
+            _ => {}
         }
     }
+    record
+}
 
-    fn finish(self) -> ResourceRecord {
-        let mut record = ResourceRecord {
-            href: self.href,
-            response_status: self.response_status,
-            etag: None,
-            calendar_data: None,
-        };
-        for property in self.successful_properties {
-            match (property.namespace, property.local_name.as_slice()) {
-                (NamespaceKind::Dav, b"getetag") => record.etag = Some(property.value),
-                (NamespaceKind::Caldav, b"calendar-data") => {
-                    record.calendar_data = Some(property.value)
-                }
-                _ => {}
+fn discovered_calendar(response: &XmlNode) -> Option<DiscoveredCalendar> {
+    let mut is_calendar = false;
+    let mut display_name = None;
+    let mut sync_token = None;
+    let mut color = None;
+    let mut writable = false;
+    for property in successful_properties(response) {
+        match (property.namespace, property.local_name.as_slice()) {
+            (NamespaceKind::Dav, b"resourcetype") => {
+                is_calendar |= property
+                    .children
+                    .iter()
+                    .any(|child| child.is_named(NamespaceKind::Caldav, b"calendar"));
             }
+            (NamespaceKind::Dav, b"displayname") => {
+                display_name = Some(property.text_value());
+            }
+            (NamespaceKind::Dav, b"sync-token") => {
+                sync_token = Some(property.text_value());
+            }
+            (NamespaceKind::AppleIcal, b"calendar-color") => {
+                color = Some(property.text_value());
+            }
+            (NamespaceKind::Dav, b"current-user-privilege-set") => {
+                writable |= has_write_privilege(property);
+            }
+            _ => {}
         }
-        record
+    }
+    is_calendar.then_some(DiscoveredCalendar {
+        href: response_href(response),
+        display_name,
+        sync_token,
+        color,
+        writable,
+    })
+}
+
+fn has_write_privilege(property: &XmlNode) -> bool {
+    property.children.iter().any(|child| {
+        child.is_named(NamespaceKind::Dav, b"write")
+            || child.is_named(NamespaceKind::Dav, b"write-content")
+            || child.is_named(NamespaceKind::Dav, b"all")
+            || has_write_privilege(child)
+    })
+}
+
+fn nonempty_value(value: String, message: &str) -> Result<String, ParseError> {
+    if value.is_empty() {
+        Err(malformed(message))
+    } else {
+        Ok(value)
     }
 }
 
