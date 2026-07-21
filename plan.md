@@ -971,7 +971,7 @@ native dismissal.
 
 Goal: events/calendars survive restart.
 
-Status: Not started
+Status: Complete — automated repository tests and manual restart persistence verified.
 
 Recommended first persistence backend: SQLite.
 
@@ -979,14 +979,17 @@ Reason: easier range querying, local cache, sync metadata, and reminders than ra
 
 Tasks:
 
-- [ ] Add SQLite dependency, likely `rusqlite` or `sqlx`.
-- [ ] Create schema for:
-  - [ ] calendars
-  - [ ] events
-  - [ ] reminders
-  - [ ] sync metadata placeholder
-- [ ] Implement repository traits with SQLite.
-- [ ] Migrate in-memory development data path to SQLite.
+- [x] Add bundled `rusqlite` with chrono/UUID support.
+- [x] Create schema for:
+  - [x] calendars
+  - [x] events
+  - [x] reminders
+  - [x] sync metadata placeholder
+  - [x] durable default-calendar initialization marker
+- [x] Implement repository traits with SQLite.
+- [x] Persist default-calendar initialization atomically and exactly once.
+- [x] Migrate the application data path to
+      `$XDG_DATA_HOME/dev.chris.calendar/calendar.sqlite`.
 
 Verification:
 
@@ -995,7 +998,12 @@ cargo test
 cargo run
 ```
 
-Manual check: create event, restart app, event remains.
+Automated checks pass, including close/reopen durability, cross-offset timed
+range queries, optional timezone round-tripping, and non-destructive one-time
+default seeding.
+
+Manual check: create event, quit the app, restart it, and verify the event
+remains visible and opens in the preview. (Passes.)
 
 ### Phase 8: Week and agenda views
 

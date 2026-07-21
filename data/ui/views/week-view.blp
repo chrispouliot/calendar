@@ -1,0 +1,79 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $WeekView: Adw.Bin {
+  Box {
+    orientation: vertical;
+    spacing: 0;
+    css-name: "calendar-view";
+    css-classes: ["week-view"];
+
+    Box headers_row {
+      orientation: horizontal;
+      spacing: 0;
+
+      Box {
+        width-request: 64;
+      }
+
+      Grid headers_grid {
+        column-homogeneous: true;
+        hexpand: true;
+      }
+    }
+
+    Separator {
+      margin-start: 4;
+      margin-end: 4;
+    }
+
+    Box all_day_row {
+      orientation: horizontal;
+      spacing: 0;
+      margin-top: 4;
+      margin-bottom: 4;
+
+      Label all_day_label {
+        label: "All-day";
+        width-request: 64;
+        halign: end;
+        valign: start;
+        css-classes: ["dim-label"];
+      }
+
+      Box all_day_columns {
+        orientation: horizontal;
+        homogeneous: true;
+        hexpand: true;
+      }
+    }
+
+    Separator {
+      margin-start: 4;
+      margin-end: 4;
+    }
+
+    ScrolledWindow timeline_scroll {
+      hexpand: true;
+      vexpand: true;
+      hscrollbar-policy: never;
+      vscrollbar-policy: automatic;
+      overlay-scrolling: true;
+      child: Viewport {
+        child: Box timeline_box {
+          orientation: horizontal;
+          hexpand: true;
+
+          Box time_labels_box {
+            orientation: vertical;
+            width-request: 64;
+          }
+
+          Adw.Bin timeline_grid_bin {
+            hexpand: true;
+          }
+        };
+      };
+    }
+  }
+}

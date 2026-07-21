@@ -1,3 +1,7 @@
+mod sqlite;
+
+pub use sqlite::SqliteRepository;
+
 use std::collections::HashMap;
 use uuid::Uuid;
 

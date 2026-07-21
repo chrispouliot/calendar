@@ -45,6 +45,13 @@ mod imp {
         /// Today (read from clock at construction).
         pub today_date: Cell<NaiveDate>,
 
+        /// Date represented by the currently displayed month.
+        pub active_date: Cell<NaiveDate>,
+
+        /// Do not report the transient dominant month while a host is
+        /// synchronising the view to its shared active date.
+        pub active_date_syncing: Cell<bool>,
+
         /// Last reported first-visible-week (year, month) for the title callback.
         pub last_title_ym: Cell<(i32, u32)>,
 
@@ -88,6 +95,8 @@ mod imp {
                     NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
                 )),
                 today_date: Cell::new(NaiveDate::from_ymd_opt(2026, 1, 5).unwrap()),
+                active_date: Cell::new(NaiveDate::from_ymd_opt(2026, 1, 5).unwrap()),
+                active_date_syncing: Cell::new(false),
                 last_title_ym: Cell::new((2026, 1)),
                 cached_calendars: RefCell::new(Vec::new()),
                 cached_events: RefCell::new(Vec::new()),
@@ -220,6 +229,7 @@ mod imp {
                 NaiveDate::from_ymd_opt(now.year(), now.month() as u32, now.day_of_month() as u32)
                     .expect("valid today");
             self.today_date.set(today);
+            self.active_date.set(today);
 
             // Position so today's week is the first visible week (refinement 2).
             let buf = WeeksBuffer::new(monday_of_week(today));
@@ -359,27 +369,38 @@ impl MonthView {
     /// month's 1st becomes the first visible row's Monday.  The viewport
     /// resets to its centred position.
     pub fn navigate_previous(&self) {
-        let (y, m) = self.viewport_center_ym();
-        let (py, pm) = if m == 1 { (y - 1, 12u32) } else { (y, m - 1) };
-        self.set_buffer_to_month(py, pm);
+        let date = self.imp().active_date.get();
+        self.set_active_date(shift_month(date, -1));
     }
 
     /// Navigate to the next calendar month.  See `navigate_previous`.
     pub fn navigate_next(&self) {
-        let (y, m) = self.viewport_center_ym();
-        let (ny, nm) = if m == 12 { (y + 1, 1u32) } else { (y, m + 1) };
-        self.set_buffer_to_month(ny, nm);
+        let date = self.imp().active_date.get();
+        self.set_active_date(shift_month(date, 1));
     }
 
     /// Jump to today.  Today's week becomes the first visible week (refinement 2).
     pub fn go_today(&self) {
+        self.set_active_date(self.imp().today_date.get());
+    }
+
+    /// Return the date retained while navigating between calendar views.
+    pub fn active_date(&self) -> NaiveDate {
+        self.imp().active_date.get()
+    }
+
+    /// Display the month containing `date`, retaining its day where the
+    /// destination month has that day and clamping it otherwise.
+    pub fn set_active_date(&self, date: NaiveDate) {
         let imp = self.imp();
-        let today = imp.today_date.get();
-        let buf = WeeksBuffer::new(monday_of_week(today));
-        *imp.weeks_buffer.borrow_mut() = buf;
+        imp.active_date.set(date);
+        imp.active_date_syncing.set(true);
+        *imp.weeks_buffer.borrow_mut() = WeeksBuffer::new(monday_of_week(date));
         self.reset_scroll_position();
         self.after_navigation();
         self.repopulate_rows();
+        imp.active_date_syncing.set(false);
+        imp.active_date.set(date);
     }
 
     // ── Rendering ──
@@ -613,18 +634,6 @@ impl MonthView {
 
     // ── Navigation internals ──
 
-    /// Set the WeeksBuffer so the Monday on/before the given month's 1st is
-    /// the first visible row's Monday.  Scroll reset, title callback fired.
-    fn set_buffer_to_month(&self, year: i32, month: u32) {
-        let imp = self.imp();
-        let first_of = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month target");
-        let first_visible = monday_of_week(first_of);
-        *imp.weeks_buffer.borrow_mut() = WeeksBuffer::new(first_visible);
-        self.reset_scroll_position();
-        self.after_navigation();
-        self.repopulate_rows();
-    }
-
     /// Reset the scroll position so the viewport shows the intended visible
     /// window (rows VISIBLE_START..VISIBLE_END).
     fn reset_scroll_position(&self) {
@@ -648,8 +657,12 @@ impl MonthView {
         let (y, m) = self.first_visible_week_ym();
         let imp = self.imp();
         imp.last_title_ym.set((y, m));
-        if let Some(cb) = imp.on_month_changed.borrow().as_ref() {
-            cb(y, m);
+        if !imp.active_date_syncing.get() {
+            imp.active_date
+                .set(reconcile_month(self.active_date(), y, m));
+            if let Some(cb) = imp.on_month_changed.borrow().as_ref() {
+                cb(y, m);
+            }
         }
     }
 
@@ -892,6 +905,8 @@ impl MonthView {
         let old_ym = imp.last_title_ym.get();
         if new_ym != old_ym {
             imp.last_title_ym.set(new_ym);
+            imp.active_date
+                .set(reconcile_month(self.active_date(), new_ym.0, new_ym.1));
             if let Some(cb) = imp.on_month_changed.borrow().as_ref() {
                 cb(new_ym.0, new_ym.1);
             }
@@ -946,4 +961,27 @@ fn month_name(month: u32) -> &'static str {
         12 => "December",
         _ => unreachable!(),
     }
+}
+
+fn shift_month(date: NaiveDate, direction: i64) -> NaiveDate {
+    let month_index = i64::from(date.year()) * 12 + i64::from(date.month0()) + direction;
+    let year = i32::try_from(month_index.div_euclid(12)).expect("month navigation exceeded range");
+    let month = month_index.rem_euclid(12) as u32 + 1;
+    let day = date.day().min(days_in_month(year, month));
+    NaiveDate::from_ymd_opt(year, month, day).expect("month navigation produced invalid date")
+}
+
+fn reconcile_month(date: NaiveDate, year: i32, month: u32) -> NaiveDate {
+    let day = date.day().min(days_in_month(year, month));
+    NaiveDate::from_ymd_opt(year, month, day).expect("month reconciliation produced invalid date")
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let first_of_next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .expect("month navigation exceeded range");
+    (first_of_next - chrono::Duration::days(1)).day()
 }

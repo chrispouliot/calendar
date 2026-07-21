@@ -6,6 +6,7 @@ fn main() {
     println!("cargo::rerun-if-changed=data/ui/common/quick-add-popover.blp");
     println!("cargo::rerun-if-changed=data/ui/common/event-popover.blp");
     println!("cargo::rerun-if-changed=data/ui/views/month-view.blp");
+    println!("cargo::rerun-if-changed=data/ui/views/week-view.blp");
     println!("cargo::rerun-if-changed=data/style.css");
     println!("cargo::rerun-if-changed=data/resources.gresource.xml");
     println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-month-symbolic.svg");
@@ -30,6 +31,7 @@ fn main() {
             "data/ui/common/quick-add-popover.blp",
             "data/ui/common/event-popover.blp",
             "data/ui/views/month-view.blp",
+            "data/ui/views/week-view.blp",
         ])
         .status()
         .expect("Failed to run blueprint-compiler");

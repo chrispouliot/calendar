@@ -1,10 +1,12 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::backend::{CalendarRepository, EventRepository, InMemoryRepository, RepositoryError};
+use calendar::backend::{CalendarRepository, EventRepository, RepositoryError, SqliteRepository};
 use calendar::model::{Calendar, CalendarSource, EmptyQuickAddTitle, Event, new_quick_add_event};
-use chrono::NaiveDate;
+use calendar::view_state::{ViewKind, ViewState};
+use chrono::{Datelike, NaiveDate};
 use gtk::{gio, glib};
 use std::cell::RefCell;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 mod imp {
@@ -26,20 +28,26 @@ mod imp {
         #[template_child]
         pub month_view_bin: TemplateChild<adw::Bin>,
         #[template_child]
+        pub week_view_bin: TemplateChild<adw::Bin>,
+        #[template_child]
         pub title_label: TemplateChild<gtk::Label>,
 
         // Phase 6: New-Event button (host of the quick-add popover).
         #[template_child]
         pub new_event_button: TemplateChild<gtk::Button>,
 
-        // In-memory repository with seeded calendars.
-        pub repository: RefCell<InMemoryRepository>,
+        // SQLite-backed persistent repository.  Initialised in
+        // `constructed()`; None only when DB opening failed.
+        pub repository: RefCell<Option<SqliteRepository>>,
 
         // The Quick-Add popover, created once and parented to the window.
         pub quick_add: RefCell<Option<crate::ui::quick_add_popover::QuickAddPopover>>,
 
         // The event preview popover, created once and parented to the window.
         pub event_popover: RefCell<Option<crate::ui::event_popover::EventPopover>>,
+
+        /// Shared navigation state for the three pages in `views_stack`.
+        pub view_state: RefCell<Option<ViewState>>,
     }
 
     #[glib::object_subclass]
@@ -61,17 +69,41 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
 
+            *self.view_state.borrow_mut() = Some(ViewState::new(ViewKind::Month, today_local()));
+
+            // ── Open the persistent SQLite database ──
+            let db_path = Self::make_db_path();
+
+            // All three init steps (create-dir, open, seed) are treated
+            // as one fallible path.  Any failure shows the fatal dialog
+            // and returns early.
+            let init_result: Result<(), RepositoryError> = (|| {
+                // 1. Create parent directory
+                if let Some(parent) = db_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|_| RepositoryError)?;
+                }
+                // 2. Open (or create) database
+                let mut repo = SqliteRepository::open(&db_path)?;
+                // 3. Let the repository atomically initialize defaults.
+                let defaults = Self::default_calendars();
+                repo.seed_default_calendars(&defaults)?;
+                *self.repository.borrow_mut() = Some(repo);
+                Ok(())
+            })();
+
+            if let Err(RepositoryError) = init_result {
+                let obj = self.obj();
+                Self::show_fatal_db_dialog(
+                    obj.upcast_ref::<gtk::Window>(),
+                    obj.application(),
+                    &db_path,
+                );
+                return;
+            }
+
             // ── Sidebar date chooser ──
             let chooser = crate::ui::date_chooser::DateChooser::new();
             self.date_chooser_bin.set_child(Some(&chooser));
-
-            // ── Seed the repository with deterministic test calendars ──
-            //
-            // Calendars remain seeded until calendar management (Phase 10)
-            // exists, so the Quick-Add popover always has choices.  The
-            // temporary sample events seeded during Phase 5 development have
-            // been removed; new events come from Quick Add.
-            self.seed_calendars();
 
             // ── Create and place MonthView ──
             let month_view = crate::ui::month_view::MonthView::new();
@@ -104,12 +136,34 @@ mod imp {
                 let win_weak = win_weak.clone();
                 move |y, m| {
                     if let Some(win) = win_weak.upgrade() {
-                        win.imp().update_title(y, m);
+                        win.imp().reconcile_month_state(y, m);
                     }
                 }
             });
 
             self.month_view_bin.set_child(Some(&month_view));
+
+            // ── Create and place the current WeekView ──
+            let week_view = crate::ui::week_view::WeekView::new();
+            week_view.set_on_event_activate({
+                let win_weak = win_weak.clone();
+                move |event_id, event_widget| {
+                    if let Some(win) = win_weak.upgrade() {
+                        win.imp().open_event_preview(event_id, &event_widget);
+                    }
+                }
+            });
+            self.week_view_bin.set_child(Some(&week_view));
+
+            // Blueprint wires the ViewSwitcher to this stack, so observe the
+            // stack itself to keep the shared date and view kind in sync.
+            let stack_win_weak = win.downgrade();
+            self.views_stack.connect_visible_child_notify(move |stack| {
+                if let Some(win) = stack_win_weak.upgrade() {
+                    win.imp()
+                        .handle_view_changed(stack.visible_child_name().as_deref());
+                }
+            });
 
             // ── Construct the Quick-Add popover ──
             let popover = crate::ui::quick_add_popover::QuickAddPopover::new();
@@ -199,8 +253,8 @@ mod imp {
             });
             win.add_action(&new_event);
 
-            // ── Initial render: jump to today ──
-            self.render_all_from_today();
+            // ── Initial render from the shared local-today state ──
+            self.render_all_from_state();
         }
     }
 
@@ -228,20 +282,26 @@ impl CalendarWindow {
 
     fn navigate_previous(&self) {
         let imp = self.imp();
-        imp.with_month_view(|mv| mv.navigate_previous());
-        imp.render_month_view();
+        if let Some(state) = imp.view_state.borrow_mut().as_mut() {
+            state.previous();
+        }
+        imp.render_all_from_state();
     }
 
     fn navigate_next(&self) {
         let imp = self.imp();
-        imp.with_month_view(|mv| mv.navigate_next());
-        imp.render_month_view();
+        if let Some(state) = imp.view_state.borrow_mut().as_mut() {
+            state.next();
+        }
+        imp.render_all_from_state();
     }
 
     fn navigate_today(&self) {
         let imp = self.imp();
-        imp.with_month_view(|mv| mv.go_today());
-        imp.render_month_view();
+        if let Some(state) = imp.view_state.borrow_mut().as_mut() {
+            state.set_today(today_local());
+        }
+        imp.render_all_from_state();
     }
 }
 
@@ -258,88 +318,211 @@ impl imp::CalendarWindow {
         Some(f(&mv))
     }
 
+    fn reconcile_month_state(&self, year: i32, month: u32) {
+        {
+            let mut state_guard = self.view_state.borrow_mut();
+            let Some(state) = state_guard.as_mut() else {
+                return;
+            };
+            if state.view() != ViewKind::Month {
+                return;
+            }
+            let current = state.active_date();
+            let day = current.day().min(days_in_month(year, month));
+            let date =
+                NaiveDate::from_ymd_opt(year, month, day).expect("valid month callback date");
+            *state = ViewState::new(ViewKind::Month, date);
+        }
+        self.update_title();
+    }
+
+    fn handle_view_changed(&self, page_name: Option<&str>) {
+        let Some(kind) = (match page_name {
+            Some("month") => Some(ViewKind::Month),
+            Some("week") => Some(ViewKind::Week),
+            Some("agenda") => Some(ViewKind::Agenda),
+            _ => None,
+        }) else {
+            return;
+        };
+
+        let old_kind = self.view_state.borrow().as_ref().map(ViewState::view);
+        if old_kind == Some(ViewKind::Month) && kind != ViewKind::Month {
+            let dominant = self.with_month_view(|mv| mv.dominant_year_month());
+            if let Some((year, month)) = dominant {
+                self.reconcile_month_state(year, month);
+            }
+        }
+
+        if let Some(state) = self.view_state.borrow_mut().as_mut() {
+            state.set_view(kind);
+        }
+        self.sync_views_to_state();
+        self.render_month_view();
+        self.render_week_view();
+        self.update_title();
+    }
+
+    /// Push the shared active date into every concrete view.  Agenda has no
+    /// widget yet, but retains the same state and navigation semantics.
+    fn sync_views_to_state(&self) {
+        let Some(date) = self
+            .view_state
+            .borrow()
+            .as_ref()
+            .map(ViewState::active_date)
+        else {
+            return;
+        };
+        self.with_month_view(|mv| mv.set_active_date(date));
+        if let Some(child) = self.week_view_bin.child()
+            && let Ok(week_view) = child.downcast::<crate::ui::week_view::WeekView>()
+        {
+            week_view.set_active_date(date);
+        }
+    }
+
     /// Load calendars + events from the repository and tell the MonthView to
     /// re-render.  Updates the navigation title afterwards.
     fn render_month_view(&self) {
-        let repo = self.repository.borrow();
-        let calendars = repo.list_calendars();
-        let all_events: Vec<Event> = calendars
-            .iter()
-            .flat_map(|c| repo.list_events_for_calendar(c.id))
-            .collect();
-        drop(repo);
+        let (calendars, all_events) = {
+            let repo_guard = self.repository.borrow();
+            let repo = repo_guard.as_ref().expect("repository must be initialised");
+            let calendars = repo.list_calendars();
+            let all_events: Vec<Event> = calendars
+                .iter()
+                .flat_map(|c| repo.list_events_for_calendar(c.id))
+                .collect();
+            (calendars, all_events)
+        };
 
         self.with_month_view(|mv| mv.render(&calendars, &all_events));
 
-        // Update the navigation title from the MonthView's dominant month.
-        self.with_month_view(|mv| {
-            let (y, m) = mv.dominant_year_month();
-            self.update_title(y, m);
-        });
+        self.update_title();
     }
 
-    /// Set the navigation title to "Month Year".
-    fn update_title(&self, year: i32, month: u32) {
-        let month_name = match month {
-            1 => "January",
-            2 => "February",
-            3 => "March",
-            4 => "April",
-            5 => "May",
-            6 => "June",
-            7 => "July",
-            8 => "August",
-            9 => "September",
-            10 => "October",
-            11 => "November",
-            12 => "December",
-            _ => unreachable!(),
+    /// Load calendars + events from the repository and tell the WeekView to
+    /// render the current Monday-first week.
+    fn render_week_view(&self) {
+        let (calendars, all_events) = {
+            let repo_guard = self.repository.borrow();
+            let repo = repo_guard.as_ref().expect("repository must be initialised");
+            let calendars = repo.list_calendars();
+            let all_events: Vec<Event> = calendars
+                .iter()
+                .flat_map(|calendar| repo.list_events_for_calendar(calendar.id))
+                .collect();
+            (calendars, all_events)
         };
-        self.title_label
-            .set_label(&format!("{} {}", month_name, year));
+
+        if let Some(child) = self.week_view_bin.child()
+            && let Ok(week_view) = child.downcast::<crate::ui::week_view::WeekView>()
+        {
+            week_view.render(&calendars, &all_events);
+        }
     }
 
-    /// Jump to today and render.
-    fn render_all_from_today(&self) {
-        self.with_month_view(|mv| mv.go_today());
+    /// Set the navigation title from the active view and shared date.
+    fn update_title(&self) {
+        let state_guard = self.view_state.borrow();
+        let Some(state) = state_guard.as_ref() else {
+            return;
+        };
+        let date = state.active_date();
+        let title = match state.view() {
+            ViewKind::Month => format!("{} {}", month_name(date.month()), date.year()),
+            ViewKind::Week => {
+                let week = state.current_week_dates();
+                format!(
+                    "Week of {} {} {}, {}",
+                    month_name(week[0].month()),
+                    week[0].day(),
+                    week[0].year(),
+                    week[6].format("%b %-d")
+                )
+            }
+            ViewKind::Agenda => {
+                format!("Agenda — {} {}", month_name(date.month()), date.year())
+            }
+        };
+        self.title_label.set_label(&title);
+    }
+
+    /// Synchronise both concrete views and render from shared state.
+    fn render_all_from_state(&self) {
+        self.sync_views_to_state();
         self.render_month_view();
+        self.render_week_view();
+        self.update_title();
     }
 
-    /// Seed deterministic test calendars.  These remain until calendar
-    /// management (Phase 10) exists, so the Quick-Add popover always has
-    /// choices.
-    fn seed_calendars(&self) {
-        let mut repo = self.repository.borrow_mut();
+    /// Build the application-specific database path beneath the
+    /// platform's per-user data directory.
+    fn make_db_path() -> PathBuf {
+        let mut path = glib::user_data_dir();
+        path.push("dev.chris.calendar");
+        path.push("calendar.sqlite");
+        path
+    }
 
-        let cal_id = Uuid::parse_str("e1111111-e111-1111-1111-111111111111").unwrap();
-        let _ = repo.save_calendar(&Calendar {
-            id: cal_id,
-            name: "Personal".to_string(),
-            color: "#3366cc".to_string(),
-            visible: true,
-            read_only: false,
-            source: CalendarSource::Local,
-        });
+    /// Construct the three defaults used for first-run repository
+    /// initialization.  The repository owns the durable initialization
+    /// marker and transaction that decide whether these are written.
+    fn default_calendars() -> [Calendar; 3] {
+        [
+            Calendar {
+                id: Uuid::parse_str("e1111111-e111-1111-1111-111111111111").unwrap(),
+                name: "Personal".to_string(),
+                color: "#3366cc".to_string(),
+                visible: true,
+                read_only: false,
+                source: CalendarSource::Local,
+            },
+            Calendar {
+                id: Uuid::parse_str("e2222222-e222-2222-2222-222222222222").unwrap(),
+                name: "Work".to_string(),
+                color: "#cc3333".to_string(),
+                visible: true,
+                read_only: false,
+                source: CalendarSource::Local,
+            },
+            Calendar {
+                id: Uuid::parse_str("e3333333-e333-3333-3333-333333333333").unwrap(),
+                name: "Hidden".to_string(),
+                color: "#999999".to_string(),
+                visible: false,
+                read_only: false,
+                source: CalendarSource::Local,
+            },
+        ]
+    }
 
-        let work_cal_id = Uuid::parse_str("e2222222-e222-2222-2222-222222222222").unwrap();
-        let _ = repo.save_calendar(&Calendar {
-            id: work_cal_id,
-            name: "Work".to_string(),
-            color: "#cc3333".to_string(),
-            visible: true,
-            read_only: false,
-            source: CalendarSource::Local,
+    /// Show a fatal error dialog for a startup database failure,
+    /// then quit.  The dialog displays the full path so the user can
+    /// diagnose permissions or disk-space issues.
+    fn show_fatal_db_dialog(
+        parent: &gtk::Window,
+        app: Option<gtk::Application>,
+        db_path: &std::path::Path,
+    ) {
+        let dialog = adw::MessageDialog::new(
+            Some(parent),
+            Some("Cannot Open Calendar Database"),
+            Some(&format!(
+                "The calendar data could not be opened at\n\n  {}\n\n\
+                 Check that you have write permission and enough \
+                 disk space. The application will now close.",
+                db_path.display(),
+            )),
+        );
+        dialog.add_response("quit", "Quit");
+        dialog.set_close_response("quit");
+        dialog.connect_response(Some("quit"), move |_, _| {
+            if let Some(app) = app.as_ref() {
+                app.quit();
+            }
         });
-
-        let hidden_cal_id = Uuid::parse_str("e3333333-e333-3333-3333-333333333333").unwrap();
-        let _ = repo.save_calendar(&Calendar {
-            id: hidden_cal_id,
-            name: "Hidden".to_string(),
-            color: "#999999".to_string(),
-            visible: false,
-            read_only: false,
-            source: CalendarSource::Local,
-        });
+        gtk::prelude::GtkWindowExt::present(&dialog);
     }
 
     // ── Quick-Add helpers ──
@@ -365,7 +548,9 @@ impl imp::CalendarWindow {
 
         // Refresh calendar list from the repository so renames / toggles
         // are reflected in the popover each time it opens.
-        let calendars = self.repository.borrow().list_calendars();
+        let repo = self.repository.borrow();
+        let repo = repo.as_ref().expect("repository must be initialised");
+        let calendars = repo.list_calendars();
         popover.set_calendars(&calendars);
         popover.set_date(date);
 
@@ -405,10 +590,15 @@ impl imp::CalendarWindow {
             }
         };
 
-        let result = self.repository.borrow_mut().save_event(&event);
+        let result = {
+            let mut repo = self.repository.borrow_mut();
+            let repo = repo.as_mut().expect("repository must be initialised");
+            repo.save_event(&event)
+        }; // mutable guard dropped before render / popover work
         match result {
             Ok(()) => {
                 self.render_month_view();
+                self.render_week_view();
                 if let Some(popover) = popover_weak.upgrade() {
                     popover.popdown();
                 }
@@ -446,13 +636,16 @@ impl imp::CalendarWindow {
             return;
         };
 
-        let repo = self.repository.borrow();
-        let event = match repo.get_event(event_id) {
-            Some(ev) => ev,
-            None => return, // silently ignore missing events
+        let (event, calendar) = {
+            let repo_guard = self.repository.borrow();
+            let repo = repo_guard.as_ref().expect("repository must be initialised");
+            let event = match repo.get_event(event_id) {
+                Some(ev) => ev,
+                None => return, // silently ignore missing events
+            };
+            let calendar = repo.get_calendar(event.calendar_id);
+            (event, calendar)
         };
-        let calendar = repo.get_calendar(event.calendar_id);
-        drop(repo);
 
         let today = today_local();
         popover.set_event(&event, calendar.as_ref(), today);
@@ -476,4 +669,32 @@ fn today_local() -> NaiveDate {
             NaiveDate::from_ymd_opt(dt.year(), dt.month() as u32, dt.day_of_month() as u32)
         })
         .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 7, 20).unwrap())
+}
+
+fn month_name(month: u32) -> &'static str {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => unreachable!(),
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let first_of_next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .expect("month callback exceeded chrono's year range");
+    (first_of_next - chrono::Duration::days(1)).day()
 }

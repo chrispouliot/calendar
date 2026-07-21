@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveTime};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveTime};
 
 use crate::calendar_grid::month_grid;
 use crate::model::{Calendar, Event, EventSchedule};
@@ -29,6 +29,58 @@ pub fn project_month(
     calendars: &[Calendar],
     events: &[Event],
 ) -> [DayProjection; 42] {
+    let grid = month_grid(year, month);
+    let projection = project_dates(
+        grid.into_iter().map(|cell| {
+            let date =
+                NaiveDate::from_ymd_opt(cell.year, cell.month, cell.day).expect("valid grid cell");
+            (date, cell.in_displayed_month)
+        }),
+        calendars,
+        events,
+    );
+
+    projection.try_into().expect("month grid has 42 cells")
+}
+
+/// Projects the Monday-first week containing `active_date`.
+pub fn project_week(
+    active_date: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+) -> [DayProjection; 7] {
+    let monday = active_date - Duration::days(active_date.weekday().num_days_from_monday() as i64);
+    let projection = project_dates(
+        (0..7).map(|offset| (monday + Duration::days(offset), true)),
+        calendars,
+        events,
+    );
+
+    projection.try_into().expect("week has 7 days")
+}
+
+/// Projects `active_date` through the end of its Monday-first calendar week.
+/// The active date is retained even when it has no events; later empty days
+/// are omitted.
+pub fn project_agenda(
+    active_date: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+) -> Vec<DayProjection> {
+    let week = project_week(active_date, calendars, events);
+    week.into_iter()
+        .filter(|day| {
+            day.date >= active_date
+                && (day.date == active_date || !day.all_day.is_empty() || !day.timed.is_empty())
+        })
+        .collect()
+}
+
+fn project_dates(
+    dates: impl IntoIterator<Item = (NaiveDate, bool)>,
+    calendars: &[Calendar],
+    events: &[Event],
+) -> Vec<DayProjection> {
     // Visible calendars indexed by id.
     let cal_map: HashMap<uuid::Uuid, &Calendar> = calendars
         .iter()
@@ -36,20 +88,16 @@ pub fn project_month(
         .map(|c| (c.id, c))
         .collect();
 
-    let grid = month_grid(year, month);
-
-    // Build an empty projection aligned with the grid.
-    let mut projection: [DayProjection; 42] = std::array::from_fn(|i| {
-        let cell = grid[i];
-        let date =
-            NaiveDate::from_ymd_opt(cell.year, cell.month, cell.day).expect("valid grid cell");
-        DayProjection {
+    // Build an empty projection in the requested date order.
+    let mut projection: Vec<DayProjection> = dates
+        .into_iter()
+        .map(|(date, in_displayed_month)| DayProjection {
             date,
-            in_displayed_month: cell.in_displayed_month,
+            in_displayed_month,
             all_day: Vec::new(),
             timed: Vec::new(),
-        }
-    });
+        })
+        .collect();
 
     // Collect start times for timed events so we can sort chips later.
     let mut event_start: HashMap<uuid::Uuid, DateTime<FixedOffset>> = HashMap::new();

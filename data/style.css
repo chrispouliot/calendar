@@ -150,6 +150,55 @@ calendar-view.month-view .monthview-overflow {
   color: alpha(currentColor, 0.6);
 }
 
+/* ── Week View ── */
+calendar-view.week-view {
+  padding: 4px;
+}
+
+calendar-view.week-view .weekview-weekday,
+calendar-view.week-view .weekview-hour-label {
+  color: alpha(currentColor, 0.55);
+  font-size: smaller;
+  font-weight: 600;
+}
+
+calendar-view.week-view .weekview-date {
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+calendar-view.week-view .today .weekview-date {
+  color: var(--accent-fg-color);
+  background-color: var(--accent-bg-color);
+  border-radius: 6px;
+  padding: 1px 7px;
+}
+
+calendar-view.week-view .weekview-grid {
+  color: var(--accent-color);
+}
+
+calendar-view.week-view button.weekview-event,
+calendar-view.week-view button.weekview-all-day-event {
+  border: 1px solid alpha(currentColor, 0.18);
+  border-radius: 5px;
+  background-color: alpha(var(--accent-bg-color), 0.18);
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0;
+}
+
+calendar-view.week-view button.weekview-event:hover,
+calendar-view.week-view button.weekview-all-day-event:hover {
+  background-color: alpha(var(--accent-bg-color), 0.32);
+}
+
+calendar-view.week-view button.weekview-event:focus-visible,
+calendar-view.week-view button.weekview-all-day-event:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+}
+
 /* ── Quick-Add popover ──
  *
  * The popover template uses these style hooks to paint calendar
