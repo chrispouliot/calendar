@@ -199,6 +199,37 @@ calendar-view.week-view button.weekview-all-day-event:focus-visible {
   outline-offset: -2px;
 }
 
+/* ── Agenda View ── */
+.agenda-day-heading {
+  margin-top: 4px;
+  margin-bottom: 2px;
+}
+
+button.agenda-event {
+  border: 1px solid alpha(currentColor, 0.16);
+  border-radius: 6px;
+  background-color: alpha(var(--accent-bg-color), 0.12);
+}
+
+button.agenda-event:hover {
+  background-color: alpha(var(--accent-bg-color), 0.24);
+}
+
+button.agenda-event:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+button.agenda-event .agenda-event-time,
+button.agenda-event .agenda-event-location {
+  font-size: smaller;
+}
+
+.agenda-empty-row {
+  min-height: 36px;
+  padding: 8px 10px;
+}
+
 /* ── Quick-Add popover ──
  *
  * The popover template uses these style hooks to paint calendar

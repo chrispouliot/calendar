@@ -1,0 +1,21 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $AgendaView: Adw.Bin {
+  ScrolledWindow agenda_scroll {
+    hexpand: true;
+    vexpand: true;
+    hscrollbar-policy: never;
+    vscrollbar-policy: automatic;
+    overlay-scrolling: true;
+
+    child: Box agenda_days_box {
+      orientation: vertical;
+      spacing: 18;
+      margin-top: 18;
+      margin-bottom: 18;
+      margin-start: 24;
+      margin-end: 24;
+    };
+  }
+}

@@ -30,6 +30,8 @@ mod imp {
         #[template_child]
         pub week_view_bin: TemplateChild<adw::Bin>,
         #[template_child]
+        pub agenda_view_bin: TemplateChild<adw::Bin>,
+        #[template_child]
         pub title_label: TemplateChild<gtk::Label>,
 
         // Phase 6: New-Event button (host of the quick-add popover).
@@ -154,6 +156,18 @@ mod imp {
                 }
             });
             self.week_view_bin.set_child(Some(&week_view));
+
+            // ── Create and place the current AgendaView ──
+            let agenda_view = crate::ui::agenda_view::AgendaView::new();
+            agenda_view.set_on_event_activate({
+                let win_weak = win_weak.clone();
+                move |event_id, event_widget| {
+                    if let Some(win) = win_weak.upgrade() {
+                        win.imp().open_event_preview(event_id, &event_widget);
+                    }
+                }
+            });
+            self.agenda_view_bin.set_child(Some(&agenda_view));
 
             // Blueprint wires the ViewSwitcher to this stack, so observe the
             // stack itself to keep the shared date and view kind in sync.
@@ -360,11 +374,11 @@ impl imp::CalendarWindow {
         self.sync_views_to_state();
         self.render_month_view();
         self.render_week_view();
+        self.render_agenda_view();
         self.update_title();
     }
 
-    /// Push the shared active date into every concrete view.  Agenda has no
-    /// widget yet, but retains the same state and navigation semantics.
+    /// Push the shared active date into every concrete view.
     fn sync_views_to_state(&self) {
         let Some(date) = self
             .view_state
@@ -379,6 +393,11 @@ impl imp::CalendarWindow {
             && let Ok(week_view) = child.downcast::<crate::ui::week_view::WeekView>()
         {
             week_view.set_active_date(date);
+        }
+        if let Some(child) = self.agenda_view_bin.child()
+            && let Ok(agenda_view) = child.downcast::<crate::ui::agenda_view::AgendaView>()
+        {
+            agenda_view.set_active_date(date);
         }
     }
 
@@ -422,6 +441,25 @@ impl imp::CalendarWindow {
         }
     }
 
+    fn render_agenda_view(&self) {
+        let (calendars, all_events) = {
+            let repo_guard = self.repository.borrow();
+            let repo = repo_guard.as_ref().expect("repository must be initialised");
+            let calendars = repo.list_calendars();
+            let all_events: Vec<Event> = calendars
+                .iter()
+                .flat_map(|calendar| repo.list_events_for_calendar(calendar.id))
+                .collect();
+            (calendars, all_events)
+        };
+
+        if let Some(child) = self.agenda_view_bin.child()
+            && let Ok(agenda_view) = child.downcast::<crate::ui::agenda_view::AgendaView>()
+        {
+            agenda_view.render(&calendars, &all_events);
+        }
+    }
+
     /// Set the navigation title from the active view and shared date.
     fn update_title(&self) {
         let state_guard = self.view_state.borrow();
@@ -453,6 +491,7 @@ impl imp::CalendarWindow {
         self.sync_views_to_state();
         self.render_month_view();
         self.render_week_view();
+        self.render_agenda_view();
         self.update_title();
     }
 
@@ -599,6 +638,7 @@ impl imp::CalendarWindow {
             Ok(()) => {
                 self.render_month_view();
                 self.render_week_view();
+                self.render_agenda_view();
                 if let Some(popover) = popover_weak.upgrade() {
                     popover.popdown();
                 }

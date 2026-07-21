@@ -114,22 +114,9 @@ template $CalendarWindow: Adw.ApplicationWindow {
             use-underline: true;
             icon-name: "calendar-agenda-symbolic";
 
-            child: Box {
-              orientation: vertical;
+            child: Adw.Bin agenda_view_bin {
+              hexpand: true;
               vexpand: true;
-              valign: center;
-              halign: center;
-              spacing: 12;
-
-              Image {
-                icon-name: "calendar-agenda-symbolic";
-                pixel-size: 64;
-              }
-
-              Label {
-                label: "Agenda View";
-                css-classes: ["title-1"];
-              }
             };
           }
         }

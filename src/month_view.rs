@@ -22,6 +22,15 @@ pub struct DayProjection {
     pub timed: Vec<EventChip>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgendaGroup {
+    EventDay(DayProjection),
+    EmptyRange {
+        start_date: NaiveDate,
+        end_date_exclusive: NaiveDate,
+    },
+}
+
 /// Projects events onto a fixed 42-cell, Monday-first month grid.
 pub fn project_month(
     year: i32,
@@ -74,6 +83,53 @@ pub fn project_agenda(
                 && (day.date == active_date || !day.all_day.is_empty() || !day.timed.is_empty())
         })
         .collect()
+}
+
+/// Projects a date range into event-day and maximal empty-range groups.
+pub fn project_agenda_range(
+    start_date: NaiveDate,
+    end_date_exclusive: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+) -> Vec<AgendaGroup> {
+    if start_date >= end_date_exclusive {
+        return Vec::new();
+    }
+
+    let mut dates = Vec::new();
+    let mut date = start_date;
+    while date < end_date_exclusive {
+        dates.push((date, true));
+        date += Duration::days(1);
+    }
+
+    let days = project_dates(dates, calendars, events);
+    let mut groups = Vec::new();
+    let mut empty_start = None;
+
+    for day in days {
+        let has_events = !day.all_day.is_empty() || !day.timed.is_empty();
+        if has_events {
+            if let Some(empty_start) = empty_start.take() {
+                groups.push(AgendaGroup::EmptyRange {
+                    start_date: empty_start,
+                    end_date_exclusive: day.date,
+                });
+            }
+            groups.push(AgendaGroup::EventDay(day));
+        } else if empty_start.is_none() {
+            empty_start = Some(day.date);
+        }
+    }
+
+    if let Some(empty_start) = empty_start {
+        groups.push(AgendaGroup::EmptyRange {
+            start_date: empty_start,
+            end_date_exclusive,
+        });
+    }
+
+    groups
 }
 
 fn project_dates(

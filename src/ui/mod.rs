@@ -1,3 +1,4 @@
+pub mod agenda_view;
 pub mod date_chooser;
 pub mod event_popover;
 pub mod month_view;
