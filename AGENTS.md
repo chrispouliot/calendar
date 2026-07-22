@@ -70,6 +70,13 @@ nix develop
 
 The shell provides Rust, GTK4, Libadwaita, pkg-config, and `blueprint-compiler`.
 
+For automated or non-interactive commands that execute Rust binaries (including
+`cargo test` and `cargo run`), prefer `nix develop -c <command>`. A bare shell
+may compile successfully via `pkg-config` but fail at runtime because Nix-store
+GLib/GTK libraries are absent from `LD_LIBRARY_PATH`. Do not persist a global
+`LD_LIBRARY_PATH`; the development shell and packaged application provide their
+own runtime library environment.
+
 ## Development guidance
 
 - Keep UI and backend boundaries separate.

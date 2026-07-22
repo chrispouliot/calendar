@@ -270,15 +270,20 @@ mod imp {
                 obj.check_recycle();
             });
 
-            // Run once outside GTK's active allocation pass. setup_scroll
-            // establishes explicit row geometry and the complete adjustment,
-            // so no retry or range polling is needed.
+            // Retry outside GTK's active allocation pass until the viewport
+            // has an allocation; stop when setup succeeds or the widget dies.
             let obj_weak5 = obj_weak.clone();
             self.week_scroll.connect_realize(move |_| {
                 let obj_weak5 = obj_weak5.clone();
-                glib::source::idle_add_local_once(move || {
-                    if let Some(obj) = obj_weak5.upgrade() {
-                        obj.setup_scroll();
+                glib::source::idle_add_local(move || {
+                    let Some(obj) = obj_weak5.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    obj.setup_scroll();
+                    if obj.imp().initialized.get() {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
                     }
                 });
             });

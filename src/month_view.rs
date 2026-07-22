@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveTime, TimeZone, Utc};
 use rrule::{RRuleSet, Tz as RRuleTz};
 
 use crate::calendar_grid::month_grid;
 use crate::model::{Calendar, Event, EventSchedule};
+use crate::viewer_time::to_local_fixed;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventChip {
@@ -40,6 +41,30 @@ pub fn project_month(
     calendars: &[Calendar],
     events: &[Event],
 ) -> [DayProjection; 42] {
+    let localizer = GlibLocalizer;
+    project_month_with_localizer(year, month, calendars, events, &localizer)
+}
+
+/// Projects events onto a fixed 42-cell, Monday-first month grid using the
+/// supplied timezone for timed-event date boundaries.
+pub fn project_month_in_timezone<Tz: TimeZone>(
+    year: i32,
+    month: u32,
+    calendars: &[Calendar],
+    events: &[Event],
+    viewer_timezone: &Tz,
+) -> [DayProjection; 42] {
+    let localizer = TimezoneLocalizer(viewer_timezone);
+    project_month_with_localizer(year, month, calendars, events, &localizer)
+}
+
+fn project_month_with_localizer(
+    year: i32,
+    month: u32,
+    calendars: &[Calendar],
+    events: &[Event],
+    localizer: &impl ViewerLocalizer,
+) -> [DayProjection; 42] {
     let grid = month_grid(year, month);
     let projection = project_dates(
         grid.into_iter().map(|cell| {
@@ -49,6 +74,7 @@ pub fn project_month(
         }),
         calendars,
         events,
+        localizer,
     );
 
     projection.try_into().expect("month grid has 42 cells")
@@ -60,11 +86,34 @@ pub fn project_week(
     calendars: &[Calendar],
     events: &[Event],
 ) -> [DayProjection; 7] {
+    let localizer = GlibLocalizer;
+    project_week_with_localizer(active_date, calendars, events, &localizer)
+}
+
+/// Projects the Monday-first week containing `active_date` using the
+/// supplied timezone for timed-event date boundaries.
+pub fn project_week_in_timezone<Tz: TimeZone>(
+    active_date: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+    viewer_timezone: &Tz,
+) -> [DayProjection; 7] {
+    let localizer = TimezoneLocalizer(viewer_timezone);
+    project_week_with_localizer(active_date, calendars, events, &localizer)
+}
+
+fn project_week_with_localizer(
+    active_date: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+    localizer: &impl ViewerLocalizer,
+) -> [DayProjection; 7] {
     let monday = active_date - Duration::days(active_date.weekday().num_days_from_monday() as i64);
     let projection = project_dates(
         (0..7).map(|offset| (monday + Duration::days(offset), true)),
         calendars,
         events,
+        localizer,
     );
 
     projection.try_into().expect("week has 7 days")
@@ -78,7 +127,29 @@ pub fn project_agenda(
     calendars: &[Calendar],
     events: &[Event],
 ) -> Vec<DayProjection> {
-    let week = project_week(active_date, calendars, events);
+    let localizer = GlibLocalizer;
+    project_agenda_with_localizer(active_date, calendars, events, &localizer)
+}
+
+/// Projects `active_date` through the end of its Monday-first calendar week
+/// using the supplied timezone for timed-event date boundaries.
+pub fn project_agenda_in_timezone<Tz: TimeZone>(
+    active_date: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+    viewer_timezone: &Tz,
+) -> Vec<DayProjection> {
+    let localizer = TimezoneLocalizer(viewer_timezone);
+    project_agenda_with_localizer(active_date, calendars, events, &localizer)
+}
+
+fn project_agenda_with_localizer(
+    active_date: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+    localizer: &impl ViewerLocalizer,
+) -> Vec<DayProjection> {
+    let week = project_week_with_localizer(active_date, calendars, events, localizer);
     week.into_iter()
         .filter(|day| {
             day.date >= active_date
@@ -94,6 +165,42 @@ pub fn project_agenda_range(
     calendars: &[Calendar],
     events: &[Event],
 ) -> Vec<AgendaGroup> {
+    let localizer = GlibLocalizer;
+    project_agenda_range_with_localizer(
+        start_date,
+        end_date_exclusive,
+        calendars,
+        events,
+        &localizer,
+    )
+}
+
+/// Projects a date range into event-day and maximal empty-range groups using
+/// the supplied timezone for timed-event date boundaries.
+pub fn project_agenda_range_in_timezone<Tz: TimeZone>(
+    start_date: NaiveDate,
+    end_date_exclusive: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+    viewer_timezone: &Tz,
+) -> Vec<AgendaGroup> {
+    let localizer = TimezoneLocalizer(viewer_timezone);
+    project_agenda_range_with_localizer(
+        start_date,
+        end_date_exclusive,
+        calendars,
+        events,
+        &localizer,
+    )
+}
+
+fn project_agenda_range_with_localizer(
+    start_date: NaiveDate,
+    end_date_exclusive: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+    localizer: &impl ViewerLocalizer,
+) -> Vec<AgendaGroup> {
     if start_date >= end_date_exclusive {
         return Vec::new();
     }
@@ -105,7 +212,7 @@ pub fn project_agenda_range(
         date += Duration::days(1);
     }
 
-    let days = project_dates(dates, calendars, events);
+    let days = project_dates(dates, calendars, events, localizer);
     let mut groups = Vec::new();
     let mut empty_start = None;
 
@@ -134,10 +241,31 @@ pub fn project_agenda_range(
     groups
 }
 
+trait ViewerLocalizer {
+    fn localize(&self, value: &DateTime<FixedOffset>) -> DateTime<FixedOffset>;
+}
+
+struct GlibLocalizer;
+
+impl ViewerLocalizer for GlibLocalizer {
+    fn localize(&self, value: &DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+        to_local_fixed(value)
+    }
+}
+
+struct TimezoneLocalizer<'a, Tz>(&'a Tz);
+
+impl<Tz: TimeZone> ViewerLocalizer for TimezoneLocalizer<'_, Tz> {
+    fn localize(&self, value: &DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+        value.with_timezone(self.0).fixed_offset()
+    }
+}
+
 fn project_dates(
     dates: impl IntoIterator<Item = (NaiveDate, bool)>,
     calendars: &[Calendar],
     events: &[Event],
+    localizer: &impl ViewerLocalizer,
 ) -> Vec<DayProjection> {
     // Visible calendars indexed by id.
     let cal_map: HashMap<uuid::Uuid, &Calendar> = calendars
@@ -203,6 +331,8 @@ fn project_dates(
                 }
             }
             EventSchedule::Timed { start, end, .. } => {
+                let start = localizer.localize(start);
+                let end = localizer.localize(end);
                 let start_date = start.date_naive();
                 let end_date = end.date_naive();
                 let end_is_midnight =

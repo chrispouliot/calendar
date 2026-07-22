@@ -5,6 +5,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event, EventSchedule};
 use calendar::month_view::{AgendaGroup, EventChip, project_agenda_range};
+use calendar::viewer_time::{now_local_fixed, to_local_fixed};
 use chrono::{Datelike, Duration, NaiveDate};
 use gtk::glib;
 use uuid::Uuid;
@@ -99,13 +100,8 @@ mod imp {
     impl ObjectImpl for AgendaView {
         fn constructed(&self) {
             self.parent_constructed();
-            if let Ok(now) = glib::DateTime::now_local()
-                && let Some(today) = NaiveDate::from_ymd_opt(
-                    now.year(),
-                    now.month() as u32,
-                    now.day_of_month() as u32,
-                )
-            {
+            let now = now_local_fixed();
+            if let Some(today) = NaiveDate::from_ymd_opt(now.year(), now.month(), now.day()) {
                 self.active_date.set(today);
             }
 
@@ -608,7 +604,7 @@ fn group_contains(group: &AgendaGroup, date: NaiveDate) -> bool {
 fn event_time_label(event: &Event) -> String {
     match &event.schedule {
         EventSchedule::AllDay { .. } => "All day".to_string(),
-        EventSchedule::Timed { start, .. } => start.format("%-I:%M %p").to_string(),
+        EventSchedule::Timed { start, .. } => to_local_fixed(start).format("%-I:%M %p").to_string(),
     }
 }
 
@@ -653,11 +649,8 @@ fn full_date(date: NaiveDate, include_year: bool) -> String {
 }
 
 fn local_today() -> NaiveDate {
-    glib::DateTime::now_local()
-        .ok()
-        .and_then(|now| {
-            NaiveDate::from_ymd_opt(now.year(), now.month() as u32, now.day_of_month() as u32)
-        })
+    let now = now_local_fixed();
+    NaiveDate::from_ymd_opt(now.year(), now.month(), now.day())
         .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 5).unwrap())
 }
 

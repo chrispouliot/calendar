@@ -58,7 +58,7 @@
 
 use calendar::calendar_grid::month_grid;
 use calendar::model::{Calendar, CalendarSource, Event, EventSchedule};
-use calendar::month_view::{DayProjection, project_month};
+use calendar::month_view::{DayProjection, project_month_in_timezone};
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
 use uuid::Uuid;
 
@@ -276,7 +276,8 @@ fn phase5_month_view_event_projection() {
     ];
 
     // ----- Project May 2026.
-    let projection = project_month(2026, 5, &calendars, &events);
+    let viewer_timezone = FixedOffset::east_opt(2 * 3600).unwrap();
+    let projection = project_month_in_timezone(2026, 5, &calendars, &events, &viewer_timezone);
     let grid = month_grid(2026, 5);
 
     // 1) Length and date alignment with month_grid.
@@ -436,4 +437,55 @@ fn phase5_month_view_event_projection() {
             day.date
         );
     }
+}
+
+#[test]
+fn projects_timed_events_in_the_viewer_timezone() {
+    let calendar_id = Uuid::parse_str("55555555-5555-5555-5555-555555555555").unwrap();
+    let calendars = vec![Calendar {
+        id: calendar_id,
+        name: "Personal".to_string(),
+        color: "#3366cc".to_string(),
+        visible: true,
+        read_only: false,
+        source: CalendarSource::Local,
+    }];
+    let event = Event {
+        id: Uuid::parse_str("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee").unwrap(),
+        calendar_id,
+        title: "Evening appointment".to_string(),
+        location: String::new(),
+        description: String::new(),
+        schedule: EventSchedule::Timed {
+            start: at(2026, 7, 22, 3, 0),
+            end: at(2026, 7, 22, 4, 0),
+            timezone: None,
+        },
+        recurrence: None,
+        reminders: Vec::new(),
+    };
+    let viewer_timezone = FixedOffset::west_opt(7 * 3600).unwrap();
+
+    let projection = project_month_in_timezone(2026, 7, &calendars, &[event], &viewer_timezone);
+    let find_day = |day| {
+        projection
+            .iter()
+            .find(|projection| projection.date == NaiveDate::from_ymd_opt(2026, 7, day).unwrap())
+            .unwrap()
+    };
+
+    assert!(
+        find_day(21)
+            .timed
+            .iter()
+            .any(|chip| chip.title == "Evening appointment"),
+        "2026-07-22 03:00 +02:00 is 2026-07-21 18:00 at -07:00"
+    );
+    assert!(
+        !find_day(22)
+            .timed
+            .iter()
+            .any(|chip| chip.title == "Evening appointment"),
+        "the event remains entirely within the viewer's July 21 evening"
+    );
 }

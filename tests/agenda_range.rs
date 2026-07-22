@@ -1,5 +1,7 @@
 use calendar::model::{Calendar, CalendarSource, Event, EventSchedule};
-use calendar::month_view::{AgendaGroup, DayProjection, EventChip, project_agenda_range};
+use calendar::month_view::{
+    AgendaGroup, DayProjection, EventChip, project_agenda_range, project_agenda_range_in_timezone,
+};
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
 use uuid::Uuid;
 
@@ -164,7 +166,9 @@ fn phase8_agenda_range_groups_every_requested_date() {
     let start = NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
     let end = NaiveDate::from_ymd_opt(2026, 5, 19).unwrap();
 
-    let groups = project_agenda_range(start, end, &calendars, &events);
+    let viewer_timezone = FixedOffset::east_opt(2 * 3600).unwrap();
+    let groups =
+        project_agenda_range_in_timezone(start, end, &calendars, &events, &viewer_timezone);
 
     assert!(
         matches!(groups[0], AgendaGroup::EmptyRange { start_date, end_date_exclusive } if start_date == start && end_date_exclusive == NaiveDate::from_ymd_opt(2026, 5, 12).unwrap())

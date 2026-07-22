@@ -1163,7 +1163,7 @@ Tasks:
 - [x] Store reminder definitions in the app database.
 - [x] Compute next reminder occurrences.
 - [x] Run a reminder scheduler while the app is active.
-- [x] Use replacing/aggregating desktop notifications through the freedesktop notification API.
+- [x] Use replacing/aggregating desktop notifications through GNotification with a stable ID and default app action.
 - [ ] Support dismiss/snooze later.
 - [x] Recompute reminders after sync/edit/delete.
 
@@ -1178,33 +1178,37 @@ Manual check: create event with reminder and receive notification.
 
 Implemented with CalDAV DISPLAY VALARM mapping, durable reminder definitions,
 bounded timed/all-day recurrence expansion, preset reminder editing, and one
-foreground notification that replaces or aggregates reminders. Normal shutdown
-withdraws the notification. Dismiss/snooze actions and closed-app delivery remain
-future work, with background delivery assigned to Phase 13.
+GNotification with a stable ID that replaces or aggregates reminders. Its
+default app action activates Calendar while the process is held, and normal
+shutdown withdraws the notification. Dismiss/snooze actions remain future work.
 
-### Phase 13: Background service
+### Phase 13: In-process background operation
 
 Goal: keep calendars synchronized and deliver reminders while the GTK
 application is closed.
 
-Status: Not started
+Status: Complete
 
 Tasks:
 
-- [ ] Extract reusable sync and reminder runners from the application process.
-- [ ] Add a headless, D-Bus-activated or systemd user service.
-- [ ] Schedule periodic sync and react to network availability with backoff.
-- [ ] Coordinate SQLite access and prevent overlapping account sync runs.
-- [ ] Recompute and schedule reminder notifications after remote changes.
-- [ ] Support notification actions without requiring an open application window.
-- [ ] Package and install the service metadata with the application.
+- [x] Own sync and reminder runners in a process-lifetime background controller.
+- [x] Keep sync and reminder work active with no open calendar window.
+- [x] Reopen the shared SQLite database from workers so account and event edits
+  become visible to subsequent cycles.
+- [x] Preserve explicit Quit semantics while holding the application for
+  background operation.
+- [x] Complete manual lifecycle verification for closed-window sync and reminders.
 
 Verification:
 
-- Close the GTK application, change an event on the CalDAV server, and verify
+- Close the calendar window, change an event on the CalDAV server, and verify
   that the local cache updates in the background.
-- Close the GTK application and verify that a scheduled reminder still produces
+- Close the calendar window and verify that a scheduled reminder still produces
   a desktop notification.
+
+Background operation is in-process and does not survive explicit Quit, logout,
+crash, or reboot. Reminder clicks use the GNotification default app action to
+activate the shared CalendarWindow while the process is held.
 
 ## Recommended first work unit
 

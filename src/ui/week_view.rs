@@ -7,6 +7,7 @@ use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event, EventSchedule};
 use calendar::month_view::{DayProjection, EventChip, project_week};
 use calendar::view_state::{ViewKind, ViewState};
+use calendar::viewer_time::{now_local_fixed, to_local_fixed};
 use chrono::{Datelike, NaiveDate, Timelike};
 use gtk::{gdk, glib, graphene, gsk};
 use uuid::Uuid;
@@ -155,6 +156,8 @@ impl WeekGrid {
                 let EventSchedule::Timed { start, end, .. } = &event.schedule else {
                     continue;
                 };
+                let start = to_local_fixed(start);
+                let end = to_local_fixed(end);
                 let start_minutes = if start.date_naive() == dates[day] {
                     time_minutes(start.time())
                 } else {
@@ -344,15 +347,8 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
 
-            let today = glib::DateTime::now_local()
-                .ok()
-                .and_then(|now| {
-                    NaiveDate::from_ymd_opt(
-                        now.year(),
-                        now.month() as u32,
-                        now.day_of_month() as u32,
-                    )
-                })
+            let now = now_local_fixed();
+            let today = NaiveDate::from_ymd_opt(now.year(), now.month(), now.day())
                 .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 5).unwrap());
             self.today_date.set(today);
             self.active_date.set(today);
@@ -548,14 +544,9 @@ impl WeekView {
     }
 
     fn schedule_clock_tick(&self) {
-        let delay = self
-            .local_now()
-            .map(|now| {
-                let elapsed =
-                    now.second().max(0) as u64 * 1_000_000 + now.microsecond().max(0) as u64;
-                Duration::from_micros((60_000_000 - elapsed).max(1_000))
-            })
-            .unwrap_or_else(|| Duration::from_secs(60));
+        let now = self.local_now();
+        let elapsed = now.second() as u64 * 1_000_000 + now.nanosecond() as u64;
+        let delay = Duration::from_micros((60_000_000 - elapsed).max(1_000));
         let obj_weak = self.downgrade();
         let source = glib::timeout_add_local_once(delay, move || {
             if let Some(obj) = obj_weak.upgrade() {
@@ -572,14 +563,8 @@ impl WeekView {
     }
 
     fn refresh_clock(&self) {
-        let Some(now) = self.local_now() else {
-            if let Some(grid) = self.imp().week_grid.borrow().as_ref() {
-                grid.set_clock(self.imp().today_date.get(), None);
-            }
-            return;
-        };
-        let today =
-            NaiveDate::from_ymd_opt(now.year(), now.month() as u32, now.day_of_month() as u32);
+        let now = self.local_now();
+        let today = NaiveDate::from_ymd_opt(now.year(), now.month(), now.day());
         if let Some(today) = today {
             let date_changed = self.imp().today_date.replace(today) != today;
             if date_changed {
@@ -595,13 +580,13 @@ impl WeekView {
         }
     }
 
-    fn local_now(&self) -> Option<glib::DateTime> {
-        glib::DateTime::now_local().ok()
+    fn local_now(&self) -> chrono::DateTime<chrono::FixedOffset> {
+        now_local_fixed()
     }
 
     fn local_now_minutes(&self) -> Option<f64> {
-        self.local_now()
-            .map(|now| now.hour() as f64 * 60.0 + now.minute() as f64)
+        let now = self.local_now();
+        Some(now.hour() as f64 * 60.0 + now.minute() as f64)
     }
 
     fn scroll_to_current_time(&self) {
@@ -621,10 +606,8 @@ impl WeekView {
         if page_size <= 0.0 || upper <= adjustment.lower() {
             return;
         }
-        let now = glib::DateTime::now_local().ok();
-        let minutes = now
-            .map(|value| value.hour() as f64 * 60.0 + value.minute() as f64)
-            .unwrap_or(9.0 * 60.0);
+        let now = self.local_now();
+        let minutes = now.hour() as f64 * 60.0 + now.minute() as f64;
         let target = minutes / 60.0 * HOUR_HEIGHT - imp.timeline_scroll.height() as f64 / 3.0;
         let max_value = (upper - page_size).max(adjustment.lower());
         adjustment.set_value(target.clamp(adjustment.lower(), max_value));

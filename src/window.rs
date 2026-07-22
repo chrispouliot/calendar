@@ -1,9 +1,7 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::backend::caldav::CaldavDiscovery;
-use calendar::backend::credentials::{CredentialError, delete_on_worker, lookup_on_worker};
-use calendar::backend::reminders::reminder_occurrences_in_window;
-use calendar::backend::sync::{AccountSyncSummary, AccountSyncWorkerError, sync_account_on_worker};
+use calendar::backend::credentials::delete_on_worker;
 use calendar::backend::{
     AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError,
     SqliteRepository,
@@ -12,366 +10,12 @@ use calendar::model::{
     Account, Calendar, CalendarSource, EmptyQuickAddTitle, Event, new_quick_add_event,
 };
 use calendar::view_state::{ViewKind, ViewState};
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, FixedOffset, Local, NaiveDate};
+use chrono::{Datelike, NaiveDate};
 use gtk::{gio, glib};
-use notify_rust::{Hint, Notification, NotificationHandle, Timeout, Urgency};
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::thread::JoinHandle;
-use std::time::Duration;
 use uuid::Uuid;
-
-const REMINDER_NOTIFICATION_ID: &str = "calendar-reminders";
-const REMINDER_LOOKBACK: ChronoDuration = ChronoDuration::hours(1);
-
-enum SyncPhase {
-    Lookup {
-        accounts: Vec<Account>,
-        next: usize,
-        account: Account,
-        receiver: Receiver<Result<Option<oo7::Secret>, CredentialError>>,
-    },
-    Sync {
-        accounts: Vec<Account>,
-        next: usize,
-        receiver: Receiver<Result<AccountSyncSummary, AccountSyncWorkerError>>,
-    },
-}
-
-struct SyncSchedulerState {
-    database_path: PathBuf,
-    phase: Option<SyncPhase>,
-    pending: bool,
-    terminal_progress: bool,
-}
-
-pub(super) struct SyncScheduler {
-    startup_source: Rc<RefCell<Option<glib::SourceId>>>,
-    interval_source: glib::SourceId,
-    poll_source: glib::SourceId,
-}
-
-impl SyncScheduler {
-    fn new(window: &CalendarWindow, database_path: PathBuf) -> Self {
-        let state = Rc::new(RefCell::new(SyncSchedulerState {
-            database_path,
-            phase: None,
-            pending: false,
-            terminal_progress: false,
-        }));
-
-        let startup_weak = window.downgrade();
-        let startup_state = state.clone();
-        let startup_source = Rc::new(RefCell::new(None));
-        let startup_source_for_callback = startup_source.clone();
-        let source = glib::timeout_add_local_once(Duration::from_secs(1), move || {
-            startup_source_for_callback.borrow_mut().take();
-            request_sync_batch(&startup_weak, &startup_state);
-        });
-        startup_source.borrow_mut().replace(source);
-
-        let interval_weak = window.downgrade();
-        let interval_state = state.clone();
-        let interval_source = glib::timeout_add_local(Duration::from_secs(60), move || {
-            request_sync_batch(&interval_weak, &interval_state);
-            glib::ControlFlow::Continue
-        });
-
-        let poll_weak = window.downgrade();
-        let poll_state = state;
-        let poll_source = glib::timeout_add_local(Duration::from_millis(100), move || {
-            poll_sync_batch(&poll_weak, &poll_state)
-        });
-
-        Self {
-            startup_source,
-            interval_source,
-            poll_source,
-        }
-    }
-
-    fn stop(self) {
-        if let Some(startup_source) = self.startup_source.borrow_mut().take() {
-            startup_source.remove();
-        }
-        self.interval_source.remove();
-        self.poll_source.remove();
-    }
-}
-
-struct ReminderScheduler {
-    source: Rc<RefCell<Option<glib::SourceId>>>,
-    notifier_sender: Sender<ReminderNotificationCommand>,
-    notifier_thread: Option<JoinHandle<()>>,
-}
-
-enum ReminderNotificationCommand {
-    Show { title: String, body: String },
-    Close,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct DeliveredReminder {
-    event_id: Uuid,
-    occurrence_start: DateTime<FixedOffset>,
-    trigger_at: DateTime<FixedOffset>,
-    description: String,
-}
-
-struct ReminderSchedulerState {
-    last_checked: DateTime<FixedOffset>,
-    delivered: HashSet<DeliveredReminder>,
-}
-
-impl ReminderScheduler {
-    fn new(window: &CalendarWindow) -> Self {
-        let (notifier_sender, notifier_receiver) = std::sync::mpsc::channel();
-        let notifier_thread = std::thread::Builder::new()
-            .name("calendar-reminder-notifier".to_string())
-            .spawn(|| run_reminder_notifier(notifier_receiver))
-            .expect("failed to start calendar reminder notifier thread");
-
-        let state = Rc::new(RefCell::new(ReminderSchedulerState {
-            last_checked: Local::now().fixed_offset(),
-            delivered: HashSet::new(),
-        }));
-        seed_startup_reminders(window, &state);
-        if let Some(app) = window.application() {
-            app.withdraw_notification(REMINDER_NOTIFICATION_ID);
-        }
-
-        let window_weak = window.downgrade();
-        let source_state = state;
-        let source = Rc::new(RefCell::new(None));
-        let source_for_callback = source.clone();
-        let source_id = glib::timeout_add_local(Duration::from_secs(15), move || {
-            let control_flow = check_reminders(&window_weak, &source_state);
-            if control_flow == glib::ControlFlow::Break {
-                source_for_callback.borrow_mut().take();
-            }
-            control_flow
-        });
-        source.borrow_mut().replace(source_id);
-
-        Self {
-            source,
-            notifier_sender,
-            notifier_thread: Some(notifier_thread),
-        }
-    }
-
-    fn stop(mut self) {
-        if let Some(source) = self.source.borrow_mut().take() {
-            source.remove();
-        }
-        let _ = self
-            .notifier_sender
-            .send(ReminderNotificationCommand::Close);
-        drop(self.notifier_sender);
-        if let Some(thread) = self.notifier_thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn reminder_notification(title: &str, body: &str) -> Notification {
-    let mut notification = Notification::new();
-    notification
-        .appname("Calendar")
-        .summary(title)
-        .body(body)
-        .icon(&reminder_notification_icon())
-        .hint(Hint::Category("reminder".to_string()))
-        .hint(Hint::Urgency(Urgency::Normal))
-        .timeout(Timeout::Default);
-    notification
-}
-
-fn reminder_notification_icon() -> String {
-    let installed_icon = std::env::current_exe()
-        .ok()
-        .and_then(|executable| executable.parent()?.parent().map(PathBuf::from))
-        .map(|prefix| prefix.join("share/icons/hicolor/scalable/apps/dev.chris.calendar.svg"))
-        .filter(|path| path.is_file());
-    if let Some(path) = installed_icon {
-        return path.to_string_lossy().into_owned();
-    }
-
-    let source_tree_icon = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("data/icons/hicolor/scalable/apps/dev.chris.calendar.svg");
-    if source_tree_icon.is_file() {
-        return source_tree_icon.to_string_lossy().into_owned();
-    }
-
-    "dev.chris.calendar".to_string()
-}
-
-fn close_reminder_notification(handle: &mut Option<NotificationHandle>) {
-    if let Some(handle) = handle.take() {
-        handle.close();
-    }
-}
-
-fn run_reminder_notifier(receiver: Receiver<ReminderNotificationCommand>) {
-    let mut handle: Option<NotificationHandle> = None;
-    while let Ok(command) = receiver.recv() {
-        match command {
-            ReminderNotificationCommand::Show { title, body } => {
-                if handle.is_some() {
-                    let update_result = {
-                        let existing = handle.as_mut().expect("notification handle disappeared");
-                        existing.summary(&title).body(&body);
-                        existing.update()
-                    };
-                    if let Err(error) = update_result {
-                        eprintln!("[calendar] failed to update reminder notification: {error}");
-                        close_reminder_notification(&mut handle);
-                    }
-                } else {
-                    let notification = reminder_notification(&title, &body);
-                    match notification.show() {
-                        Ok(new_handle) => handle = Some(new_handle),
-                        Err(error) => {
-                            eprintln!("[calendar] failed to show reminder notification: {error}");
-                        }
-                    }
-                }
-            }
-            ReminderNotificationCommand::Close => {
-                close_reminder_notification(&mut handle);
-                return;
-            }
-        }
-    }
-    close_reminder_notification(&mut handle);
-}
-
-fn reminder_window_start(now: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
-    now.checked_sub_signed(REMINDER_LOOKBACK).unwrap_or(now)
-}
-
-fn load_reminder_events(window: &CalendarWindow) -> Vec<Event> {
-    let repo_guard = window.imp().repository.borrow();
-    let Some(repo) = repo_guard.as_ref() else {
-        return Vec::new();
-    };
-    repo.list_calendars()
-        .into_iter()
-        .flat_map(|calendar| repo.list_events_for_calendar(calendar.id))
-        .collect()
-}
-
-fn delivered_reminder_key(
-    event_id: Uuid,
-    occurrence_start: DateTime<FixedOffset>,
-    trigger_at: DateTime<FixedOffset>,
-    description: String,
-) -> DeliveredReminder {
-    DeliveredReminder {
-        event_id,
-        occurrence_start,
-        trigger_at,
-        description,
-    }
-}
-
-fn seed_startup_reminders(window: &CalendarWindow, state: &Rc<RefCell<ReminderSchedulerState>>) {
-    let now = Local::now().fixed_offset();
-    let start = reminder_window_start(now);
-    let events = load_reminder_events(window);
-    let mut state = state.borrow_mut();
-    for event in &events {
-        for occurrence in reminder_occurrences_in_window(event, start, now) {
-            state.delivered.insert(delivered_reminder_key(
-                occurrence.event_id,
-                occurrence.occurrence_start,
-                occurrence.trigger_at,
-                occurrence.description,
-            ));
-        }
-    }
-}
-
-fn check_reminders(
-    window_weak: &glib::WeakRef<CalendarWindow>,
-    state: &Rc<RefCell<ReminderSchedulerState>>,
-) -> glib::ControlFlow {
-    let Some(window) = window_weak.upgrade() else {
-        return glib::ControlFlow::Break;
-    };
-
-    let now = Local::now().fixed_offset();
-    let start = reminder_window_start(now);
-    {
-        let mut state = state.borrow_mut();
-        state.last_checked = now;
-        state
-            .delivered
-            .retain(|reminder| reminder.trigger_at > start);
-    }
-
-    let events = load_reminder_events(&window);
-
-    let mut due: Vec<(String, DateTime<FixedOffset>, String)> = Vec::new();
-    for event in &events {
-        for occurrence in reminder_occurrences_in_window(event, start, now) {
-            let key = delivered_reminder_key(
-                occurrence.event_id,
-                occurrence.occurrence_start,
-                occurrence.trigger_at,
-                occurrence.description.clone(),
-            );
-            if state.borrow_mut().delivered.insert(key) {
-                due.push((
-                    event.title.clone(),
-                    occurrence.occurrence_start,
-                    occurrence.description,
-                ));
-            }
-        }
-    }
-    if due.is_empty() {
-        return glib::ControlFlow::Continue;
-    }
-
-    let (title, body) = if due.len() == 1 {
-        let (event_title, occurrence_start, description) = &due[0];
-        let due_line = format!(
-            "Due at {}",
-            occurrence_start.with_timezone(&Local).format("%-I:%M %p")
-        );
-        let description = description.trim();
-        if description.is_empty()
-            || description.eq_ignore_ascii_case(&format!("Reminder for {event_title}"))
-        {
-            (event_title.clone(), due_line)
-        } else {
-            (event_title.clone(), format!("{due_line}\n{description}"))
-        }
-    } else {
-        let event_lines = due
-            .iter()
-            .map(|(event_title, occurrence_start, _)| {
-                format!(
-                    "{event_title} — {}",
-                    occurrence_start.with_timezone(&Local).format("%-I:%M %p")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        (format!("{} calendar reminders", due.len()), event_lines)
-    };
-    if let Some(scheduler) = window.imp().reminder_scheduler.borrow().as_ref() {
-        let _ = scheduler
-            .notifier_sender
-            .send(ReminderNotificationCommand::Show { title, body });
-    }
-
-    glib::ControlFlow::Continue
-}
 
 mod imp {
     use super::*;
@@ -423,12 +67,6 @@ mod imp {
 
         /// Shared navigation state for the three pages in `views_stack`.
         pub view_state: RefCell<Option<ViewState>>,
-
-        // Foreground-only CalDAV synchronization while this window is alive.
-        pub(super) sync_scheduler: RefCell<Option<SyncScheduler>>,
-
-        // Foreground-only reminder notifications while this window is alive.
-        pub(super) reminder_scheduler: RefCell<Option<ReminderScheduler>>,
     }
 
     #[glib::object_subclass]
@@ -453,7 +91,7 @@ mod imp {
             *self.view_state.borrow_mut() = Some(ViewState::new(ViewKind::Month, today_local()));
 
             // ── Open the persistent SQLite database ──
-            let db_path = Self::make_db_path();
+            let db_path = crate::background::database_path();
 
             // All three init steps (create-dir, open, seed) are treated
             // as one fallible path.  Any failure shows the fatal dialog
@@ -767,19 +405,9 @@ mod imp {
 
             // ── Initial render from the shared local-today state ──
             self.render_all_from_state();
-
-            *self.sync_scheduler.borrow_mut() =
-                Some(SyncScheduler::new(&win, Self::make_db_path()));
-            *self.reminder_scheduler.borrow_mut() = Some(ReminderScheduler::new(&win));
         }
 
         fn dispose(&self) {
-            if let Some(scheduler) = self.sync_scheduler.borrow_mut().take() {
-                scheduler.stop();
-            }
-            if let Some(scheduler) = self.reminder_scheduler.borrow_mut().take() {
-                scheduler.stop();
-            }
             if let Some(popover) = self.quick_add.borrow_mut().take() {
                 popover.unparent();
             }
@@ -802,154 +430,6 @@ glib::wrapper! {
                    gtk::ShortcutManager, gio::ActionGroup, gio::ActionMap;
 }
 
-fn request_sync_batch(
-    window_weak: &glib::WeakRef<CalendarWindow>,
-    state: &Rc<RefCell<SyncSchedulerState>>,
-) {
-    if state.borrow().phase.is_some() {
-        state.borrow_mut().pending = true;
-        return;
-    }
-
-    let Some(window) = window_weak.upgrade() else {
-        return;
-    };
-    let accounts = window
-        .imp()
-        .repository
-        .borrow()
-        .as_ref()
-        .map(AccountRepository::list_accounts)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|account| account.enabled)
-        .collect::<Vec<_>>();
-    drop(window);
-
-    state.borrow_mut().terminal_progress = false;
-    if accounts.is_empty() {
-        return;
-    }
-    start_account_lookup(window_weak, state, accounts, 0);
-}
-
-fn start_account_lookup(
-    window_weak: &glib::WeakRef<CalendarWindow>,
-    state: &Rc<RefCell<SyncSchedulerState>>,
-    accounts: Vec<Account>,
-    next: usize,
-) {
-    if next >= accounts.len() {
-        finish_sync_batch(window_weak, state);
-        return;
-    }
-    let account = accounts[next].clone();
-    let receiver = lookup_on_worker(account.id);
-    state.borrow_mut().phase = Some(SyncPhase::Lookup {
-        accounts,
-        next,
-        account,
-        receiver,
-    });
-}
-
-fn advance_sync_batch(
-    window_weak: &glib::WeakRef<CalendarWindow>,
-    state: &Rc<RefCell<SyncSchedulerState>>,
-    accounts: Vec<Account>,
-    next: usize,
-) {
-    state.borrow_mut().terminal_progress = true;
-    if next < accounts.len() {
-        start_account_lookup(window_weak, state, accounts, next);
-    } else {
-        finish_sync_batch(window_weak, state);
-    }
-}
-
-fn finish_sync_batch(
-    window_weak: &glib::WeakRef<CalendarWindow>,
-    state: &Rc<RefCell<SyncSchedulerState>>,
-) {
-    let (refresh, pending) = {
-        let mut state = state.borrow_mut();
-        state.phase = None;
-        let refresh = state.terminal_progress;
-        state.terminal_progress = false;
-        let pending = state.pending;
-        state.pending = false;
-        (refresh, pending)
-    };
-
-    if refresh && let Some(window) = window_weak.upgrade() {
-        window.imp().render_all_from_state();
-    }
-    if pending {
-        request_sync_batch(window_weak, state);
-    }
-}
-
-fn poll_sync_batch(
-    window_weak: &glib::WeakRef<CalendarWindow>,
-    state: &Rc<RefCell<SyncSchedulerState>>,
-) -> glib::ControlFlow {
-    if window_weak.upgrade().is_none() {
-        return glib::ControlFlow::Break;
-    }
-
-    let Some(phase) = state.borrow_mut().phase.take() else {
-        return glib::ControlFlow::Continue;
-    };
-
-    match phase {
-        SyncPhase::Lookup {
-            accounts,
-            next,
-            account,
-            receiver,
-        } => match receiver.try_recv() {
-            Err(TryRecvError::Empty) => {
-                state.borrow_mut().phase = Some(SyncPhase::Lookup {
-                    accounts,
-                    next,
-                    account,
-                    receiver,
-                });
-            }
-            Err(TryRecvError::Disconnected) | Ok(Err(_)) | Ok(Ok(None)) => {
-                advance_sync_batch(window_weak, state, accounts, next + 1);
-            }
-            Ok(Ok(Some(password))) => {
-                let database_path = state.borrow().database_path.clone();
-                let receiver = sync_account_on_worker(database_path, account, password);
-                state.borrow_mut().phase = Some(SyncPhase::Sync {
-                    accounts,
-                    next,
-                    receiver,
-                });
-            }
-        },
-        SyncPhase::Sync {
-            accounts,
-            next,
-            receiver,
-        } => match receiver.try_recv() {
-            Err(TryRecvError::Empty) => {
-                state.borrow_mut().phase = Some(SyncPhase::Sync {
-                    accounts,
-                    next,
-                    receiver,
-                });
-            }
-            Err(TryRecvError::Disconnected) | Ok(Err(_)) | Ok(Ok(_)) => {
-                advance_sync_batch(window_weak, state, accounts, next + 1);
-            }
-        },
-    }
-
-    glib::ControlFlow::Continue
-}
-
 // ── Public API (window callbacks from actions) ──
 
 impl CalendarWindow {
@@ -957,6 +437,10 @@ impl CalendarWindow {
         glib::Object::builder()
             .property("application", Some(app))
             .build()
+    }
+
+    pub(crate) fn refresh_from_background(&self) {
+        self.imp().render_all_from_state();
     }
 
     fn navigate_previous(&self) {
@@ -1280,7 +764,7 @@ impl imp::CalendarWindow {
         };
         result.map_err(|_| "Could not add the online account.".to_string())?;
         self.render_all_from_state();
-        Ok(Self::make_db_path())
+        Ok(crate::background::database_path())
     }
 
     /// Persist one visibility change without changing any other calendar
@@ -1309,15 +793,6 @@ impl imp::CalendarWindow {
                 false
             }
         }
-    }
-
-    /// Build the application-specific database path beneath the
-    /// platform's per-user data directory.
-    fn make_db_path() -> PathBuf {
-        let mut path = glib::user_data_dir();
-        path.push("dev.chris.calendar");
-        path.push("calendar.sqlite");
-        path
     }
 
     /// Construct the three defaults used for first-run repository

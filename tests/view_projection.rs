@@ -1,5 +1,7 @@
 use calendar::model::{Calendar, CalendarSource, Event, EventSchedule};
-use calendar::month_view::{DayProjection, EventChip, project_agenda, project_week};
+use calendar::month_view::{
+    DayProjection, EventChip, project_agenda_in_timezone, project_week_in_timezone,
+};
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
 use uuid::Uuid;
 
@@ -177,7 +179,8 @@ fn phase8_week_and_agenda_share_month_event_projection_rules() {
     ];
     let active_date = NaiveDate::from_ymd_opt(2026, 5, 13).unwrap();
 
-    let week = project_week(active_date, &calendars, &events);
+    let viewer_timezone = FixedOffset::east_opt(2 * 3600).unwrap();
+    let week = project_week_in_timezone(active_date, &calendars, &events, &viewer_timezone);
     assert_eq!(
         week.each_ref().map(|day| day.date),
         [
@@ -221,7 +224,7 @@ fn phase8_week_and_agenda_share_month_event_projection_rules() {
             .all(|chip| chip.calendar_id != hidden_id && chip.calendar_id != orphan_id)
     );
 
-    let agenda = project_agenda(active_date, &calendars, &events);
+    let agenda = project_agenda_in_timezone(active_date, &calendars, &events, &viewer_timezone);
     assert_eq!(
         agenda.iter().map(|day| day.date).collect::<Vec<_>>(),
         vec![

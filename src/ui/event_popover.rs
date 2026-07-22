@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event, EventSchedule};
+use calendar::viewer_time::to_local_fixed;
 use chrono::{Datelike, NaiveDate, Timelike};
 use gtk::glib;
 
@@ -183,6 +184,8 @@ fn format_schedule(schedule: &EventSchedule, today: NaiveDate) -> String {
             end,
             timezone: _,
         } => {
+            let start = to_local_fixed(start);
+            let end = to_local_fixed(end);
             let start_naive = start.date_naive();
             let end_naive = end.date_naive();
             let start_time = format!("{:02}:{:02}", start.hour(), start.minute());
