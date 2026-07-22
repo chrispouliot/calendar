@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveTime};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use rrule::{RRuleSet, Tz as RRuleTz};
 
 use crate::calendar_grid::month_grid;
 use crate::model::{Calendar, Event, EventSchedule};
@@ -155,18 +157,27 @@ fn project_dates(
         })
         .collect();
 
-    // Collect start times for timed events so we can sort chips later.
-    let mut event_start: HashMap<uuid::Uuid, DateTime<FixedOffset>> = HashMap::new();
+    let first_date = projection.first().map(|day| day.date);
+    let last_date = projection.last().map(|day| day.date);
+    let mut expanded_events: Vec<Event> = match (first_date, last_date) {
+        (Some(first), Some(last)) => events
+            .iter()
+            .flat_map(|event| expand_event(event, first, last))
+            .collect(),
+        _ => Vec::new(),
+    };
+    expanded_events.sort_by(|a, b| match (&a.schedule, &b.schedule) {
+        (
+            EventSchedule::Timed { start: a_start, .. },
+            EventSchedule::Timed { start: b_start, .. },
+        ) => a_start.cmp(b_start).then_with(|| a.id.cmp(&b.id)),
+        (EventSchedule::AllDay { .. }, EventSchedule::Timed { .. }) => std::cmp::Ordering::Less,
+        (EventSchedule::Timed { .. }, EventSchedule::AllDay { .. }) => std::cmp::Ordering::Greater,
+        (EventSchedule::AllDay { .. }, EventSchedule::AllDay { .. }) => std::cmp::Ordering::Equal,
+    });
 
-    // First pass: record timed-event start times.
-    for event in events {
-        if let EventSchedule::Timed { start, .. } = &event.schedule {
-            event_start.insert(event.id, *start);
-        }
-    }
-
-    // Second pass: place chips.
-    for event in events {
+    // Timed events are already ordered by each expanded occurrence's start.
+    for event in &expanded_events {
         let cal = match cal_map.get(&event.calendar_id) {
             Some(c) => c,
             None => continue,
@@ -217,16 +228,117 @@ fn project_dates(
         }
     }
 
-    // Sort each day's timed chips by start time ascending; ties broken by event_id.
-    for day in projection.iter_mut() {
-        day.timed.sort_by(|a, b| {
-            let a_start = event_start.get(&a.event_id);
-            let b_start = event_start.get(&b.event_id);
-            a_start
-                .cmp(&b_start)
-                .then_with(|| a.event_id.cmp(&b.event_id))
-        });
-    }
-
     projection
+}
+
+const RECURRENCE_LIMIT: u16 = 4096;
+
+fn expand_event(event: &Event, first: NaiveDate, last: NaiveDate) -> Vec<Event> {
+    if event.recurrence.is_none() {
+        return vec![event.clone()];
+    }
+    let Ok(source) = recurrence_source(event) else {
+        return vec![event.clone()];
+    };
+    let Ok(set) = source.parse::<RRuleSet>() else {
+        return vec![event.clone()];
+    };
+    let duration = match &event.schedule {
+        EventSchedule::AllDay {
+            start_date,
+            end_date_exclusive,
+        } => Duration::days((*end_date_exclusive - *start_date).num_days()),
+        EventSchedule::Timed { start, end, .. } => *end - *start,
+    };
+    let tz = recurrence_timezone(event);
+    let lower = bound_datetime(tz, first) - duration - Duration::seconds(1);
+    let upper = bound_datetime(tz, last + Duration::days(1));
+    let dates = set.after(lower).before(upper).all(RECURRENCE_LIMIT).dates;
+
+    dates
+        .into_iter()
+        .filter_map(|date| {
+            let schedule = match &event.schedule {
+                EventSchedule::AllDay { .. } => {
+                    let start_date = date.date_naive();
+                    let end_date_exclusive = start_date.checked_add_signed(duration)?;
+                    EventSchedule::AllDay {
+                        start_date,
+                        end_date_exclusive,
+                    }
+                }
+                EventSchedule::Timed { timezone, .. } => {
+                    let start = date.fixed_offset();
+                    let end = start.checked_add_signed(duration)?;
+                    EventSchedule::Timed {
+                        start,
+                        end,
+                        timezone: timezone.clone(),
+                    }
+                }
+            };
+            Some(Event {
+                schedule,
+                recurrence: None,
+                ..event.clone()
+            })
+        })
+        .collect()
+}
+
+fn recurrence_source(event: &Event) -> Result<String, ()> {
+    let Some(recurrence) = &event.recurrence else {
+        return Err(());
+    };
+    let dtstart = match &event.schedule {
+        EventSchedule::AllDay { start_date, .. } => {
+            format!("DTSTART:{}T000000", start_date.format("%Y%m%d"))
+        }
+        EventSchedule::Timed {
+            start, timezone, ..
+        } => match timezone.as_deref() {
+            None => format!(
+                "DTSTART:{}",
+                start.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ")
+            ),
+            Some(tzid) => {
+                let timezone = chrono_tz::Tz::from_str(tzid).map_err(|_| ())?;
+                format!(
+                    "DTSTART;TZID={tzid}:{}",
+                    start.with_timezone(&timezone).format("%Y%m%dT%H%M%S")
+                )
+            }
+        },
+    };
+    let mut source = dtstart;
+    for line in recurrence
+        .rrule
+        .iter()
+        .chain(&recurrence.rdate)
+        .chain(&recurrence.exdate)
+    {
+        source.push('\n');
+        source.push_str(line);
+    }
+    Ok(source)
+}
+
+fn recurrence_timezone(event: &Event) -> RRuleTz {
+    match event.schedule {
+        EventSchedule::AllDay { .. } => RRuleTz::LOCAL,
+        EventSchedule::Timed {
+            timezone: Some(ref timezone),
+            ..
+        } => chrono_tz::Tz::from_str(timezone)
+            .map(RRuleTz::from)
+            .unwrap_or(RRuleTz::UTC),
+        EventSchedule::Timed { timezone: None, .. } => RRuleTz::UTC,
+    }
+}
+
+fn bound_datetime(timezone: RRuleTz, date: NaiveDate) -> chrono::DateTime<RRuleTz> {
+    timezone
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .expect("projection dates are valid")
 }

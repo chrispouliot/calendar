@@ -189,17 +189,24 @@ fn phase11_maps_safe_icalendar_event_subset_and_rejects_unsupported_resources() 
     );
     assert!(matches!(floating, EventMappingError::FloatingTime));
 
-    for unsupported in [
-        resource(
+    let recurring = map_icalendar_event(
+        &resource(
             "BEGIN:VEVENT\r\nUID:recurring\r\nSUMMARY:Recurring\r\nDTSTART;VALUE=DATE:20260714\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\n",
         ),
-        resource(
+        event_id,
+        calendar_id,
+    )
+    .expect("a valid RRULE is supported");
+    assert!(recurring.event.recurrence.is_some());
+
+    let detached = mapping_error(
+        &resource(
             "BEGIN:VEVENT\r\nUID:instance\r\nSUMMARY:Instance\r\nDTSTART;VALUE=DATE:20260714\r\nRECURRENCE-ID;VALUE=DATE:20260714\r\nEND:VEVENT\r\n",
         ),
-    ] {
-        let error = mapping_error(&unsupported, event_id, calendar_id);
-        assert!(matches!(error, EventMappingError::UnsupportedRecurrence));
-    }
+        event_id,
+        calendar_id,
+    );
+    assert!(matches!(detached, EventMappingError::UnsupportedRecurrence));
 
     let multiple_events = mapping_error(
         &resource(

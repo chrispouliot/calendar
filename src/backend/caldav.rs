@@ -1,7 +1,8 @@
 use chrono::{DateTime, FixedOffset, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use icalendar::{
-    Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, EventLike,
+    Alarm, Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, EventLike,
+    Related,
 };
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event as XmlEvent};
@@ -11,6 +12,7 @@ use quick_xml::writer::Writer;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, USER_AGENT};
 use reqwest::{Method, Url};
+use rrule::RRuleSet;
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -522,13 +524,6 @@ pub fn serialize_icalendar_event(
     if remote_uid.trim().is_empty() {
         return Err(EventSerializationError::EmptyUid);
     }
-    if event.recurrence.is_some() {
-        return Err(EventSerializationError::UnsupportedRecurrence);
-    }
-    if !event.reminders.is_empty() {
-        return Err(EventSerializationError::UnsupportedReminders);
-    }
-
     let mut serialized_event = icalendar::Event::new();
     serialized_event.uid(remote_uid);
     serialized_event.summary(&event.title);
@@ -560,6 +555,33 @@ pub fn serialize_icalendar_event(
         }
     }
 
+    for reminder in &event.reminders {
+        if reminder.seconds_before_start <= 0 {
+            return Err(EventSerializationError::UnsupportedReminders);
+        }
+        serialized_event.alarm(Alarm::display(
+            &reminder.description,
+            (
+                -chrono::Duration::seconds(reminder.seconds_before_start),
+                Related::Start,
+            ),
+        ));
+    }
+
+    if let Some(recurrence) = &event.recurrence {
+        validate_recurrence(&event.schedule, recurrence)
+            .map_err(|_| EventSerializationError::UnsupportedRecurrence)?;
+        for line in &recurrence.rrule {
+            add_recurrence_property(&mut serialized_event, line, false)?;
+        }
+        for line in &recurrence.rdate {
+            add_recurrence_property(&mut serialized_event, line, true)?;
+        }
+        for line in &recurrence.exdate {
+            add_recurrence_property(&mut serialized_event, line, true)?;
+        }
+    }
+
     let serialized_event = serialized_event.done();
     let mut calendar = Calendar::new();
     calendar.push(serialized_event);
@@ -573,15 +595,10 @@ fn serialize_timed_values(
     timezone: Option<&str>,
 ) -> Result<(CalendarDateTime, CalendarDateTime), EventSerializationError> {
     match timezone {
-        None => {
-            if start.offset().local_minus_utc() != 0 || end.offset().local_minus_utc() != 0 {
-                return Err(EventSerializationError::InvalidSchedule);
-            }
-            Ok((
-                CalendarDateTime::from(start.with_timezone(&Utc)),
-                CalendarDateTime::from(end.with_timezone(&Utc)),
-            ))
-        }
+        None => Ok((
+            CalendarDateTime::from(start.with_timezone(&Utc)),
+            CalendarDateTime::from(end.with_timezone(&Utc)),
+        )),
         Some(tzid) => {
             let timezone =
                 Tz::from_str(tzid).map_err(|_| EventSerializationError::InvalidSchedule)?;
@@ -611,7 +628,7 @@ fn serialize_tz_value(
     })
 }
 
-/// Map the one-event, non-recurring subset accepted by the local event model.
+/// Map one supported VEVENT master into the local event model.
 ///
 /// The CalDAV resource identity (href and ETag) deliberately does not enter
 /// this value; callers persist that identity alongside the returned event.
@@ -647,11 +664,7 @@ pub fn map_icalendar_event(
         .get_uid()
         .filter(|uid| !uid.trim().is_empty())
         .ok_or(EventMappingError::MissingUid)?;
-    if has_property(event, "RRULE")
-        || has_property(event, "RDATE")
-        || has_property(event, "EXDATE")
-        || has_property(event, "RECURRENCE-ID")
-    {
+    if has_property(event, "RECURRENCE-ID") {
         return Err(EventMappingError::UnsupportedRecurrence);
     }
     if has_property(event, "DURATION") {
@@ -659,10 +672,15 @@ pub fn map_icalendar_event(
             "DURATION is not supported".to_owned(),
         ));
     }
-    if !event.components().is_empty() {
-        return Err(EventMappingError::UnsupportedData(
-            "nested VEVENT components are not supported".to_owned(),
-        ));
+    let mut reminders = Vec::new();
+    for component in event.components() {
+        if component.component_kind().eq_ignore_ascii_case("VALARM") {
+            reminders.push(map_alarm(component)?);
+        } else {
+            return Err(EventMappingError::UnsupportedData(
+                "nested non-VALARM components are not supported".to_owned(),
+            ));
+        }
     }
 
     let start = event.get_start().ok_or_else(|| {
@@ -674,6 +692,7 @@ pub fn map_icalendar_event(
     })?;
     let end = event.get_end();
     let schedule = map_schedule(start, end)?;
+    let recurrence = recurrence_spec(&normalized, &schedule)?;
     let mapped = crate::model::Event {
         id: event_id,
         calendar_id,
@@ -681,14 +700,268 @@ pub fn map_icalendar_event(
         location: event.get_location().unwrap_or_default().to_owned(),
         description: event.get_description().unwrap_or_default().to_owned(),
         schedule,
-        recurrence: None,
-        reminders: Vec::new(),
+        recurrence,
+        reminders,
     };
 
     Ok(MappedEvent {
         event: mapped,
         remote_uid: uid.to_owned(),
     })
+}
+
+fn map_alarm<C: Component>(component: &C) -> Result<crate::model::ReminderSpec, EventMappingError> {
+    let action = component
+        .properties()
+        .get("ACTION")
+        .filter(|property| property.value().eq_ignore_ascii_case("DISPLAY"))
+        .ok_or_else(|| {
+            EventMappingError::UnsupportedData("VALARM action is unsupported".to_owned())
+        })?;
+    if component.multi_properties().contains_key("ACTION")
+        || component.multi_properties().contains_key("TRIGGER")
+        || component.multi_properties().contains_key("DESCRIPTION")
+        || !component.components().is_empty()
+    {
+        return Err(EventMappingError::UnsupportedData(
+            "VALARM has repeated required properties".to_owned(),
+        ));
+    }
+    let _ = action;
+    if component.properties().contains_key("REPEAT")
+        || component.properties().contains_key("DURATION")
+        || component.multi_properties().contains_key("REPEAT")
+        || component.multi_properties().contains_key("DURATION")
+    {
+        return Err(EventMappingError::UnsupportedData(
+            "repeating VALARMs are unsupported".to_owned(),
+        ));
+    }
+
+    let trigger = component
+        .properties()
+        .get("TRIGGER")
+        .ok_or_else(|| EventMappingError::UnsupportedData("VALARM has no TRIGGER".to_owned()))?;
+    if let Some(value) = trigger.params().get("VALUE") {
+        if value.value().eq_ignore_ascii_case("DATE-TIME") {
+            return Err(EventMappingError::UnsupportedData(
+                "absolute VALARM triggers are unsupported".to_owned(),
+            ));
+        }
+        if !value.value().eq_ignore_ascii_case("DURATION") {
+            return Err(EventMappingError::UnsupportedData(
+                "VALARM trigger value type is malformed".to_owned(),
+            ));
+        }
+    }
+    let related = trigger.params().get("RELATED").map(|value| value.value());
+    if related.is_some_and(|value| value.eq_ignore_ascii_case("END")) {
+        return Err(EventMappingError::UnsupportedData(
+            "VALARM trigger must be related to START".to_owned(),
+        ));
+    }
+    if related.is_some_and(|value| !value.eq_ignore_ascii_case("START")) {
+        return Err(EventMappingError::UnsupportedData(
+            "VALARM trigger relationship is malformed".to_owned(),
+        ));
+    }
+    let seconds = parse_ical_duration(trigger.value()).ok_or_else(|| {
+        EventMappingError::UnsupportedData("VALARM trigger is malformed".to_owned())
+    })?;
+    if seconds >= 0 || seconds == i64::MIN {
+        return Err(EventMappingError::UnsupportedData(
+            "VALARM trigger must be a negative whole-second duration".to_owned(),
+        ));
+    }
+    let seconds_before_start = -seconds;
+    let description = component
+        .properties()
+        .get("DESCRIPTION")
+        .ok_or_else(|| {
+            EventMappingError::UnsupportedData("DISPLAY VALARM has no DESCRIPTION".to_owned())
+        })?
+        .value()
+        .to_owned();
+    Ok(crate::model::ReminderSpec {
+        seconds_before_start,
+        description,
+    })
+}
+
+fn parse_ical_duration(value: &str) -> Option<i64> {
+    let (negative, value) = match value.as_bytes().first()? {
+        b'-' => (true, &value[1..]),
+        b'+' => (false, &value[1..]),
+        _ => (false, value),
+    };
+    let value = value.strip_prefix('P')?;
+    if value.is_empty() {
+        return None;
+    }
+    let mut total = 0i64;
+    let mut number = 0i64;
+    let mut have_number = false;
+    let mut in_time = false;
+    let mut used_week = false;
+    let mut used_date = false;
+    for byte in value.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                number = number
+                    .checked_mul(10)?
+                    .checked_add(i64::from(byte - b'0'))?;
+                have_number = true;
+            }
+            b'T' if !in_time && !used_week => {
+                in_time = true;
+                have_number = false;
+            }
+            designator @ (b'W' | b'D' | b'H' | b'M' | b'S') if have_number => {
+                let multiplier = match designator {
+                    b'W' if !in_time && !used_date && !used_week => {
+                        used_week = true;
+                        7 * 24 * 60 * 60
+                    }
+                    b'D' if !in_time && !used_week && !used_date => {
+                        used_date = true;
+                        24 * 60 * 60
+                    }
+                    b'H' if in_time => 60 * 60,
+                    b'M' if in_time => 60,
+                    b'S' if in_time => 1,
+                    _ => return None,
+                };
+                total = total.checked_add(number.checked_mul(multiplier)?)?;
+                number = 0;
+                have_number = false;
+            }
+            _ => return None,
+        }
+    }
+    if have_number || total == 0 || (used_week && in_time) {
+        return None;
+    }
+    Some(if negative {
+        total.checked_neg()?
+    } else {
+        total
+    })
+}
+
+fn add_recurrence_property(
+    event: &mut icalendar::Event,
+    line: &str,
+    multi: bool,
+) -> Result<(), EventSerializationError> {
+    let (key, value) = line
+        .split_once(':')
+        .ok_or(EventSerializationError::UnsupportedRecurrence)?;
+    if key.is_empty() || value.is_empty() || key.eq_ignore_ascii_case("DTSTART") {
+        return Err(EventSerializationError::UnsupportedRecurrence);
+    }
+    if multi {
+        event.add_multi_property(key, value);
+    } else {
+        event.add_property(key, value);
+    }
+    Ok(())
+}
+
+fn recurrence_spec(
+    resource: &str,
+    schedule: &crate::model::EventSchedule,
+) -> Result<Option<crate::model::RecurrenceSpec>, EventMappingError> {
+    let mut in_event = false;
+    let mut recurrence = crate::model::RecurrenceSpec::default();
+    for line in resource.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.eq_ignore_ascii_case("BEGIN:VEVENT") {
+            in_event = true;
+            continue;
+        }
+        if line.eq_ignore_ascii_case("END:VEVENT") {
+            in_event = false;
+            continue;
+        }
+        if !in_event {
+            continue;
+        }
+        let Some((key, _)) = line.split_once(':') else {
+            continue;
+        };
+        let name = key.split(';').next().unwrap_or_default();
+        match name.to_ascii_uppercase().as_str() {
+            "RRULE" => recurrence.rrule.push(line.to_owned()),
+            "RDATE" => recurrence.rdate.push(line.to_owned()),
+            "EXDATE" => recurrence.exdate.push(line.to_owned()),
+            _ => {}
+        }
+    }
+    if recurrence.rrule.is_empty() && recurrence.rdate.is_empty() && recurrence.exdate.is_empty() {
+        return Ok(None);
+    }
+    if recurrence.rrule.len() > 1 {
+        return Err(EventMappingError::UnsupportedRecurrence);
+    }
+    if recurrence
+        .rdate
+        .iter()
+        .chain(&recurrence.exdate)
+        .any(|line| line.to_ascii_uppercase().contains("VALUE=PERIOD"))
+    {
+        return Err(EventMappingError::UnsupportedRecurrence);
+    }
+
+    validate_recurrence(schedule, &recurrence)
+        .map_err(|message| EventMappingError::UnsupportedData(message.to_owned()))?;
+    Ok(Some(recurrence))
+}
+
+fn validate_recurrence(
+    schedule: &crate::model::EventSchedule,
+    recurrence: &crate::model::RecurrenceSpec,
+) -> Result<(), &'static str> {
+    let mut source = recurrence_dtstart(schedule)?;
+    source.push('\n');
+    for line in &recurrence.rrule {
+        source.push_str(line);
+        source.push('\n');
+    }
+    for line in &recurrence.rdate {
+        source.push_str(line);
+        source.push('\n');
+    }
+    for line in &recurrence.exdate {
+        source.push_str(line);
+        source.push('\n');
+    }
+    source
+        .parse::<RRuleSet>()
+        .map(|_| ())
+        .map_err(|_| "invalid recurrence properties")
+}
+
+fn recurrence_dtstart(schedule: &crate::model::EventSchedule) -> Result<String, &'static str> {
+    match schedule {
+        crate::model::EventSchedule::AllDay { start_date, .. } => {
+            Ok(format!("DTSTART:{}T000000", start_date.format("%Y%m%d")))
+        }
+        crate::model::EventSchedule::Timed {
+            start, timezone, ..
+        } => match timezone.as_deref() {
+            None => Ok(format!(
+                "DTSTART:{}",
+                start.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ")
+            )),
+            Some(tzid) => {
+                let timezone = Tz::from_str(tzid).map_err(|_| "unknown event timezone")?;
+                Ok(format!(
+                    "DTSTART;TZID={tzid}:{}",
+                    start.with_timezone(&timezone).format("%Y%m%dT%H%M%S")
+                ))
+            }
+        },
+    }
 }
 
 fn has_property(event: &icalendar::Event, key: &str) -> bool {

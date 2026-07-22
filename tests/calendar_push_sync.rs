@@ -92,7 +92,7 @@ fn phase11_pushes_durable_operations_and_keeps_conflicts_and_skips_pending() {
         "No update ETag",
     );
     let unsupported = Event {
-        recurrence: Some(RecurrenceSpec),
+        recurrence: Some(RecurrenceSpec::default()),
         ..event(
             "e1100320-0000-0000-0000-000000000010",
             calendar.id,

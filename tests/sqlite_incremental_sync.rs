@@ -230,7 +230,7 @@ fn phase11_reconciles_incremental_remote_changes_atomically_and_advances_token()
                 summary.deleted,
                 summary.skipped
             ),
-            (1, 1, 1, 1)
+            (1, 2, 1, 0)
         );
         assert_eq!(repo.get_event(update.id).unwrap().title, "Remote planning");
         assert_eq!(
@@ -255,13 +255,17 @@ fn phase11_reconciles_incremental_remote_changes_atomically_and_advances_token()
         assert!(repo.get_event(deleted.id).is_none());
         assert!(repo.get_event_sync_state(deleted.id).is_none());
         assert_eq!(repo.get_event(untouched.id), Some(untouched.clone()));
-        assert_eq!(repo.get_event(unsupported.id), Some(unsupported.clone()));
+        assert_eq!(
+            repo.get_event(unsupported.id).unwrap().title,
+            "Do not overwrite"
+        );
+        assert!(repo.get_event(unsupported.id).unwrap().recurrence.is_some());
         assert_eq!(
             repo.get_event_sync_state(unsupported.id)
                 .unwrap()
                 .etag
                 .as_deref(),
-            Some("\"old-recurring\"")
+            Some("\"recurring-v2\"")
         );
         assert_eq!(repo.get_event(local_only.id), Some(local_only.clone()));
         assert_eq!(

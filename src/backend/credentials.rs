@@ -110,9 +110,25 @@ pub fn delete_on_worker(account: Uuid) -> Receiver<Result<(), CredentialError>> 
     })
 }
 
-fn credential_worker<F>(name: &str, operation: F) -> Receiver<Result<(), CredentialError>>
+/// Look up an account password without making the GTK thread wait for the
+/// system credential store.
+pub fn lookup_on_worker(account: Uuid) -> Receiver<Result<Option<Secret>, CredentialError>> {
+    credential_worker("credential-lookup", move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| CredentialError)?;
+        runtime.block_on(async move {
+            let store = CredentialStore::system().await?;
+            store.lookup(account).await
+        })
+    })
+}
+
+fn credential_worker<T, F>(name: &str, operation: F) -> Receiver<Result<T, CredentialError>>
 where
-    F: FnOnce() -> Result<(), CredentialError> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, CredentialError> + Send + 'static,
 {
     let (sender, receiver) = mpsc::sync_channel(1);
     let worker = move || {

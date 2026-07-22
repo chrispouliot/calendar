@@ -37,8 +37,11 @@ fn phase9_detailed_event_validation() {
             start_date,
             end_date_exclusive: end_date,
         },
-        recurrence: Some(RecurrenceSpec),
-        reminders: vec![ReminderSpec],
+        recurrence: Some(RecurrenceSpec::default()),
+        reminders: vec![ReminderSpec {
+            seconds_before_start: 600,
+            description: "Join the meeting".to_owned(),
+        }],
     };
     let normalized = validate_event(detailed).expect("a complete forward all-day event is valid");
     assert_eq!(normalized.id, event_id, "event id must remain available");
@@ -64,7 +67,10 @@ fn phase9_detailed_event_validation() {
     );
     assert_eq!(
         normalized.reminders,
-        vec![ReminderSpec],
+        vec![ReminderSpec {
+            seconds_before_start: 600,
+            description: "Join the meeting".to_owned(),
+        }],
         "reminders must remain available"
     );
     assert_eq!(

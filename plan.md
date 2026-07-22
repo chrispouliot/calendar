@@ -507,7 +507,7 @@ data/
 
 Goal: launch a real Adwaita app window.
 
-Status: In progress
+Status: Complete
 
 Tasks:
 
@@ -1106,7 +1106,7 @@ shutdown checks pass.
 
 Goal: own network sync backend.
 
-Status: In progress
+Status: Complete
 
 Tasks:
 
@@ -1121,7 +1121,7 @@ Tasks:
   - [x] ETag
   - [x] sync-token if supported
 - [x] Map supported non-recurring iCalendar events to/from the app model.
-- [ ] Add recurrence mapping.
+- [x] Add recurrence mapping.
 - [x] Queue and upload supported local create/update/delete operations.
 - [x] Preserve pending local intent on ETag conflicts without overwriting remote data.
 - [x] Add incremental sync-token reports with invalid-token fallback.
@@ -1144,27 +1144,28 @@ Use integration tests against a local CalDAV server such as Radicale or another 
 Implemented so far: durable account/source, pending-operation, and sync
 metadata; authenticated DAV discovery with event-calendar filtering; secure
 credential storage; account provisioning and removal UI; nonblocking initial
-event import; full-snapshot pulls; safe non-recurring iCalendar
+event import; full-snapshot and incremental pulls; recurrence-aware iCalendar
 mapping/serialization; atomic local edit and SQLite reconciliation; conditional
-uploads; and conflict-preserving ETag handling. The ignored Radicale integration
-test verifies discovery, import, create, update, conflict, deletion, and
-incremental token advancement. Recurrence mapping and automatic scheduling
-remain.
+uploads; orphaned-upload recovery; and conflict-preserving ETag handling. The
+ignored Radicale integration test verifies discovery, import, create, update,
+conflict, deletion, and incremental token advancement. Automatic scheduling
+runs while the GTK application is open. Closed-app synchronization remains in
+Phase 13.
 
 ### Phase 12: Reminders and notifications
 
 Goal: replace Evolution alarm notification behavior.
 
-Status: Not started
+Status: Complete
 
 Tasks:
 
-- [ ] Store reminder definitions in the app database.
-- [ ] Compute next reminder occurrences.
-- [ ] Run a reminder scheduler while app/background service is active.
-- [ ] Use desktop notifications through GIO/GLib APIs.
+- [x] Store reminder definitions in the app database.
+- [x] Compute next reminder occurrences.
+- [x] Run a reminder scheduler while the app is active.
+- [x] Use replacing/aggregating desktop notifications through the freedesktop notification API.
 - [ ] Support dismiss/snooze later.
-- [ ] Recompute reminders after sync/edit/delete.
+- [x] Recompute reminders after sync/edit/delete.
 
 Verification:
 
@@ -1174,6 +1175,12 @@ cargo run
 ```
 
 Manual check: create event with reminder and receive notification.
+
+Implemented with CalDAV DISPLAY VALARM mapping, durable reminder definitions,
+bounded timed/all-day recurrence expansion, preset reminder editing, and one
+foreground notification that replaces or aggregates reminders. Normal shutdown
+withdraws the notification. Dismiss/snooze actions and closed-app delivery remain
+future work, with background delivery assigned to Phase 13.
 
 ### Phase 13: Background service
 

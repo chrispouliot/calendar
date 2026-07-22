@@ -38,6 +38,177 @@ pub enum InitialPullWorkerError {
     WorkerPanic,
 }
 
+/// The aggregate result of syncing all persisted CalDAV calendars for one
+/// account. It contains only counts and no account or credential data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountSyncSummary {
+    pub calendars: usize,
+    pub pushed: PendingPushSummary,
+    pub pulled: RemoteSnapshotSummary,
+}
+
+/// Errors sent by the account-sync worker deliberately omit account,
+/// credential, and transport details so formatting a terminal result is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSyncWorkerError {
+    InvalidCredential,
+    Caldav,
+    MissingCalendarSyncState,
+    Repository,
+    WorkerPanic,
+}
+
+/// Start an account sync on one dedicated worker. The returned receiver is
+/// ready before any blocking database or network work begins.
+pub fn sync_account_on_worker(
+    database_path: PathBuf,
+    account: Account,
+    password: oo7::Secret,
+) -> Receiver<Result<AccountSyncSummary, AccountSyncWorkerError>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker_sender = sender.clone();
+    let worker = move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sync_account(&database_path, &account, password)
+        }))
+        .unwrap_or(Err(AccountSyncWorkerError::WorkerPanic));
+        let _ = worker_sender.send(result);
+    };
+
+    if std::thread::Builder::new()
+        .name("caldav-account-sync".to_owned())
+        .spawn(worker)
+        .is_err()
+    {
+        let _ = sender.send(Err(AccountSyncWorkerError::WorkerPanic));
+    }
+    receiver
+}
+
+fn sync_account(
+    database_path: &std::path::Path,
+    account: &Account,
+    password: oo7::Secret,
+) -> Result<AccountSyncSummary, AccountSyncWorkerError> {
+    if password.content_type() != oo7::ContentType::Text {
+        return Err(AccountSyncWorkerError::InvalidCredential);
+    }
+
+    let mut repository =
+        SqliteRepository::open(database_path).map_err(|_| AccountSyncWorkerError::Repository)?;
+    let client = CaldavClient::new_with_secret(
+        account.server_url.clone(),
+        account.username.clone(),
+        password,
+    );
+    let calendars = repository
+        .list_calendars()
+        .into_iter()
+        .filter(|calendar| {
+            matches!(
+                calendar.source,
+                CalendarSource::CalDav { account_id } if account_id == account.id
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut summary = AccountSyncSummary {
+        calendars: calendars.len(),
+        pushed: PendingPushSummary {
+            created: 0,
+            updated: 0,
+            deleted: 0,
+            conflicts: 0,
+            skipped: 0,
+        },
+        pulled: RemoteSnapshotSummary {
+            added: 0,
+            updated: 0,
+            deleted: 0,
+            skipped: 0,
+        },
+    };
+
+    for calendar in calendars {
+        repository
+            .queue_orphan_event_creates(calendar.id, account.id)
+            .map_err(|_| AccountSyncWorkerError::Repository)?;
+        let pending_before_push = repository.list_pending_sync_operations(calendar.id);
+        let pushed = push_pending_operations(&client, &mut repository, calendar.id)
+            .map_err(account_push_error)?;
+        summary.pushed.created += pushed.created;
+        summary.pushed.updated += pushed.updated;
+        summary.pushed.deleted += pushed.deleted;
+        summary.pushed.conflicts += pushed.conflicts;
+        summary.pushed.skipped += pushed.skipped;
+
+        // A server may acknowledge a PUT before its collection report includes
+        // that resource. Keep successful uploads protected for this immediate
+        // pull; the temporary intents are removed after reconciliation.
+        let recently_pushed = pending_before_push
+            .into_iter()
+            .filter_map(|operation| {
+                let event_id = match &operation {
+                    PendingSyncOperation::Create { event_id, .. }
+                    | PendingSyncOperation::Update { event_id, .. }
+                    | PendingSyncOperation::Delete { event_id, .. } => *event_id,
+                };
+                if repository.get_pending_sync_operation(event_id).is_some() {
+                    return None;
+                }
+                match operation {
+                    PendingSyncOperation::Delete { .. } => Some((event_id, operation)),
+                    PendingSyncOperation::Create { .. } | PendingSyncOperation::Update { .. } => {
+                        repository.get_event_sync_state(event_id).map(|state| {
+                            let temporary = PendingSyncOperation::Update {
+                                calendar_id: state.calendar_id,
+                                event_id: state.event_id,
+                                remote_href: state.remote_href.clone(),
+                                remote_uid: state.remote_uid.clone(),
+                                base_etag: state.etag.clone(),
+                            };
+                            (event_id, temporary)
+                        })
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        for (_, operation) in &recently_pushed {
+            repository
+                .upsert_pending_sync_operation(operation)
+                .map_err(|_| AccountSyncWorkerError::Repository)?;
+        }
+
+        let pulled = pull_calendar_snapshot(&client, &mut repository, calendar.id);
+        for (event_id, _) in &recently_pushed {
+            repository.remove_pending_sync_operation(*event_id);
+        }
+        let pulled = pulled.map_err(account_pull_error)?;
+        summary.pulled.added += pulled.added;
+        summary.pulled.updated += pulled.updated;
+        summary.pulled.deleted += pulled.deleted;
+        summary.pulled.skipped += pulled.skipped;
+    }
+
+    Ok(summary)
+}
+
+fn account_push_error(error: PushSyncError) -> AccountSyncWorkerError {
+    match error {
+        PushSyncError::Caldav(_) => AccountSyncWorkerError::Caldav,
+        PushSyncError::MissingCalendarSyncState => AccountSyncWorkerError::MissingCalendarSyncState,
+        PushSyncError::Repository(_) => AccountSyncWorkerError::Repository,
+    }
+}
+
+fn account_pull_error(error: PullSyncError) -> AccountSyncWorkerError {
+    match error {
+        PullSyncError::Caldav(_) => AccountSyncWorkerError::Caldav,
+        PullSyncError::MissingCalendarSyncState => AccountSyncWorkerError::MissingCalendarSyncState,
+        PullSyncError::Repository(_) => AccountSyncWorkerError::Repository,
+    }
+}
+
 /// Start an initial, full CalDAV baseline for all calendars provisioned for an
 /// account. The returned receiver is ready before any blocking database or
 /// network work begins.

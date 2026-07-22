@@ -1,8 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::model::{Calendar, Event, EventSchedule, validate_event};
+use calendar::model::{Calendar, Event, EventSchedule, ReminderSpec, validate_event};
 use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike,
 };
@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 type SaveFn = Box<dyn Fn(Event, bool) -> bool>;
 type DeleteFn = Box<dyn Fn(Uuid) -> bool>;
+
+const KEEP_EXISTING_REMINDERS_INDEX: u32 = 7;
 
 #[derive(Clone)]
 pub struct OriginalTimedEvent {
@@ -46,7 +48,7 @@ mod imp {
         #[template_child]
         pub repeat_row: TemplateChild<adw::ActionRow>,
         #[template_child]
-        pub reminders_row: TemplateChild<adw::ActionRow>,
+        pub reminders_row: TemplateChild<adw::ComboRow>,
         #[template_child]
         pub delete_event_row: TemplateChild<adw::ButtonRow>,
         #[template_child]
@@ -63,6 +65,8 @@ mod imp {
         pub end_date_row_state: RefCell<Option<crate::ui::date_chooser_row::DateChooserRow>>,
         pub start_date_time_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
         pub end_date_time_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
+        pub reminder_selection_user_changed: Cell<bool>,
+        pub reminder_selection_syncing: Cell<bool>,
         pub on_save: RefCell<Option<SaveFn>>,
         pub on_delete: RefCell<Option<DeleteFn>>,
     }
@@ -136,6 +140,16 @@ mod imp {
             self.save_button.connect_clicked(move |_| {
                 if let Some(editor) = weak.upgrade() {
                     editor.imp().save_clicked();
+                }
+            });
+
+            let weak = self.obj().downgrade();
+            self.reminders_row.connect_selected_notify(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    let imp = editor.imp();
+                    if !imp.reminder_selection_syncing.get() {
+                        imp.reminder_selection_user_changed.set(true);
+                    }
                 }
             });
 
@@ -228,7 +242,7 @@ impl EventEditor {
         imp.title_entry.set_text(title);
         imp.location_entry.set_text("");
         imp.description_view.buffer().set_text("");
-        imp.set_placeholder_state(false, 0);
+        imp.set_placeholder_state(false, &[]);
         *imp.original_timed_event.borrow_mut() = None;
         select_calendar(&imp.calendar_row, &imp.calendars.borrow(), calendar_id);
         imp.schedule_stack.set_visible_child_name("all-day");
@@ -259,7 +273,7 @@ impl EventEditor {
         imp.title_entry.set_text(&event.title);
         imp.location_entry.set_text(&event.location);
         imp.description_view.buffer().set_text(&event.description);
-        imp.set_placeholder_state(event.recurrence.is_some(), event.reminders.len());
+        imp.set_placeholder_state(event.recurrence.is_some(), &event.reminders);
         select_calendar(
             &imp.calendar_row,
             &imp.calendars.borrow(),
@@ -327,19 +341,46 @@ impl EventEditor {
 }
 
 impl imp::EventEditor {
-    fn set_placeholder_state(&self, has_recurrence: bool, reminder_count: usize) {
+    fn set_placeholder_state(&self, has_recurrence: bool, reminders: &[ReminderSpec]) {
         self.repeat_row.set_subtitle(if has_recurrence {
             "Existing recurrence"
         } else {
             "Does not repeat"
         });
 
-        let reminder_subtitle = match reminder_count {
-            0 => "No reminders".to_string(),
-            1 => "1 reminder".to_string(),
-            count => format!("{count} reminders"),
+        self.set_reminder_selection(reminders);
+    }
+
+    fn set_reminder_selection(&self, reminders: &[ReminderSpec]) {
+        let keep_existing = !reminders.is_empty()
+            && (reminders.len() != 1
+                || reminder_choice_index(reminders[0].seconds_before_start).is_none());
+        let mut labels = vec![
+            "No reminder",
+            "5 minutes before",
+            "10 minutes before",
+            "15 minutes before",
+            "30 minutes before",
+            "1 hour before",
+            "1 day before",
+        ];
+        if keep_existing {
+            labels.push("Keep existing reminders");
+        }
+        let selected = if keep_existing {
+            KEEP_EXISTING_REMINDERS_INDEX
+        } else {
+            reminders
+                .first()
+                .and_then(|reminder| reminder_choice_index(reminder.seconds_before_start))
+                .unwrap_or(0) as u32
         };
-        self.reminders_row.set_subtitle(&reminder_subtitle);
+        let model = gtk::StringList::new(&labels);
+        self.reminder_selection_syncing.set(true);
+        self.reminders_row.set_model(Some(&model));
+        self.reminders_row.set_selected(selected);
+        self.reminder_selection_syncing.set(false);
+        self.reminder_selection_user_changed.set(false);
     }
 
     fn schedule_changed(&self) {
@@ -582,21 +623,28 @@ impl imp::EventEditor {
         let buffer = self.description_view.buffer();
         let (start, end) = buffer.bounds();
         let description = buffer.text(&start, &end, false).to_string();
+        let title = self.title_entry.text().to_string();
+        let reminders = if self.reminder_selection_user_changed.get()
+            && self.reminders_row.selected() != KEEP_EXISTING_REMINDERS_INDEX
+        {
+            self.reminders_for_selection(&title)
+        } else {
+            base.as_ref()
+                .map(|event| event.reminders.clone())
+                .unwrap_or_default()
+        };
         let event = Event {
             id: base
                 .as_ref()
                 .map(|event| event.id)
                 .unwrap_or_else(Uuid::new_v4),
             calendar_id,
-            title: self.title_entry.text().to_string(),
+            title,
             location: self.location_entry.text().to_string(),
             description,
             schedule,
-            recurrence: base.as_ref().and_then(|event| event.recurrence),
-            reminders: base
-                .as_ref()
-                .map(|event| event.reminders.clone())
-                .unwrap_or_default(),
+            recurrence: base.as_ref().and_then(|event| event.recurrence.clone()),
+            reminders,
         };
         let Ok(event) = validate_event(event) else {
             self.show_error("Enter a title and a range where the end is after the start.");
@@ -610,6 +658,34 @@ impl imp::EventEditor {
             let editor = self.obj().clone();
             adw::prelude::AdwDialogExt::force_close(&editor);
         }
+    }
+
+    fn reminders_for_selection(&self, title: &str) -> Vec<ReminderSpec> {
+        let seconds_before_start = match self.reminders_row.selected() {
+            1 => 5 * 60,
+            2 => 10 * 60,
+            3 => 15 * 60,
+            4 => 30 * 60,
+            5 => 60 * 60,
+            6 => 24 * 60 * 60,
+            _ => return Vec::new(),
+        };
+        vec![ReminderSpec {
+            seconds_before_start,
+            description: format!("Reminder for {title}"),
+        }]
+    }
+}
+
+fn reminder_choice_index(seconds_before_start: i64) -> Option<usize> {
+    match seconds_before_start {
+        seconds if seconds == 5 * 60 => Some(1),
+        seconds if seconds == 10 * 60 => Some(2),
+        seconds if seconds == 15 * 60 => Some(3),
+        seconds if seconds == 30 * 60 => Some(4),
+        seconds if seconds == 60 * 60 => Some(5),
+        seconds if seconds == 24 * 60 * 60 => Some(6),
+        _ => None,
     }
 }
 

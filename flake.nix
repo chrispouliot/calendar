@@ -23,6 +23,49 @@
 
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in {
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.rustPlatform.buildRustPackage {
+            pname = "calendar";
+            version = "0.1.0";
+
+            src = pkgs.lib.cleanSource ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+
+            nativeBuildInputs = [
+              pkgs.blueprint-compiler
+              pkgs.glib
+              pkgs.glib.dev
+              pkgs.pkg-config
+              pkgs.wrapGAppsHook4
+            ];
+
+            buildInputs = [
+              pkgs.glib
+              pkgs.gsettings-desktop-schemas
+              pkgs.gtk4
+              pkgs.libadwaita
+            ];
+
+            postInstall = ''
+              install -Dm644 data/dev.chris.calendar.desktop \
+                $out/share/applications/dev.chris.calendar.desktop
+              install -Dm644 data/icons/hicolor/scalable/apps/dev.chris.calendar.svg \
+                $out/share/icons/hicolor/scalable/apps/dev.chris.calendar.svg
+            '';
+
+            meta = {
+              description = "A GNOME-style calendar application";
+              mainProgram = "calendar";
+              platforms = systems;
+            };
+          };
+        }
+      );
+
       devShells = forAllSystems (
         system:
         let

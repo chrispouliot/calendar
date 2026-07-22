@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Calendar
+Exec=calendar
+Icon=dev.chris.calendar
+Categories=Office;Calendar;
+StartupNotify=true
+StartupWMClass=dev.chris.calendar
+X-GNOME-UsesNotifications=true

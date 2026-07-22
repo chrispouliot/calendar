@@ -1,5 +1,6 @@
 pub mod caldav;
 pub mod credentials;
+pub mod reminders;
 pub mod sync;
 
 mod sqlite;

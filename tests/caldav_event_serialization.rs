@@ -22,7 +22,7 @@ use calendar::backend::caldav::{
     EventSerializationError, map_icalendar_event, serialize_icalendar_event,
 };
 use calendar::model::{Event, EventSchedule, RecurrenceSpec, ReminderSpec};
-use chrono::{DateTime, NaiveDate};
+use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
 const EVENT_ID: &str = "11111111-1111-1111-1111-111111111111";
@@ -115,16 +115,51 @@ fn phase11_serializes_safe_events_as_one_parseable_icalendar_resource() {
     ));
 
     let mut recurring = valid.clone();
-    recurring.recurrence = Some(RecurrenceSpec);
+    recurring.recurrence = Some(RecurrenceSpec::default());
     assert!(matches!(
         serialization_error(&recurring, "recurring"),
         EventSerializationError::UnsupportedRecurrence
     ));
 
     let mut reminded = valid;
-    reminded.reminders.push(ReminderSpec);
+    reminded.reminders.push(ReminderSpec {
+        seconds_before_start: 0,
+        description: String::new(),
+    });
     assert!(matches!(
         serialization_error(&reminded, "reminded"),
         EventSerializationError::UnsupportedReminders
     ));
+}
+
+#[test]
+fn serializes_offset_timed_events_without_a_tzid_as_utc() {
+    let (event_id, calendar_id) = ids();
+    let start = DateTime::parse_from_rfc3339("2026-01-15T09:30:00+02:00").unwrap();
+    let end = DateTime::parse_from_rfc3339("2026-01-15T10:45:00+02:00").unwrap();
+    let source = event(EventSchedule::Timed {
+        start,
+        end,
+        timezone: None,
+    });
+
+    let resource = serialize_icalendar_event(&source, "local-offset")
+        .expect("local offset times without a TZID must serialize as UTC");
+    assert!(resource.contains("DTSTART:20260115T073000Z"));
+    assert!(resource.contains("DTEND:20260115T084500Z"));
+
+    let mapped = map_icalendar_event(&resource, event_id, calendar_id)
+        .expect("serialized UTC times must map back to a timed event");
+    let EventSchedule::Timed {
+        start: mapped_start,
+        end: mapped_end,
+        timezone,
+    } = mapped.event.schedule
+    else {
+        panic!("serialized timed event must map to a timed schedule");
+    };
+    assert_eq!(timezone, None);
+    assert_eq!(mapped_start.with_timezone(&Utc), start.with_timezone(&Utc));
+    assert_eq!(mapped_end.with_timezone(&Utc), end.with_timezone(&Utc));
+    assert_eq!(mapped_end - mapped_start, end - start);
 }

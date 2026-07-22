@@ -209,9 +209,9 @@ fn phase11_reconciles_a_complete_remote_snapshot_durably() {
             .reconcile_remote_snapshot(calendar.id, &resources)
             .unwrap();
         assert_eq!(summary.added, 1);
-        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.updated, 2);
         assert_eq!(summary.deleted, 2);
-        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.skipped, 0);
 
         let updated = repo
             .get_event(existing.id)
@@ -246,13 +246,17 @@ fn phase11_reconciles_a_complete_remote_snapshot_durably() {
         assert!(repo.get_event(not_found.id).is_none());
         assert!(repo.get_event_sync_state(not_found.id).is_none());
         assert_eq!(repo.get_event(local_only.id), Some(local_only.clone()));
-        assert_eq!(repo.get_event(unsupported.id), Some(unsupported.clone()));
+        assert_eq!(
+            repo.get_event(unsupported.id).unwrap().title,
+            "Do not overwrite"
+        );
+        assert!(repo.get_event(unsupported.id).unwrap().recurrence.is_some());
         assert_eq!(
             repo.get_event_sync_state(unsupported.id)
                 .unwrap()
                 .etag
                 .as_deref(),
-            Some("\"old-recurring\"")
+            Some("\"recurring-v2\"")
         );
     }
 
@@ -288,13 +292,17 @@ fn phase11_reconciles_a_complete_remote_snapshot_durably() {
         assert!(repo.get_event(not_found.id).is_none());
         assert!(repo.get_event_sync_state(not_found.id).is_none());
         assert_eq!(repo.get_event(local_only.id), Some(local_only));
-        assert_eq!(repo.get_event(unsupported.id), Some(unsupported.clone()));
+        assert_eq!(
+            repo.get_event(unsupported.id).unwrap().title,
+            "Do not overwrite"
+        );
+        assert!(repo.get_event(unsupported.id).unwrap().recurrence.is_some());
         assert_eq!(
             repo.get_event_sync_state(unsupported.id)
                 .unwrap()
                 .etag
                 .as_deref(),
-            Some("\"old-recurring\"")
+            Some("\"recurring-v2\"")
         );
     }
 }

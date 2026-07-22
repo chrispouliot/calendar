@@ -93,11 +93,24 @@ pub enum EventSchedule {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecurrenceSpec;
+/// The recurrence properties belonging to an event master.
+///
+/// The lines retain their iCalendar parameters (for example `TZID` and
+/// `VALUE=DATE`) so that persistence does not reduce a valid remote rule to a
+/// boolean flag.  They are validated and evaluated through `rrule` at the
+/// CalDAV and view-projection boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecurrenceSpec {
+    pub rrule: Vec<String>,
+    pub rdate: Vec<String>,
+    pub exdate: Vec<String>,
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReminderSpec;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderSpec {
+    pub seconds_before_start: i64,
+    pub description: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmptyQuickAddTitle;

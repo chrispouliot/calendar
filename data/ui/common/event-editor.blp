@@ -111,16 +111,8 @@ template $EventEditor: Adw.Dialog {
             }
           }
 
-          Adw.ActionRow reminders_row {
+          Adw.ComboRow reminders_row {
             title: _("Reminders");
-            subtitle: _("No reminders");
-            activatable: false;
-
-            [suffix]
-            Label {
-              label: _("Additional options unavailable");
-              styles ["dim-label"]
-            }
           }
         }
 

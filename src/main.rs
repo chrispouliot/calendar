@@ -3,11 +3,13 @@ mod window;
 
 use adw::prelude::*;
 use adw::{Application, gio};
-use gtk::gdk;
+use gtk::{gdk, glib};
 
 const APP_ID: &str = "dev.chris.calendar";
 
 fn main() {
+    glib::set_application_name("Calendar");
+
     // Register embedded GResource before any template loading.
     gio::resources_register_include!("calendar.gresource").expect("Failed to register GResource");
 
@@ -70,4 +72,17 @@ fn add_application_actions(app: &Application) {
         }
     });
     app.add_action(&about);
+
+    let activate = gio::SimpleAction::new("activate", None);
+    let app_weak = app.downgrade();
+    activate.connect_activate(move |_, _| {
+        if let Some(app) = app_weak.upgrade() {
+            if let Some(window) = app.active_window() {
+                window.present();
+            } else {
+                app.activate();
+            }
+        }
+    });
+    app.add_action(&activate);
 }

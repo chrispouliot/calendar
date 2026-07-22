@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::model::{
     Account, Calendar, CalendarSource, CalendarSyncState, DateTimeRange, Event, EventSchedule,
-    EventSyncState, PendingSyncOperation, RecurrenceSpec,
+    EventSyncState, PendingSyncOperation, RecurrenceSpec, ReminderSpec,
 };
 
 use super::{
@@ -79,16 +79,19 @@ impl SqliteRepository {
                     start_unix INTEGER NOT NULL DEFAULT 0,
                     end_unix INTEGER NOT NULL DEFAULT 0,
                     recurrence_enabled INTEGER NOT NULL DEFAULT 0,
+                    recurrence_data TEXT,
                     FOREIGN KEY (calendar_id) REFERENCES calendars(id)
                         ON DELETE CASCADE
                 );
 
-                CREATE TABLE IF NOT EXISTS reminders (
-                    id BLOB PRIMARY KEY,
-                    event_id BLOB NOT NULL,
-                    FOREIGN KEY (event_id) REFERENCES events(id)
-                        ON DELETE CASCADE
-                );
+                 CREATE TABLE IF NOT EXISTS reminders (
+                     id BLOB PRIMARY KEY,
+                     event_id BLOB NOT NULL,
+                     seconds_before_start INTEGER NOT NULL,
+                     description TEXT NOT NULL,
+                     FOREIGN KEY (event_id) REFERENCES events(id)
+                         ON DELETE CASCADE
+                 );
 
                  CREATE TABLE IF NOT EXISTS sync_metadata (
                      id BLOB PRIMARY KEY,
@@ -160,6 +163,28 @@ impl SqliteRepository {
             "ALTER TABLE calendars ADD COLUMN account_id BLOB REFERENCES accounts(id) ON DELETE CASCADE",
             [],
         );
+        // The original Phase 7 reminders table was a never-populated
+        // placeholder. Add the reminder payload columns without rebuilding it.
+        let mut migrated_reminders = false;
+        for (name, definition) in [
+            ("seconds_before_start", "INTEGER NOT NULL DEFAULT 0"),
+            ("description", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !self.reminders_has_column(name)? {
+                self.conn
+                    .execute(
+                        &format!("ALTER TABLE reminders ADD COLUMN {name} {definition}"),
+                        [],
+                    )
+                    .map_err(|_| RepositoryError)?;
+                migrated_reminders = true;
+            }
+        }
+        if migrated_reminders {
+            self.conn
+                .execute("UPDATE sync_metadata SET sync_token = NULL", [])
+                .map_err(|_| RepositoryError)?;
+        }
 
         // The original Phase 7 placeholder had only id and calendar_id. Add
         // the identity columns in place so existing placeholder rows remain.
@@ -173,6 +198,11 @@ impl SqliteRepository {
                     .map_err(|_| RepositoryError)?;
             }
         }
+        // Preserve the legacy enabled bit when old databases have no rule
+        // text; new rows retain the complete recurrence properties.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE events ADD COLUMN recurrence_data TEXT", []);
         // Legacy placeholder rows have a NULL remote_url. They are retained,
         // while actual sync state rows are unique by calendar.
         self.conn
@@ -189,6 +219,22 @@ impl SqliteRepository {
         let mut stmt = self
             .conn
             .prepare("PRAGMA table_info(sync_metadata)")
+            .map_err(|_| RepositoryError)?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|_| RepositoryError)?;
+        for column in columns {
+            if column.map_err(|_| RepositoryError)? == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn reminders_has_column(&self, name: &str) -> Result<bool, RepositoryError> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(reminders)")
             .map_err(|_| RepositoryError)?;
         let columns = stmt
             .query_map([], |row| row.get::<_, String>(1))
@@ -690,6 +736,56 @@ impl SqliteRepository {
         tx.commit().map_err(|_| RepositoryError)
     }
 
+    /// Recover upload intents for CalDAV events persisted before sync intent
+    /// creation was available. Discovery and insertion share one transaction so
+    /// a worker cannot observe a partially repaired calendar.
+    pub(crate) fn queue_orphan_event_creates(
+        &mut self,
+        calendar_id: Uuid,
+        account_id: Uuid,
+    ) -> Result<(), RepositoryError> {
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let event_ids = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT e.id
+                     FROM events AS e
+                     JOIN calendars AS c ON c.id = e.calendar_id
+                     WHERE e.calendar_id = ?1
+                       AND c.source = 'CalDav'
+                       AND c.account_id = ?2
+                       AND NOT EXISTS (
+                           SELECT 1 FROM event_sync_metadata AS m
+                           WHERE m.event_id = e.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM pending_sync_operations AS p
+                           WHERE p.event_id = e.id
+                       )
+                     ORDER BY e.id",
+                )
+                .map_err(|_| RepositoryError)?;
+            statement
+                .query_map(params![calendar_id, account_id], |row| row.get(0))
+                .map_err(|_| RepositoryError)?
+                .collect::<Result<Vec<Uuid>, _>>()
+                .map_err(|_| RepositoryError)?
+        };
+
+        for event_id in event_ids {
+            upsert_pending_sync_operation_in_transaction(
+                &tx,
+                &PendingSyncOperation::Create {
+                    calendar_id,
+                    event_id,
+                    remote_uid: event_id.to_string(),
+                },
+            )?;
+        }
+
+        tx.commit().map_err(|_| RepositoryError)
+    }
+
     pub fn update_event_with_sync(&mut self, event: &Event) -> Result<(), RepositoryError> {
         let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
         let existing_calendar_id: Option<Uuid> = tx
@@ -749,7 +845,7 @@ impl SqliteRepository {
                 "SELECT id, calendar_id, title, location, description, \
                  schedule_type, start_date, end_date_exclusive, \
                  start_datetime, end_datetime, timezone, \
-                 start_unix, recurrence_enabled FROM events WHERE id = ?1",
+                 start_unix, recurrence_enabled, recurrence_data FROM events WHERE id = ?1",
                 params![id],
                 event_from_row,
             )
@@ -1070,8 +1166,13 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
 
     let recurrence: Option<RecurrenceSpec> = {
         let enabled: i32 = row.get(12)?;
-        if enabled != 0 {
-            Some(RecurrenceSpec)
+        let data: Option<String> = row.get(13)?;
+        if let Some(data) = data {
+            Some(recurrence_from_storage(&data))
+        } else if enabled != 0 {
+            // The legacy schema did not retain the rule text. Preserve its
+            // enabled state rather than silently changing the event.
+            Some(RecurrenceSpec::default())
         } else {
             None
         }
@@ -1250,6 +1351,7 @@ impl EventRepository for SqliteRepository {
         }
 
         let recurrence_enabled = if event.recurrence.is_some() { 1 } else { 0 };
+        let recurrence_data = recurrence_to_storage(event.recurrence.as_ref());
         let affected = match &event.schedule {
             EventSchedule::AllDay {
                 start_date,
@@ -1268,8 +1370,9 @@ impl EventRepository for SqliteRepository {
                          timezone = NULL,
                          start_unix = 0,
                          end_unix = 0,
-                         recurrence_enabled = ?7
-                     WHERE id = ?8",
+                          recurrence_enabled = ?7,
+                          recurrence_data = ?8
+                      WHERE id = ?9",
                 params![
                     event.calendar_id,
                     event.title,
@@ -1278,6 +1381,7 @@ impl EventRepository for SqliteRepository {
                     start_date,
                     end_date_exclusive,
                     recurrence_enabled,
+                    recurrence_data,
                     event.id,
                 ],
             ),
@@ -1299,8 +1403,9 @@ impl EventRepository for SqliteRepository {
                          timezone = ?7,
                          start_unix = ?8,
                          end_unix = ?9,
-                         recurrence_enabled = ?10
-                     WHERE id = ?11",
+                          recurrence_enabled = ?10,
+                          recurrence_data = ?11
+                      WHERE id = ?12",
                 params![
                     event.calendar_id,
                     event.title,
@@ -1312,6 +1417,7 @@ impl EventRepository for SqliteRepository {
                     start.timestamp(),
                     end.timestamp(),
                     recurrence_enabled,
+                    recurrence_data,
                     event.id,
                 ],
             ),
@@ -1321,22 +1427,26 @@ impl EventRepository for SqliteRepository {
             return Err(RepositoryError);
         }
 
+        replace_reminders(&tx, event)?;
         tx.commit().map_err(|_| RepositoryError)?;
         Ok(())
     }
 
     fn get_event(&self, id: Uuid) -> Option<Event> {
-        self.conn
+        let mut event = self
+            .conn
             .query_row(
                 "SELECT id, calendar_id, title, location, description, \
                  schedule_type, start_date, end_date_exclusive, \
                  start_datetime, end_datetime, timezone, \
-                 start_unix, recurrence_enabled \
+                  start_unix, recurrence_enabled, recurrence_data \
                  FROM events WHERE id = ?1",
                 params![id],
                 event_from_row,
             )
-            .ok()
+            .ok()?;
+        event.reminders = reminders_for_event(&self.conn, id).ok()?;
+        Some(event)
     }
 
     fn delete_event(&mut self, id: Uuid) -> bool {
@@ -1376,16 +1486,21 @@ impl EventRepository for SqliteRepository {
             "SELECT id, calendar_id, title, location, description, \
              schedule_type, start_date, end_date_exclusive, \
              start_datetime, end_datetime, timezone, \
-             start_unix, recurrence_enabled \
+              start_unix, recurrence_enabled, recurrence_data \
              FROM events WHERE calendar_id = ?1",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map(params![calendar_id], event_from_row)
+        let mut events: Vec<Event> = stmt
+            .query_map(params![calendar_id], event_from_row)
             .into_iter()
             .flat_map(|rows| rows.filter_map(|r| r.ok()))
-            .collect()
+            .collect();
+        for event in &mut events {
+            event.reminders = reminders_for_event(&self.conn, event.id).unwrap_or_default();
+        }
+        events
     }
 
     fn timed_events_in_range(&self, range: &DateTimeRange) -> Vec<Event> {
@@ -1398,7 +1513,7 @@ impl EventRepository for SqliteRepository {
             "SELECT id, calendar_id, title, location, description, \
              schedule_type, start_date, end_date_exclusive, \
              start_datetime, end_datetime, timezone, \
-             start_unix, recurrence_enabled \
+             start_unix, recurrence_enabled, recurrence_data \
              FROM events \
              WHERE schedule_type = 'timed' \
                AND start_unix < ?2 \
@@ -1408,10 +1523,15 @@ impl EventRepository for SqliteRepository {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map(params![range_start_unix, range_end_unix], event_from_row)
+        let mut events: Vec<Event> = stmt
+            .query_map(params![range_start_unix, range_end_unix], event_from_row)
             .into_iter()
             .flat_map(|rows| rows.filter_map(|r| r.ok()))
-            .collect()
+            .collect();
+        for event in &mut events {
+            event.reminders = reminders_for_event(&self.conn, event.id).unwrap_or_default();
+        }
+        events
     }
 }
 
@@ -1744,6 +1864,37 @@ impl PendingSyncOperationRepository for SqliteRepository {
 // Internal helper – single-row insert of an event
 // ---------------------------------------------------------------------------
 
+fn recurrence_to_storage(recurrence: Option<&RecurrenceSpec>) -> Option<String> {
+    recurrence.map(|recurrence| {
+        recurrence
+            .rrule
+            .iter()
+            .chain(&recurrence.rdate)
+            .chain(&recurrence.exdate)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+fn recurrence_from_storage(data: &str) -> RecurrenceSpec {
+    let mut recurrence = RecurrenceSpec::default();
+    for line in data.lines().filter(|line| !line.trim().is_empty()) {
+        match line
+            .split_once(':')
+            .and_then(|(key, _)| key.split(';').next())
+            .map(str::to_ascii_uppercase)
+            .as_deref()
+        {
+            Some("RRULE") => recurrence.rrule.push(line.to_owned()),
+            Some("RDATE") => recurrence.rdate.push(line.to_owned()),
+            Some("EXDATE") => recurrence.exdate.push(line.to_owned()),
+            _ => {}
+        }
+    }
+    recurrence
+}
+
 fn calendar_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     id: Uuid,
@@ -1910,6 +2061,7 @@ fn update_event_in_transaction(
     }
 
     let recurrence_enabled = if event.recurrence.is_some() { 1 } else { 0 };
+    let recurrence_data = recurrence_to_storage(event.recurrence.as_ref());
     let affected = match &event.schedule {
         EventSchedule::AllDay {
             start_date,
@@ -1928,8 +2080,9 @@ fn update_event_in_transaction(
                      timezone = NULL,
                      start_unix = 0,
                      end_unix = 0,
-                     recurrence_enabled = ?7
-                 WHERE id = ?8",
+                     recurrence_enabled = ?7,
+                     recurrence_data = ?8
+                 WHERE id = ?9",
             params![
                 event.calendar_id,
                 event.title,
@@ -1938,6 +2091,7 @@ fn update_event_in_transaction(
                 start_date,
                 end_date_exclusive,
                 recurrence_enabled,
+                recurrence_data,
                 event.id,
             ],
         ),
@@ -1959,8 +2113,9 @@ fn update_event_in_transaction(
                      timezone = ?7,
                      start_unix = ?8,
                      end_unix = ?9,
-                     recurrence_enabled = ?10
-                 WHERE id = ?11",
+                     recurrence_enabled = ?10,
+                     recurrence_data = ?11
+                 WHERE id = ?12",
             params![
                 event.calendar_id,
                 event.title,
@@ -1972,6 +2127,7 @@ fn update_event_in_transaction(
                 start.timestamp(),
                 end.timestamp(),
                 recurrence_enabled,
+                recurrence_data,
                 event.id,
             ],
         ),
@@ -1980,11 +2136,13 @@ fn update_event_in_transaction(
     if affected == 0 {
         return Err(RepositoryError);
     }
+    replace_reminders(tx, event)?;
     Ok(())
 }
 
 fn insert_event(conn: &Connection, event: &Event) -> Result<(), RepositoryError> {
     let recurrence_enabled = if event.recurrence.is_some() { 1 } else { 0 };
+    let recurrence_data = recurrence_to_storage(event.recurrence.as_ref());
 
     match &event.schedule {
         EventSchedule::AllDay {
@@ -1995,9 +2153,9 @@ fn insert_event(conn: &Connection, event: &Event) -> Result<(), RepositoryError>
                 "INSERT INTO events (id, calendar_id, title, location, description, \
                  schedule_type, start_date, end_date_exclusive, \
                  start_datetime, end_datetime, timezone, \
-                 start_unix, end_unix, recurrence_enabled) \
+                  start_unix, end_unix, recurrence_enabled, recurrence_data) \
                  VALUES (?1, ?2, ?3, ?4, ?5, 'all_day', ?6, ?7, \
-                         NULL, NULL, NULL, 0, 0, ?8)",
+                         NULL, NULL, NULL, 0, 0, ?8, ?9)",
                 params![
                     event.id,
                     event.calendar_id,
@@ -2007,6 +2165,7 @@ fn insert_event(conn: &Connection, event: &Event) -> Result<(), RepositoryError>
                     start_date,
                     end_date_exclusive,
                     recurrence_enabled,
+                    recurrence_data,
                 ],
             )
             .map_err(|_| RepositoryError)?;
@@ -2020,9 +2179,9 @@ fn insert_event(conn: &Connection, event: &Event) -> Result<(), RepositoryError>
                 "INSERT INTO events (id, calendar_id, title, location, description, \
                  schedule_type, start_date, end_date_exclusive, \
                  start_datetime, end_datetime, timezone, \
-                 start_unix, end_unix, recurrence_enabled) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'timed', NULL, NULL, \
-                         ?6, ?7, ?8, ?9, ?10, ?11)",
+                  start_unix, end_unix, recurrence_enabled, recurrence_data) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, 'timed', NULL, NULL, \
+                          ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     event.id,
                     event.calendar_id,
@@ -2035,12 +2194,52 @@ fn insert_event(conn: &Connection, event: &Event) -> Result<(), RepositoryError>
                     start.timestamp(),
                     end.timestamp(),
                     recurrence_enabled,
+                    recurrence_data,
                 ],
             )
             .map_err(|_| RepositoryError)?;
         }
     }
+    replace_reminders(conn, event)?;
     Ok(())
+}
+
+fn replace_reminders(conn: &Connection, event: &Event) -> Result<(), RepositoryError> {
+    conn.execute(
+        "DELETE FROM reminders WHERE event_id = ?1",
+        params![event.id],
+    )
+    .map_err(|_| RepositoryError)?;
+    for reminder in &event.reminders {
+        conn.execute(
+            "INSERT INTO reminders
+                 (id, event_id, seconds_before_start, description)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                Uuid::new_v4(),
+                event.id,
+                reminder.seconds_before_start,
+                reminder.description,
+            ],
+        )
+        .map_err(|_| RepositoryError)?;
+    }
+    Ok(())
+}
+
+fn reminders_for_event(conn: &Connection, event_id: Uuid) -> rusqlite::Result<Vec<ReminderSpec>> {
+    let mut statement = conn.prepare(
+        "SELECT seconds_before_start, description
+         FROM reminders WHERE event_id = ?1 ORDER BY rowid",
+    )?;
+    statement
+        .query_map(params![event_id], |row| {
+            Ok(ReminderSpec {
+                seconds_before_start: row.get(0)?,
+                description: row.get(1)?,
+            })
+        })?
+        .collect()
 }
 
 fn replace_remote_event(
