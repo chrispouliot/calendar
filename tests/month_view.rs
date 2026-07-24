@@ -59,7 +59,7 @@
 use calendar::calendar_grid::month_grid;
 use calendar::model::{Calendar, CalendarSource, Event, EventSchedule};
 use calendar::month_view::{DayProjection, project_month_in_timezone};
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, TimeZone};
 use uuid::Uuid;
 
 const TWO_HOURS_SECS: i32 = 2 * 3600;
@@ -488,4 +488,160 @@ fn projects_timed_events_in_the_viewer_timezone() {
             .any(|chip| chip.title == "Evening appointment"),
         "the event remains entirely within the viewer's July 21 evening"
     );
+}
+
+#[test]
+fn timed_chip_retains_its_viewer_local_start_time() {
+    let calendar_id = Uuid::parse_str("66666666-6666-6666-6666-666666666666").unwrap();
+    let calendars = vec![Calendar {
+        id: calendar_id,
+        name: "Personal".to_string(),
+        color: "#3366cc".to_string(),
+        visible: true,
+        read_only: false,
+        source: CalendarSource::Local,
+    }];
+    let event = Event {
+        id: Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap(),
+        calendar_id,
+        title: "Evening appointment".to_string(),
+        location: String::new(),
+        description: String::new(),
+        schedule: EventSchedule::Timed {
+            start: at(2026, 7, 22, 3, 0),
+            end: at(2026, 7, 22, 4, 0),
+            timezone: None,
+        },
+        recurrence: None,
+        reminders: Vec::new(),
+    };
+    let viewer_timezone = FixedOffset::west_opt(7 * 3600).unwrap();
+
+    let projection = project_month_in_timezone(2026, 7, &calendars, &[event], &viewer_timezone);
+    let july_21 = projection
+        .iter()
+        .find(|day| day.date == NaiveDate::from_ymd_opt(2026, 7, 21).unwrap())
+        .unwrap();
+    let chip = july_21
+        .timed
+        .iter()
+        .find(|chip| chip.title == "Evening appointment")
+        .unwrap();
+
+    assert_eq!(
+        chip.start_time,
+        NaiveTime::from_hms_opt(18, 0, 0),
+        "2026-07-22 03:00 +02:00 starts at 18:00 in the viewer's -07:00 timezone"
+    );
+}
+
+#[test]
+fn event_chips_are_past_only_after_their_viewer_local_end() {
+    let calendar_id = Uuid::parse_str("77777777-7777-7777-7777-777777777777").unwrap();
+    let calendars = vec![Calendar {
+        id: calendar_id,
+        name: "Personal".to_string(),
+        color: "#3366cc".to_string(),
+        visible: true,
+        read_only: false,
+        source: CalendarSource::Local,
+    }];
+    let event = |id: &str, title: &str, schedule| Event {
+        id: Uuid::parse_str(id).unwrap(),
+        calendar_id,
+        title: title.to_string(),
+        location: String::new(),
+        description: String::new(),
+        schedule,
+        recurrence: None,
+        reminders: Vec::new(),
+    };
+    let events = vec![
+        event(
+            "70000000-0000-0000-0000-000000000001",
+            "Prior-day timed",
+            EventSchedule::Timed {
+                start: at(2026, 5, 13, 14, 0),
+                end: at(2026, 5, 13, 15, 0),
+                timezone: None,
+            },
+        ),
+        event(
+            "70000000-0000-0000-0000-000000000002",
+            "Ended earlier today",
+            EventSchedule::Timed {
+                start: at(2026, 5, 14, 9, 0),
+                end: at(2026, 5, 14, 10, 0),
+                timezone: None,
+            },
+        ),
+        event(
+            "70000000-0000-0000-0000-000000000003",
+            "Completed all-day",
+            EventSchedule::AllDay {
+                start_date: NaiveDate::from_ymd_opt(2026, 5, 13).unwrap(),
+                end_date_exclusive: NaiveDate::from_ymd_opt(2026, 5, 14).unwrap(),
+            },
+        ),
+        event(
+            "70000000-0000-0000-0000-000000000004",
+            "Ongoing",
+            EventSchedule::Timed {
+                start: at(2026, 5, 14, 11, 0),
+                end: at(2026, 5, 14, 13, 0),
+                timezone: None,
+            },
+        ),
+        event(
+            "70000000-0000-0000-0000-000000000005",
+            "Future",
+            EventSchedule::Timed {
+                start: at(2026, 5, 14, 14, 0),
+                end: at(2026, 5, 14, 15, 0),
+                timezone: None,
+            },
+        ),
+        event(
+            "70000000-0000-0000-0000-000000000006",
+            "Current all-day",
+            EventSchedule::AllDay {
+                start_date: NaiveDate::from_ymd_opt(2026, 5, 14).unwrap(),
+                end_date_exclusive: NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(),
+            },
+        ),
+        event(
+            "70000000-0000-0000-0000-000000000007",
+            "Ends now",
+            EventSchedule::Timed {
+                start: at(2026, 5, 14, 11, 0),
+                end: at(2026, 5, 14, 12, 0),
+                timezone: None,
+            },
+        ),
+    ];
+    let viewer_timezone = FixedOffset::east_opt(TWO_HOURS_SECS).unwrap();
+    let projection = project_month_in_timezone(2026, 5, &calendars, &events, &viewer_timezone);
+    let now = at(2026, 5, 14, 12, 0);
+
+    for (title, expected_past) in [
+        ("Prior-day timed", true),
+        ("Ended earlier today", true),
+        ("Completed all-day", true),
+        ("Ongoing", false),
+        ("Future", false),
+        ("Current all-day", false),
+        ("Ends now", false),
+    ] {
+        let chip = projection
+            .iter()
+            .flat_map(|day| day.all_day.iter().chain(&day.timed))
+            .find(|chip| chip.title == title)
+            .unwrap_or_else(|| panic!("projection must contain {title}"));
+
+        assert_eq!(
+            chip.is_past_at(now),
+            expected_past,
+            "{title} should be past exactly when its viewer-local end is before now"
+        );
+    }
 }

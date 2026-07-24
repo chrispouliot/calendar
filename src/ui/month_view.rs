@@ -1,12 +1,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::time::Duration;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event};
 use calendar::month_view::project_month;
+use calendar::viewer_time::now_local_fixed;
 use calendar::weeks_buffer::{TOTAL_ROWS, VISIBLE_START, WeeksBuffer};
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, Timelike};
 use gtk::{gdk, glib, graphene};
 use uuid::Uuid;
 
@@ -75,6 +77,9 @@ mod imp {
         /// True after the first scroll setup is complete.
         pub initialized: Cell<bool>,
 
+        /// Minute-aligned refresh source while the view is mapped.
+        pub clock_source: RefCell<Option<glib::SourceId>>,
+
         /// Callback fired when dominant month changes (for title update).
         pub on_month_changed: RefCell<Option<MonthChangedFn>>,
 
@@ -106,6 +111,7 @@ mod imp {
                 row_height: Cell::new(80.0),
                 recycling_guard: Cell::new(false),
                 initialized: Cell::new(false),
+                clock_source: RefCell::new(None),
                 on_month_changed: RefCell::new(None),
                 on_activate: RefCell::new(None),
                 on_event_activate: RefCell::new(None),
@@ -185,6 +191,7 @@ mod imp {
                     // Vertical chip container (label + chips).
                     let chip_box = gtk::Box::builder()
                         .orientation(gtk::Orientation::Vertical)
+                        .spacing(2)
                         .hexpand(true)
                         .vexpand(true)
                         .halign(gtk::Align::Fill)
@@ -201,6 +208,7 @@ mod imp {
 
                     let cell_box = gtk::Box::builder()
                         .orientation(gtk::Orientation::Vertical)
+                        .spacing(4)
                         .hexpand(true)
                         .vexpand(true)
                         .halign(gtk::Align::Fill)
@@ -224,10 +232,9 @@ mod imp {
             *self.chip_boxes.borrow_mut() = chip_boxes;
 
             // ── Initialise date state from the local clock ──
-            let now = glib::DateTime::now_local().unwrap();
+            let now = now_local_fixed();
             let today =
-                NaiveDate::from_ymd_opt(now.year(), now.month() as u32, now.day_of_month() as u32)
-                    .expect("valid today");
+                NaiveDate::from_ymd_opt(now.year(), now.month(), now.day()).expect("valid today");
             self.today_date.set(today);
             self.active_date.set(today);
 
@@ -295,9 +302,23 @@ mod imp {
                 cb(y, m);
             }
         }
+
+        fn dispose(&self) {
+            self.obj().stop_clock();
+        }
     }
 
-    impl WidgetImpl for MonthView {}
+    impl WidgetImpl for MonthView {
+        fn map(&self) {
+            self.parent_map();
+            self.obj().start_clock();
+        }
+
+        fn unmap(&self) {
+            self.obj().stop_clock();
+            self.parent_unmap();
+        }
+    }
     impl BinImpl for MonthView {}
 }
 
@@ -417,6 +438,53 @@ impl MonthView {
         *imp.cached_events.borrow_mut() = events.to_vec();
         self.repopulate_rows();
     }
+
+    fn start_clock(&self) {
+        if self.imp().clock_source.borrow().is_some() {
+            return;
+        }
+        self.refresh_clock();
+        self.schedule_clock_tick();
+    }
+
+    fn stop_clock(&self) {
+        if let Some(source) = self.imp().clock_source.borrow_mut().take() {
+            source.remove();
+        }
+    }
+
+    fn schedule_clock_tick(&self) {
+        if !self.is_mapped() {
+            return;
+        }
+        let now = now_local_fixed();
+        let elapsed = now.second() as u64 * 1_000_000 + now.nanosecond() as u64 / 1_000;
+        let delay = Duration::from_micros(60_000_000_u64.saturating_sub(elapsed).max(1_000));
+        let obj_weak = self.downgrade();
+        let source = glib::timeout_add_local_once(delay, move || {
+            if let Some(obj) = obj_weak.upgrade() {
+                obj.clock_tick();
+            }
+        });
+        *self.imp().clock_source.borrow_mut() = Some(source);
+    }
+
+    fn clock_tick(&self) {
+        self.imp().clock_source.borrow_mut().take();
+        if !self.is_mapped() {
+            return;
+        }
+        self.refresh_clock();
+        self.schedule_clock_tick();
+    }
+
+    fn refresh_clock(&self) {
+        let now = now_local_fixed();
+        if let Some(today) = NaiveDate::from_ymd_opt(now.year(), now.month(), now.day()) {
+            self.imp().today_date.set(today);
+        }
+        self.repopulate_rows();
+    }
 }
 
 // ── Chip widget ──
@@ -424,27 +492,22 @@ impl MonthView {
 fn create_chip_widget(
     chip: &calendar::month_view::EventChip,
     month_view_weak: &glib::WeakRef<MonthView>,
+    now: chrono::DateTime<chrono::FixedOffset>,
 ) -> gtk::Widget {
     let hbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(3)
+        .spacing(4)
         .margin_start(2)
-        .halign(gtk::Align::Start)
+        .margin_end(2)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
         .css_classes(["monthview-chip"])
         .build();
     hbox.set_cursor_from_name(Some("pointer"));
-
-    let dot = gtk::Label::builder()
-        .label("\u{25CF}")
-        .css_classes(["monthview-chip-dot"])
-        .use_markup(true)
-        .build();
-    let sanitized_color = chip.color.replace('#', "");
-    dot.set_markup(&format!(
-        "<span foreground=\"#{}\">\u{25CF}</span>",
-        sanitized_color
-    ));
-    hbox.append(&dot);
+    if chip.is_past_at(now) {
+        hbox.add_css_class("past");
+    }
+    apply_chip_color(&hbox, &chip.color);
 
     let title = gtk::Label::builder()
         .label(&chip.title)
@@ -452,8 +515,20 @@ fn create_chip_widget(
         .halign(gtk::Align::Start)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(12)
+        .hexpand(true)
         .build();
     hbox.append(&title);
+
+    if !chip.is_all_day
+        && let Some(start_time) = chip.start_time
+    {
+        let time = gtk::Label::builder()
+            .label(start_time.format("%R").to_string())
+            .css_classes(["monthview-chip-time"])
+            .halign(gtk::Align::End)
+            .build();
+        hbox.append(&time);
+    }
 
     // Chip click → fire event-activation callback.  We capture the event_id
     // and a weak MonthView reference so the closure can access the callback
@@ -479,6 +554,37 @@ fn create_chip_widget(
     hbox.add_controller(gesture);
 
     hbox.upcast()
+}
+
+fn apply_chip_color(chip: &gtk::Box, color: &str) {
+    let color = sanitize_color(color);
+    let css = format!(
+        ".monthview-chip {{\
+            border-color: color-mix(in srgb, #{color} 68%, var(--window-bg-color));\
+            border-left-color: #{color};\
+            background-color: color-mix(in srgb, #{color} 18%, var(--window-bg-color));\
+        }}\
+        .monthview-chip:hover {{\
+            border-color: color-mix(in srgb, #{color} 68%, var(--window-bg-color));\
+            border-left-color: #{color};\
+            background-color: color-mix(in srgb, #{color} 32%, var(--window-bg-color));\
+        }}"
+    );
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&css);
+    // Keep the provider scoped to this chip rather than accumulating it on the display.
+    #[allow(deprecated)]
+    chip.style_context()
+        .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
+
+fn sanitize_color(color: &str) -> String {
+    let value = color.trim().strip_prefix('#').unwrap_or(color.trim());
+    if value.len() == 6 && value.chars().all(|character| character.is_ascii_hexdigit()) {
+        value.to_ascii_lowercase()
+    } else {
+        "808080".to_string()
+    }
 }
 
 // ── A helper to hold a cloned DayProjection ──
@@ -688,6 +794,7 @@ impl MonthView {
             all_projections.iter().map(|d| (d.date, d)).collect();
         let (dom_y, dom_m) = self.ref_year_month();
         let today = imp.today_date.get();
+        let now = now_local_fixed();
         drop(buf);
 
         for chip_box in imp.chip_boxes.borrow().iter() {
@@ -743,7 +850,7 @@ impl MonthView {
                             chip_box.append(&overflow_label);
                             break;
                         }
-                        let chip_widget = create_chip_widget(chip, &month_view_weak);
+                        let chip_widget = create_chip_widget(chip, &month_view_weak, now);
                         chip_box.append(&chip_widget);
                     }
                 }

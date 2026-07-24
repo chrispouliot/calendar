@@ -17,9 +17,9 @@ datechooser .weekday {
 datechooser button.flat.circular {
   font-size: 10pt;
   font-weight: normal;
-  min-height: 26px;
-  min-width: 26px;
-  margin: 2px;
+  min-height: 20px;
+  min-width: 20px;
+  margin: 1px;
   padding: 3px;
   transition: none;
 }
@@ -57,6 +57,25 @@ calendar-view {
 
 calendar-view .monthview-chip {
   font-size: 0.9rem;
+  min-height: 18px;
+  padding: 0 4px;
+  border: 1px solid alpha(currentColor, 0.12);
+  border-left-width: 3px;
+  border-radius: 5px;
+  background-color: alpha(currentColor, 0.08);
+}
+
+calendar-view .monthview-chip.past {
+  opacity: 0.55;
+}
+
+calendar-view .monthview-chip-title {
+  min-width: 0;
+}
+
+calendar-view .monthview-chip-time {
+  color: alpha(currentColor, 0.6);
+  font-size: smaller;
 }
 
 calendar-view .monthview-overflow {
@@ -180,24 +199,13 @@ calendar-view.week-view .weekview-grid {
 
 calendar-view.week-view button.weekview-event,
 calendar-view.week-view button.weekview-all-day-event {
-  border: 1px solid alpha(var(--window-fg-color), 0.18);
+  border-style: solid;
+  border-width: 1px;
   border-left-width: 3px;
   border-radius: 5px;
-  background-color: alpha(var(--window-fg-color), 0.08);
   font-size: 0.9rem;
   font-weight: 600;
   padding: 0;
-}
-
-calendar-view.week-view button.weekview-event:hover,
-calendar-view.week-view button.weekview-all-day-event:hover {
-  background-color: alpha(var(--window-fg-color), 0.16);
-}
-
-calendar-view.week-view button.weekview-event:focus-visible,
-calendar-view.week-view button.weekview-all-day-event:focus-visible {
-  outline: 2px solid var(--accent-color);
-  outline-offset: -2px;
 }
 
 /* ── Agenda View ── */

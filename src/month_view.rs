@@ -15,6 +15,26 @@ pub struct EventChip {
     pub calendar_id: uuid::Uuid,
     pub color: String,
     pub is_all_day: bool,
+    pub start_time: Option<NaiveTime>,
+    pub viewer_local_end: ViewerLocalEnd,
+}
+
+impl EventChip {
+    /// Returns whether the event ended strictly before the supplied instant.
+    pub fn is_past_at(&self, now: DateTime<FixedOffset>) -> bool {
+        match &self.viewer_local_end {
+            ViewerLocalEnd::Timed(end) => *end < now,
+            ViewerLocalEnd::AllDay(end_date) => {
+                end_date.and_time(NaiveTime::MIN) < now.naive_local()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewerLocalEnd {
+    Timed(DateTime<FixedOffset>),
+    AllDay(NaiveDate),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +345,8 @@ fn project_dates(
                             calendar_id: event.calendar_id,
                             color: cal.color.clone(),
                             is_all_day: true,
+                            start_time: None,
+                            viewer_local_end: ViewerLocalEnd::AllDay(*end_date_exclusive),
                         });
                     }
                     date += Duration::days(1);
@@ -350,6 +372,8 @@ fn project_dates(
                             calendar_id: event.calendar_id,
                             color: cal.color.clone(),
                             is_all_day: false,
+                            start_time: Some(start.time()),
+                            viewer_local_end: ViewerLocalEnd::Timed(end),
                         });
                     }
                     date += Duration::days(1);

@@ -226,9 +226,12 @@ impl WeekGrid {
                 + 2.0;
             let y = timed_button.start_minutes / 60.0 * HOUR_HEIGHT;
             let button_width = (lane_width - 4.0).max(20.0) as i32;
-            let button_height = ((timed_button.end_minutes - timed_button.start_minutes) / 60.0
-                * HOUR_HEIGHT)
-                .max(24.0) as i32;
+            let duration_height = ((timed_button.end_minutes - timed_button.start_minutes) / 60.0
+                * HOUR_HEIGHT) as i32;
+            let (minimum_height, _, _, _) = timed_button
+                .button
+                .measure(gtk::Orientation::Vertical, button_width);
+            let button_height = duration_height.max(minimum_height);
             let transform =
                 gsk::Transform::new().translate(&graphene::Point::new(x as f32, y as f32));
             timed_button
@@ -302,7 +305,10 @@ mod imp {
         pub cached_calendars: RefCell<Vec<Calendar>>,
         pub cached_events: RefCell<Vec<Event>>,
         pub on_event_activate: RefCell<Option<EventActivateFn>>,
-        pub initial_scroll_done: Cell<bool>,
+        pub initial_scroll_eligible: Cell<bool>,
+        pub initial_scroll_pending: Cell<bool>,
+        pub initial_scroll_source: RefCell<Option<glib::SourceId>>,
+        pub focus_scroll_source: RefCell<Option<glib::SourceId>>,
         pub clock_source: RefCell<Option<glib::SourceId>>,
         pub week_grid: RefCell<Option<WeekGrid>>,
     }
@@ -321,7 +327,10 @@ mod imp {
                 cached_calendars: RefCell::new(Vec::new()),
                 cached_events: RefCell::new(Vec::new()),
                 on_event_activate: RefCell::new(None),
-                initial_scroll_done: Cell::new(false),
+                initial_scroll_eligible: Cell::new(true),
+                initial_scroll_pending: Cell::new(false),
+                initial_scroll_source: RefCell::new(None),
+                focus_scroll_source: RefCell::new(None),
                 clock_source: RefCell::new(None),
                 week_grid: RefCell::new(None),
             }
@@ -382,25 +391,36 @@ mod imp {
                 .vadjustment()
                 .connect_changed(move |_| {
                     if let Some(obj) = obj_weak.upgrade() {
-                        obj.scroll_to_current_time();
+                        obj.schedule_initial_scroll();
                     }
                 });
         }
 
         fn dispose(&self) {
-            self.obj().stop_clock();
+            let obj = self.obj();
+            obj.cancel_focus_scroll_suppression();
+            obj.stop_clock();
         }
     }
 
     impl WidgetImpl for WeekView {
         fn map(&self) {
             self.parent_map();
+            self.obj().suppress_focus_scrolling();
+            self.obj().request_initial_scroll();
             self.obj().start_clock();
         }
 
         fn unmap(&self) {
+            self.obj().cancel_initial_scroll();
+            self.obj().cancel_focus_scroll_suppression();
             self.obj().stop_clock();
             self.parent_unmap();
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            self.parent_size_allocate(width, height, baseline);
+            self.obj().schedule_initial_scroll();
         }
     }
     impl BinImpl for WeekView {}
@@ -428,7 +448,15 @@ impl WeekView {
 
     /// Synchronise the rendered week with the shared window date.
     pub fn set_active_date(&self, date: NaiveDate) {
+        let today = self.imp().today_date.get();
+        let was_current_week = self.week_contains(today);
         self.imp().active_date.set(date);
+        let is_current_week = self.week_contains(today);
+        if is_current_week && !was_current_week {
+            self.request_initial_scroll();
+        } else if !is_current_week {
+            self.cancel_initial_scroll();
+        }
         let (calendars, events) = {
             let imp = self.imp();
             (
@@ -440,6 +468,7 @@ impl WeekView {
     }
 
     pub fn render(&self, calendars: &[Calendar], events: &[Event]) {
+        self.suppress_focus_scrolling();
         let imp = self.imp();
         *imp.cached_calendars.borrow_mut() = calendars.to_vec();
         *imp.cached_events.borrow_mut() = events.to_vec();
@@ -545,8 +574,8 @@ impl WeekView {
 
     fn schedule_clock_tick(&self) {
         let now = self.local_now();
-        let elapsed = now.second() as u64 * 1_000_000 + now.nanosecond() as u64;
-        let delay = Duration::from_micros((60_000_000 - elapsed).max(1_000));
+        let elapsed = now.second() as u64 * 1_000_000 + now.nanosecond() as u64 / 1_000;
+        let delay = Duration::from_micros(60_000_000_u64.saturating_sub(elapsed).max(1_000));
         let obj_weak = self.downgrade();
         let source = glib::timeout_add_local_once(delay, move || {
             if let Some(obj) = obj_weak.upgrade() {
@@ -570,6 +599,11 @@ impl WeekView {
             if date_changed {
                 let state = ViewState::new(ViewKind::Week, self.active_date());
                 self.render_headers(&state.current_week_dates());
+                if self.week_contains(today) {
+                    self.request_initial_scroll();
+                } else {
+                    self.cancel_initial_scroll();
+                }
             }
         }
         if let Some(grid) = self.imp().week_grid.borrow().as_ref() {
@@ -589,29 +623,119 @@ impl WeekView {
         Some(now.hour() as f64 * 60.0 + now.minute() as f64)
     }
 
+    fn request_initial_scroll(&self) {
+        let imp = self.imp();
+        if !imp.initial_scroll_eligible.get()
+            || !self.is_mapped()
+            || !self.week_contains(imp.today_date.get())
+        {
+            return;
+        }
+        imp.initial_scroll_eligible.set(false);
+        imp.initial_scroll_pending.set(true);
+        self.schedule_initial_scroll();
+    }
+
+    fn cancel_initial_scroll(&self) {
+        self.imp().initial_scroll_pending.set(false);
+        if let Some(source) = self.imp().initial_scroll_source.borrow_mut().take() {
+            source.remove();
+        }
+    }
+
+    fn suppress_focus_scrolling(&self) {
+        let Some(viewport) = self.timeline_viewport() else {
+            return;
+        };
+        viewport.set_scroll_to_focus(false);
+        let imp = self.imp();
+        if imp.focus_scroll_source.borrow().is_some() || !self.is_mapped() {
+            return;
+        }
+        let obj_weak = self.downgrade();
+        let source = glib::idle_add_local_once(move || {
+            if let Some(obj) = obj_weak.upgrade() {
+                obj.imp().focus_scroll_source.borrow_mut().take();
+                obj.enable_focus_scrolling();
+            }
+        });
+        *imp.focus_scroll_source.borrow_mut() = Some(source);
+    }
+
+    fn cancel_focus_scroll_suppression(&self) {
+        if let Some(source) = self.imp().focus_scroll_source.borrow_mut().take() {
+            source.remove();
+        }
+        self.enable_focus_scrolling();
+    }
+
+    fn enable_focus_scrolling(&self) {
+        if let Some(viewport) = self.timeline_viewport() {
+            viewport.set_scroll_to_focus(true);
+        }
+    }
+
+    fn timeline_viewport(&self) -> Option<gtk::Viewport> {
+        self.imp()
+            .timeline_scroll
+            .child()
+            .and_downcast::<gtk::Viewport>()
+    }
+
+    fn schedule_initial_scroll(&self) {
+        let imp = self.imp();
+        if !imp.initial_scroll_pending.get()
+            || !self.is_mapped()
+            || imp.initial_scroll_source.borrow().is_some()
+        {
+            return;
+        }
+        let obj_weak = self.downgrade();
+        let source = glib::idle_add_local_once(move || {
+            if let Some(obj) = obj_weak.upgrade() {
+                obj.imp().initial_scroll_source.borrow_mut().take();
+                obj.scroll_to_current_time();
+            }
+        });
+        *imp.initial_scroll_source.borrow_mut() = Some(source);
+    }
+
     fn scroll_to_current_time(&self) {
         let imp = self.imp();
-        if imp.initial_scroll_done.get() {
+        if !imp.initial_scroll_pending.get() || !self.is_mapped() {
             return;
         }
         let today = imp.today_date.get();
-        let state = ViewState::new(ViewKind::Week, imp.active_date.get());
-        if !state.current_week_dates().contains(&today) {
-            imp.initial_scroll_done.set(true);
+        if !self.week_contains(today) {
+            imp.initial_scroll_pending.set(false);
             return;
         }
         let adjustment = imp.timeline_scroll.vadjustment();
         let upper = adjustment.upper();
         let page_size = adjustment.page_size();
         if page_size <= 0.0 || upper <= adjustment.lower() {
+            let obj_weak = self.downgrade();
+            let source = glib::timeout_add_local_once(Duration::from_millis(16), move || {
+                if let Some(obj) = obj_weak.upgrade() {
+                    obj.imp().initial_scroll_source.borrow_mut().take();
+                    obj.schedule_initial_scroll();
+                }
+            });
+            *imp.initial_scroll_source.borrow_mut() = Some(source);
             return;
         }
         let now = self.local_now();
         let minutes = now.hour() as f64 * 60.0 + now.minute() as f64;
         let target = minutes / 60.0 * HOUR_HEIGHT - imp.timeline_scroll.height() as f64 / 3.0;
         let max_value = (upper - page_size).max(adjustment.lower());
+        imp.initial_scroll_pending.set(false);
         adjustment.set_value(target.clamp(adjustment.lower(), max_value));
-        imp.initial_scroll_done.set(true);
+    }
+
+    fn week_contains(&self, date: NaiveDate) -> bool {
+        ViewState::new(ViewKind::Week, self.active_date())
+            .current_week_dates()
+            .contains(&date)
     }
 }
 
@@ -625,6 +749,7 @@ fn create_event_button(
         .halign(gtk::Align::Fill)
         .valign(gtk::Align::Fill)
         .can_focus(true)
+        .focus_on_click(false)
         .tooltip_text(&chip.title)
         .build();
     button.set_cursor_from_name(Some("pointer"));
@@ -690,12 +815,14 @@ fn apply_event_color(button: &gtk::Button, color: &str) {
     // the event card instead of accumulating on the display.
     let css = format!(
         "button {{\
-            border-color: alpha(#{color}, 0.68);\
+            border-color: color-mix(in srgb, #{color} 68%, var(--window-bg-color));\
             border-left-color: #{color};\
-            background-color: alpha(#{color}, 0.18);\
+            background-color: color-mix(in srgb, #{color} 18%, var(--window-bg-color));\
         }}\
         button:hover {{\
-            background-color: alpha(#{color}, 0.32);\
+            border-color: color-mix(in srgb, #{color} 68%, var(--window-bg-color));\
+            border-left-color: #{color};\
+            background-color: color-mix(in srgb, #{color} 32%, var(--window-bg-color));\
         }}\
         button:focus-visible {{\
             outline: 2px solid #{color};\
