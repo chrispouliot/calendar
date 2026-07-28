@@ -12,7 +12,7 @@ use calendar::model::{
 use calendar::view_state::{ViewKind, ViewState};
 use chrono::{Datelike, NaiveDate};
 use gtk::{gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use uuid::Uuid;
@@ -42,6 +42,12 @@ mod imp {
         #[template_child]
         pub agenda_view_bin: TemplateChild<adw::Bin>,
         #[template_child]
+        pub month_page: TemplateChild<adw::ViewStackPage>,
+        #[template_child]
+        pub week_page: TemplateChild<adw::ViewStackPage>,
+        #[template_child]
+        pub agenda_page: TemplateChild<adw::ViewStackPage>,
+        #[template_child]
         pub title_label: TemplateChild<gtk::Label>,
 
         // Phase 6: New-Event button (host of the quick-add popover).
@@ -67,6 +73,10 @@ mod imp {
 
         /// Shared navigation state for the three pages in `views_stack`.
         pub view_state: RefCell<Option<ViewState>>,
+
+        /// The view to restore after leaving the mobile breakpoint.
+        pub wide_view: RefCell<Option<ViewKind>>,
+        pub mobile_layout: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -89,6 +99,7 @@ mod imp {
             self.parent_constructed();
 
             *self.view_state.borrow_mut() = Some(ViewState::new(ViewKind::Month, today_local()));
+            *self.wide_view.borrow_mut() = Some(ViewKind::Month);
 
             // ── Open the persistent SQLite database ──
             let db_path = crate::background::database_path();
@@ -207,6 +218,28 @@ mod imp {
                         .handle_view_changed(stack.visible_child_name().as_deref());
                 }
             });
+
+            let month_page_win_weak = win.downgrade();
+            self.month_page
+                .connect_notify_local(Some("visible"), move |_, _| {
+                    if let Some(win) = month_page_win_weak.upgrade() {
+                        win.imp().handle_breakpoint_changed();
+                    }
+                });
+            let week_page_win_weak = win.downgrade();
+            self.week_page
+                .connect_notify_local(Some("visible"), move |_, _| {
+                    if let Some(win) = week_page_win_weak.upgrade() {
+                        win.imp().handle_breakpoint_changed();
+                    }
+                });
+            let agenda_page_win_weak = win.downgrade();
+            self.agenda_page
+                .connect_notify_local(Some("visible"), move |_, _| {
+                    if let Some(win) = agenda_page_win_weak.upgrade() {
+                        win.imp().handle_breakpoint_changed();
+                    }
+                });
 
             // ── Construct the Quick-Add popover ──
             let popover = crate::ui::quick_add_popover::QuickAddPopover::new();
@@ -405,6 +438,7 @@ mod imp {
 
             // ── Initial render from the shared local-today state ──
             self.render_all_from_state();
+            self.handle_breakpoint_changed();
         }
 
         fn dispose(&self) {
@@ -510,11 +544,16 @@ impl imp::CalendarWindow {
         };
 
         let old_kind = self.view_state.borrow().as_ref().map(ViewState::view);
-        if old_kind == Some(ViewKind::Month) && kind != ViewKind::Month {
+        let mobile_layout = self.is_mobile_layout();
+        if !mobile_layout && old_kind == Some(ViewKind::Month) && kind != ViewKind::Month {
             let dominant = self.with_month_view(|mv| mv.dominant_year_month());
             if let Some((year, month)) = dominant {
                 self.reconcile_month_state(year, month);
             }
+        }
+
+        if !mobile_layout {
+            *self.wide_view.borrow_mut() = Some(kind);
         }
 
         if let Some(state) = self.view_state.borrow_mut().as_mut() {
@@ -525,6 +564,43 @@ impl imp::CalendarWindow {
         self.render_week_view();
         self.render_agenda_view();
         self.update_title();
+    }
+
+    fn is_mobile_layout(&self) -> bool {
+        !self.month_page.property::<bool>("visible") || !self.week_page.property::<bool>("visible")
+    }
+
+    fn handle_breakpoint_changed(&self) {
+        let mobile = self.is_mobile_layout();
+        if mobile == self.mobile_layout.get() {
+            return;
+        }
+
+        self.mobile_layout.set(mobile);
+        if mobile {
+            if self.wide_view.borrow().is_none()
+                && let Some(kind) = self.view_state.borrow().as_ref().map(ViewState::view)
+            {
+                *self.wide_view.borrow_mut() = Some(kind);
+            }
+            self.set_layout_view(ViewKind::Agenda);
+        } else {
+            let kind = self
+                .wide_view
+                .borrow_mut()
+                .take()
+                .or_else(|| self.view_state.borrow().as_ref().map(ViewState::view))
+                .unwrap_or(ViewKind::Agenda);
+            self.set_layout_view(kind);
+        }
+    }
+
+    fn set_layout_view(&self, kind: ViewKind) {
+        if let Some(state) = self.view_state.borrow_mut().as_mut() {
+            state.set_view(kind);
+        }
+        self.views_stack.set_visible_child_name(view_name(kind));
+        self.render_all_from_state();
     }
 
     /// Push the shared active date into every concrete view.
@@ -1170,6 +1246,14 @@ fn month_name(month: u32) -> &'static str {
         11 => "November",
         12 => "December",
         _ => unreachable!(),
+    }
+}
+
+fn view_name(kind: ViewKind) -> &'static str {
+    match kind {
+        ViewKind::Month => "month",
+        ViewKind::Week => "week",
+        ViewKind::Agenda => "agenda",
     }
 }
 

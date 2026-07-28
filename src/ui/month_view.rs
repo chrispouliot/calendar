@@ -18,6 +18,7 @@ use uuid::Uuid;
 /// free-floating dialog.  Days that contain event chips do not fire this
 /// callback — event-chip preview is handled by `on_event_activate`.
 type ActivateFn = Box<dyn Fn(usize, usize, NaiveDate)>;
+type GeometryFn = Box<dyn Fn(i32, f64)>;
 
 /// Callback type for event-chip activation: fired when the user clicks
 /// a chip widget inside a day cell.  Carries the event UUID and a
@@ -27,6 +28,292 @@ type EventActivateFn = Box<dyn Fn(uuid::Uuid, gtk::Widget)>;
 
 /// Callback type for dominant-month change (title update).
 type MonthChangedFn = Box<dyn Fn(i32, u32)>;
+
+/// A layout-only container for the buffered week rows.
+///
+/// GtkBox allocates every visible child on every pass.  That is a poor fit
+/// for the 15-row buffer: rows outside the viewport can have a larger minimum
+/// height than the current fractional row height, producing allocation
+/// warnings during resize.  This widget keeps all rows parented, but only
+/// allocates the visible window (plus one row on either side).
+mod rows_imp {
+    use super::*;
+
+    pub struct MonthRows {
+        pub children: RefCell<Vec<gtk::Box>>,
+        pub content_height: Cell<i32>,
+        pub row_height: Cell<f64>,
+        pub scroll_value: Cell<f64>,
+        pub page_size: Cell<f64>,
+        pub hadjustment: RefCell<Option<gtk::Adjustment>>,
+        pub vadjustment: RefCell<Option<gtk::Adjustment>>,
+        pub hscroll_policy: Cell<gtk::ScrollablePolicy>,
+        pub vscroll_policy: Cell<gtk::ScrollablePolicy>,
+        pub bound_vadjustment: RefCell<Option<gtk::Adjustment>>,
+        pub geometry_callback: RefCell<Option<GeometryFn>>,
+        pub geometry_guard: Cell<bool>,
+    }
+
+    impl Default for MonthRows {
+        fn default() -> Self {
+            Self {
+                children: RefCell::new(Vec::new()),
+                content_height: Cell::new(0),
+                row_height: Cell::new(0.0),
+                scroll_value: Cell::new(0.0),
+                page_size: Cell::new(0.0),
+                hadjustment: RefCell::new(None),
+                vadjustment: RefCell::new(None),
+                hscroll_policy: Cell::new(gtk::ScrollablePolicy::Minimum),
+                vscroll_policy: Cell::new(gtk::ScrollablePolicy::Minimum),
+                bound_vadjustment: RefCell::new(None),
+                geometry_callback: RefCell::new(None),
+                geometry_guard: Cell::new(false),
+            }
+        }
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for MonthRows {
+        const NAME: &'static str = "MonthRows";
+        type Type = super::MonthRows;
+        type ParentType = gtk::Widget;
+        type Interfaces = (gtk::Scrollable,);
+    }
+
+    impl ObjectImpl for MonthRows {
+        fn properties() -> &'static [glib::ParamSpec] {
+            use std::sync::OnceLock;
+
+            static PROPERTIES: OnceLock<Vec<glib::ParamSpec>> = OnceLock::new();
+            PROPERTIES.get_or_init(|| {
+                vec![
+                    glib::ParamSpecObject::builder::<gtk::Adjustment>("hadjustment")
+                        .flags(glib::ParamFlags::READWRITE | glib::ParamFlags::CONSTRUCT)
+                        .build(),
+                    glib::ParamSpecObject::builder::<gtk::Adjustment>("vadjustment")
+                        .flags(glib::ParamFlags::READWRITE | glib::ParamFlags::CONSTRUCT)
+                        .build(),
+                    glib::ParamSpecEnum::builder_with_default(
+                        "hscroll-policy",
+                        gtk::ScrollablePolicy::Minimum,
+                    )
+                    .flags(glib::ParamFlags::READWRITE | glib::ParamFlags::EXPLICIT_NOTIFY)
+                    .build(),
+                    glib::ParamSpecEnum::builder_with_default(
+                        "vscroll-policy",
+                        gtk::ScrollablePolicy::Minimum,
+                    )
+                    .flags(glib::ParamFlags::READWRITE | glib::ParamFlags::EXPLICIT_NOTIFY)
+                    .build(),
+                ]
+            })
+        }
+
+        fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+            match pspec.name() {
+                "hadjustment" => {
+                    let adjustment = value
+                        .get::<Option<gtk::Adjustment>>()
+                        .expect("hadjustment has the GtkAdjustment type");
+                    self.hadjustment.replace(adjustment);
+                }
+                "vadjustment" => {
+                    let adjustment = value
+                        .get::<Option<gtk::Adjustment>>()
+                        .expect("vadjustment has the GtkAdjustment type");
+                    self.vadjustment.replace(adjustment);
+                }
+                "hscroll-policy" => {
+                    let policy = value
+                        .get::<gtk::ScrollablePolicy>()
+                        .expect("hscroll-policy has the GtkScrollablePolicy type");
+                    if self.hscroll_policy.replace(policy) != policy {
+                        self.obj().notify(pspec.name());
+                    }
+                }
+                "vscroll-policy" => {
+                    let policy = value
+                        .get::<gtk::ScrollablePolicy>()
+                        .expect("vscroll-policy has the GtkScrollablePolicy type");
+                    if self.vscroll_policy.replace(policy) != policy {
+                        self.obj().notify(pspec.name());
+                    }
+                }
+                _ => unreachable!("unknown MonthRows property: {}", pspec.name()),
+            }
+        }
+
+        fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+            match pspec.name() {
+                "hadjustment" => self.hadjustment.borrow().to_value(),
+                "vadjustment" => self.vadjustment.borrow().to_value(),
+                "hscroll-policy" => self.hscroll_policy.get().to_value(),
+                "vscroll-policy" => self.vscroll_policy.get().to_value(),
+                _ => unreachable!("unknown MonthRows property: {}", pspec.name()),
+            }
+        }
+
+        fn dispose(&self) {
+            for child in self.children.borrow_mut().drain(..) {
+                child.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for MonthRows {
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            if orientation == gtk::Orientation::Vertical {
+                // MonthRows is the scrollable viewport, not a content widget
+                // wrapped by another viewport.  Its content extent is carried
+                // by the adjustment; requesting that extent here would make
+                // GtkScrolledWindow allocate the child at 15-row height.
+                return (0, 0, -1, -1);
+            }
+
+            let mut minimum = 0;
+            let mut natural = 0;
+            for child in self.children.borrow().iter() {
+                let (child_minimum, child_natural, _, _) = child.measure(orientation, for_size);
+                minimum = minimum.max(child_minimum);
+                natural = natural.max(child_natural);
+            }
+            (minimum, natural, -1, -1)
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            let obj = self.obj();
+            obj.bind_adjustment();
+
+            let page_size = height.max(0) as f64;
+            if page_size <= 0.0 {
+                for child in self.children.borrow().iter() {
+                    child.set_child_visible(false);
+                }
+                return;
+            }
+
+            let row_height = page_size / 5.0;
+            let old_row_height = self.row_height.get();
+            let old_value = self.scroll_value.get();
+            let adjustment = self.bound_vadjustment.borrow().clone();
+            let value = if old_row_height > 0.0 {
+                old_value / old_row_height * row_height
+            } else {
+                VISIBLE_START as f64 * row_height
+            };
+            let content_height = (TOTAL_ROWS as f64 * row_height).ceil() as i32;
+            let max_value = (content_height as f64 - page_size).max(0.0);
+            let value = value.clamp(0.0, max_value);
+
+            self.geometry_guard.set(true);
+            self.content_height.set(content_height);
+            self.row_height.set(row_height);
+            self.scroll_value.set(value);
+            self.page_size.set(page_size);
+            if let Some(adjustment) = adjustment.as_ref() {
+                adjustment.configure(
+                    value,
+                    0.0,
+                    content_height as f64,
+                    row_height,
+                    page_size,
+                    page_size,
+                );
+                self.scroll_value.set(adjustment.value());
+            }
+            self.geometry_guard.set(false);
+
+            if old_row_height != row_height
+                && let Some(callback) = self.geometry_callback.borrow().as_ref()
+            {
+                callback(page_size as i32, row_height);
+            }
+
+            let value = self.scroll_value.get();
+
+            let first = ((value / row_height).floor() as isize - 1).max(0);
+            let last = ((value + page_size) / row_height).ceil() as usize + 1;
+
+            for (index, child) in self.children.borrow().iter().enumerate() {
+                let visible = (index as isize) >= first && index <= last;
+                child.set_child_visible(visible);
+                if !visible {
+                    continue;
+                }
+
+                let y = (index as f64 * row_height - value).round() as i32;
+                let next_y = ((index + 1) as f64 * row_height - value).round() as i32;
+                child.size_allocate(&gtk::Allocation::new(0, y, width, next_y - y), baseline);
+            }
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            for child in self.children.borrow().iter() {
+                if child.is_child_visible() {
+                    self.obj().snapshot_child(child, snapshot);
+                }
+            }
+        }
+    }
+
+    impl gtk::subclass::scrollable::ScrollableImpl for MonthRows {}
+}
+
+glib::wrapper! {
+    pub struct MonthRows(ObjectSubclass<rows_imp::MonthRows>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Scrollable;
+}
+
+impl MonthRows {
+    fn new() -> Self {
+        let rows: Self = glib::Object::new();
+        rows.set_overflow(gtk::Overflow::Hidden);
+        rows
+    }
+
+    fn append(&self, child: &gtk::Box) {
+        // Keep rows out of the layout and snapshot until MonthRows has received
+        // its first allocation.  Child visibility does not change the public
+        // visible state of the row, so recycling does not hide it permanently.
+        child.set_child_visible(false);
+        child.set_parent(self);
+        self.imp().children.borrow_mut().push(child.clone());
+    }
+
+    fn set_geometry_callback<F: Fn(i32, f64) + 'static>(&self, callback: F) {
+        *self.imp().geometry_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
+    fn bind_adjustment(&self) {
+        let Some(adjustment) = self.vadjustment() else {
+            return;
+        };
+        let already_bound = self
+            .imp()
+            .bound_vadjustment
+            .borrow()
+            .as_ref()
+            .is_some_and(|bound| bound == &adjustment);
+        if already_bound {
+            return;
+        }
+
+        let weak = self.downgrade();
+        adjustment.connect_value_changed(move |adjustment| {
+            if let Some(rows) = weak.upgrade() {
+                rows.imp().scroll_value.set(adjustment.value());
+                rows.queue_allocate();
+            }
+        });
+        *self.imp().bound_vadjustment.borrow_mut() = Some(adjustment);
+    }
+
+    fn is_geometry_updating(&self) -> bool {
+        self.imp().geometry_guard.get()
+    }
+}
 
 mod imp {
     use super::*;
@@ -40,6 +327,11 @@ mod imp {
         pub week_scroll: TemplateChild<gtk::ScrolledWindow>,
         #[template_child]
         pub week_rows_box: TemplateChild<gtk::Box>,
+
+        /// Custom layout container replacing the template Box after rows are
+        /// constructed.  The template Box is retained only as the bootstrap
+        /// parent for the row widgets.
+        pub month_rows: RefCell<Option<MonthRows>>,
 
         /// Pure WeeksBuffer for date management; initialised in constructed().
         pub weeks_buffer: RefCell<WeeksBuffer>,
@@ -65,11 +357,11 @@ mod imp {
         pub day_buttons: RefCell<Vec<gtk::Button>>,
         /// Chip containers: 105 vertical boxes, created once.
         pub chip_boxes: RefCell<Vec<gtk::Box>>,
-        /// Row containers (15 horizontal boxes), created once for explicit sizing.
-        pub row_boxes: RefCell<Vec<gtk::Box>>,
-
-        /// Fixed row height measured from the initial viewport allocation.
+        /// Row height derived from the current viewport allocation.
         pub row_height: Cell<f64>,
+
+        /// Last viewport height used to size the rows and adjustment.
+        pub viewport_height: Cell<i32>,
 
         /// Guard flag to prevent recursion when updating the scroll adjustment.
         pub recycling_guard: Cell<bool>,
@@ -96,6 +388,7 @@ mod imp {
                 headers_grid: TemplateChild::default(),
                 week_scroll: TemplateChild::default(),
                 week_rows_box: TemplateChild::default(),
+                month_rows: RefCell::new(None),
                 weeks_buffer: RefCell::new(WeeksBuffer::new(
                     NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
                 )),
@@ -107,8 +400,8 @@ mod imp {
                 cached_events: RefCell::new(Vec::new()),
                 day_buttons: RefCell::new(Vec::new()),
                 chip_boxes: RefCell::new(Vec::new()),
-                row_boxes: RefCell::new(Vec::new()),
                 row_height: Cell::new(80.0),
+                viewport_height: Cell::new(0),
                 recycling_guard: Cell::new(false),
                 initialized: Cell::new(false),
                 clock_source: RefCell::new(None),
@@ -157,7 +450,6 @@ mod imp {
             // ── Build 15 week-row widgets, each with 7 day buttons ──
             let mut day_buttons: Vec<gtk::Button> = Vec::with_capacity(TOTAL_ROWS * 7);
             let mut chip_boxes: Vec<gtk::Box> = Vec::with_capacity(TOTAL_ROWS * 7);
-            let mut row_boxes: Vec<gtk::Box> = Vec::with_capacity(TOTAL_ROWS);
 
             for row in 0..TOTAL_ROWS {
                 let row_box = gtk::Box::builder()
@@ -166,8 +458,6 @@ mod imp {
                     .hexpand(true)
                     .vexpand(false)
                     .build();
-
-                row_boxes.push(row_box.clone());
 
                 for col in 0..7 {
                     let btn = gtk::Button::builder()
@@ -227,9 +517,43 @@ mod imp {
                 self.week_rows_box.append(&row_box);
             }
 
-            *self.row_boxes.borrow_mut() = row_boxes;
             *self.day_buttons.borrow_mut() = day_buttons;
             *self.chip_boxes.borrow_mut() = chip_boxes;
+
+            // Replace the template Box with the allocation-aware container.
+            // Keeping the replacement local to this widget avoids changing
+            // the public Blueprint hierarchy while giving GTK a custom
+            // measure/allocate path for the buffered rows.
+            let rows = MonthRows::new();
+            while let Some(child) = self.week_rows_box.first_child() {
+                self.week_rows_box.remove(&child);
+                let row = child
+                    .downcast::<gtk::Box>()
+                    .expect("month row template child is a Box");
+                rows.append(&row);
+            }
+            // A GtkScrolledWindow adds a competing Viewport around ordinary
+            // children.  MonthRows implements GtkScrollable itself, so make
+            // it the direct child and let the adjustment drive its layout.
+            self.week_scroll.set_child(None::<&gtk::Widget>);
+            self.week_scroll.set_child(Some(&rows));
+            rows.set_hexpand(true);
+            rows.set_vexpand(true);
+
+            let obj_weak_geometry = obj.downgrade();
+            rows.set_geometry_callback(move |viewport_height, row_height| {
+                if let Some(obj) = obj_weak_geometry.upgrade() {
+                    obj.rows_geometry_changed(viewport_height, row_height);
+                }
+            });
+            let rows_weak_adjustment = rows.downgrade();
+            rows.connect_vadjustment_notify(move |_| {
+                if let Some(rows) = rows_weak_adjustment.upgrade() {
+                    rows.bind_adjustment();
+                }
+            });
+            rows.bind_adjustment();
+            *self.month_rows.borrow_mut() = Some(rows);
 
             // ── Initialise date state from the local clock ──
             let now = now_local_fixed();
@@ -275,24 +599,6 @@ mod imp {
                     return;
                 };
                 obj.check_recycle();
-            });
-
-            // Retry outside GTK's active allocation pass until the viewport
-            // has an allocation; stop when setup succeeds or the widget dies.
-            let obj_weak5 = obj_weak.clone();
-            self.week_scroll.connect_realize(move |_| {
-                let obj_weak5 = obj_weak5.clone();
-                glib::source::idle_add_local(move || {
-                    let Some(obj) = obj_weak5.upgrade() else {
-                        return glib::ControlFlow::Break;
-                    };
-                    obj.setup_scroll();
-                    if obj.imp().initialized.get() {
-                        glib::ControlFlow::Break
-                    } else {
-                        glib::ControlFlow::Continue
-                    }
-                });
             });
 
             // Fire initial month-changed callback from the first visible week.
@@ -929,57 +1235,13 @@ impl MonthView {
 
     // ── Scroll management ──
 
-    /// One-shot initialisation from the viewport's allocated height.
-    ///
-    /// Once the scrolled window has a valid allocation, this computes the row
-    /// height (1/5 of the viewport), explicitly sizes each of the 15 rows,
-    /// sets the content extent, and establishes every adjustment parameter
-    /// (lower, upper, page-size, step/page-increments, and value) atomically
-    /// from the known geometry — no waiting for GTK to infer the range.
-    ///
-    /// The recycling guard prevents the value-changed → check_recycle path
-    /// from firing during setup.  After marking `initialized`, continuous
-    /// scrolling and row recycling work as normal.  If GTK later recomputes
-    /// the adjustment from the explicit content geometry it converges to the
-    /// same bounds and value.
-    ///
-    /// Runs exactly once — the `initialized` guard returns early thereafter.
-    fn setup_scroll(&self) {
+    /// Record geometry calculated by MonthRows during its live allocation.
+    /// MonthView is an Adw.Bin and therefore uses GtkBinLayout; MonthRows owns
+    /// the scrollable child's allocation lifecycle instead.
+    fn rows_geometry_changed(&self, viewport_height: i32, row_height: f64) {
         let imp = self.imp();
-        if imp.initialized.get() {
-            return;
-        }
-
-        let h = imp.week_scroll.height() as f64;
-        if h <= 0.0 {
-            return;
-        }
-
-        imp.recycling_guard.set(true);
-
-        let row_pixels = (h as i32) / 5;
-        if row_pixels <= 0 {
-            imp.recycling_guard.set(false);
-            return;
-        }
-        let r = f64::from(row_pixels);
-        imp.row_height.set(r);
-
-        // Use one whole-pixel height consistently for sizing and scrolling.
-        for row_box in imp.row_boxes.borrow().iter() {
-            row_box.set_height_request(row_pixels);
-        }
-
-        // The outer content box gets the full 15-row extent.
-        let total = TOTAL_ROWS as i32 * row_pixels;
-        imp.week_rows_box.set_height_request(total);
-
-        // Establish adjustment bounds/increments/value atomically from
-        // known geometry so the viewport opens at VISIBLE_START.
-        let adj = imp.week_scroll.vadjustment();
-        adj.configure(VISIBLE_START as f64 * r, 0.0, total as f64, r, h, h);
-
-        imp.recycling_guard.set(false);
+        imp.row_height.set(row_height);
+        imp.viewport_height.set(viewport_height);
         imp.initialized.set(true);
 
         let (y, m) = self.first_visible_week_ym();
@@ -1002,6 +1264,13 @@ impl MonthView {
             return;
         }
 
+        // During a resize GtkScrolledWindow may emit adjustment notifications
+        // before its scrollable child receives the matching allocation.  Let
+        // MonthRows establish the new row geometry first.
+        if imp.viewport_height.get() > 0 && imp.week_scroll.height() != imp.viewport_height.get() {
+            return;
+        }
+
         let row_h = imp.row_height.get();
         if row_h <= 0.0 {
             return;
@@ -1010,6 +1279,15 @@ impl MonthView {
         let adj = imp.week_scroll.vadjustment();
         let val = adj.value();
         let max_val = adj.upper() - adj.page_size();
+
+        if imp
+            .month_rows
+            .borrow()
+            .as_ref()
+            .is_some_and(MonthRows::is_geometry_updating)
+        {
+            return;
+        }
 
         // Title-month transition (fires even without recycling) — uses the
         // first visible complete week, not the viewport centre.

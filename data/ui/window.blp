@@ -78,6 +78,7 @@ template $CalendarWindow: Adw.ApplicationWindow {
         }
 
         Adw.ViewStack views_stack {
+          hhomogeneous: false;
           hexpand: true;
           vexpand: true;
 
@@ -169,6 +170,23 @@ template $CalendarWindow: Adw.ApplicationWindow {
     setters {
       split_view.collapsed: true;
       view_switcher.policy: narrow;
+    }
+  }
+
+  Adw.Breakpoint {
+    condition ("max-width: 700sp")
+
+    setters {
+      split_view.collapsed: true;
+      view_switcher.visible: false;
+      previous_date_button.visible: false;
+      next_date_button.visible: false;
+      split_view.show-sidebar: false;
+      sidebar_button.visible: false;
+      header_bar.title-widget: null;
+      month_page.visible: false;
+      week_page.visible: false;
+      agenda_page.visible: true;
     }
   }
 }
