@@ -71,6 +71,8 @@ mod imp {
         pub calendar_management:
             RefCell<Option<crate::ui::calendar_management::CalendarManagementDialog>>,
 
+        pub preferences: RefCell<Option<crate::ui::preferences::PreferencesDialog>>,
+
         /// Shared navigation state for the three pages in `views_stack`.
         pub view_state: RefCell<Option<ViewState>>,
 
@@ -420,6 +422,35 @@ mod imp {
                 }
             });
             *self.calendar_management.borrow_mut() = Some(calendars);
+
+            let preferences = crate::ui::preferences::PreferencesDialog::new();
+            preferences.set_on_changed({
+                let win_weak = win.downgrade();
+                move || {
+                    if let Some(win) = win_weak.upgrade() {
+                        win.imp().render_all_from_state();
+                        if let Some(editor) = win.imp().event_editor.borrow().clone() {
+                            editor.refresh_time_format();
+                        }
+                        if let Some(popover) = win.imp().event_popover.borrow().clone() {
+                            popover.refresh_time_format();
+                        }
+                    }
+                }
+            });
+            *self.preferences.borrow_mut() = Some(preferences);
+
+            let show_preferences = gio::SimpleAction::new("show-preferences", None);
+            let win_weak = win.downgrade();
+            show_preferences.connect_activate(move |_, _| {
+                if let Some(win) = win_weak.upgrade()
+                    && let Some(dialog) = win.imp().preferences.borrow().clone()
+                {
+                    dialog.refresh();
+                    dialog.present(Some(win.upcast_ref::<gtk::Widget>()));
+                }
+            });
+            win.add_action(&show_preferences);
 
             let show_calendars = gio::SimpleAction::new("show-calendars", None);
             let win_weak = win.downgrade();

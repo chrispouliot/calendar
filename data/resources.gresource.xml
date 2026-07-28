@@ -3,6 +3,7 @@
   <gresource prefix="/dev/chris/calendar">
     <file compressed="true">ui/window.ui</file>
     <file compressed="true">ui/calendar-management.ui</file>
+    <file compressed="true">ui/preferences.ui</file>
     <file compressed="true">ui/common/date-chooser.ui</file>
     <file compressed="true">ui/common/date-chooser-row.ui</file>
     <file compressed="true">ui/common/calendar-list.ui</file>

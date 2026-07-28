@@ -6,6 +6,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event};
 use calendar::month_view::project_month;
+use calendar::preferences::format_wall_time;
 use calendar::viewer_time::now_local_fixed;
 use calendar::weeks_buffer::{TOTAL_ROWS, VISIBLE_START, WeeksBuffer};
 use chrono::{Datelike, NaiveDate, Timelike};
@@ -829,7 +830,7 @@ fn create_chip_widget(
         && let Some(start_time) = chip.start_time
     {
         let time = gtk::Label::builder()
-            .label(start_time.format("%R").to_string())
+            .label(format_wall_time(start_time))
             .css_classes(["monthview-chip-time"])
             .halign(gtk::Align::End)
             .build();

@@ -6,6 +6,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event, EventSchedule};
 use calendar::month_view::{DayProjection, EventChip, project_week};
+use calendar::preferences::format_wall_time;
 use calendar::view_state::{ViewKind, ViewState};
 use calendar::viewer_time::{now_local_fixed, to_local_fixed};
 use chrono::{Datelike, NaiveDate, Timelike};
@@ -793,15 +794,7 @@ fn time_minutes(time: chrono::NaiveTime) -> f64 {
 }
 
 fn format_hour(hour: u32) -> String {
-    if hour == 0 {
-        "12 AM".to_string()
-    } else if hour < 12 {
-        format!("{hour} AM")
-    } else if hour == 12 {
-        "12 PM".to_string()
-    } else {
-        format!("{} PM", hour - 12)
-    }
+    format_wall_time(chrono::NaiveTime::from_hms_opt(hour, 0, 0).expect("valid hour"))
 }
 
 fn weekday_name(index: usize) -> &'static str {

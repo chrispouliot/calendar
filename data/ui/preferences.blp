@@ -1,0 +1,24 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $PreferencesDialog: Adw.Dialog {
+  title: "Preferences";
+  content-width: 480;
+  content-height: 260;
+
+  Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {}
+
+    content: Adw.PreferencesPage {
+      Adw.PreferencesGroup {
+        title: "Time Format";
+        description: "Choose how times are displayed throughout Calendar.";
+
+        Adw.ComboRow time_format_row {
+          title: "Clock format";
+        }
+      }
+    };
+  }
+}

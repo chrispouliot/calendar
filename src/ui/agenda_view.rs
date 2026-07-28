@@ -5,6 +5,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event, EventSchedule};
 use calendar::month_view::{AgendaGroup, EventChip, project_agenda_range};
+use calendar::preferences::format_wall_time;
 use calendar::viewer_time::{now_local_fixed, to_local_fixed};
 use chrono::{Datelike, Duration, NaiveDate};
 use gtk::glib;
@@ -604,7 +605,7 @@ fn group_contains(group: &AgendaGroup, date: NaiveDate) -> bool {
 fn event_time_label(event: &Event) -> String {
     match &event.schedule {
         EventSchedule::AllDay { .. } => "All day".to_string(),
-        EventSchedule::Timed { start, .. } => to_local_fixed(start).format("%-I:%M %p").to_string(),
+        EventSchedule::Timed { start, .. } => format_wall_time(to_local_fixed(start).time()),
     }
 }
 

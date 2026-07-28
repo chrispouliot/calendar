@@ -3,6 +3,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo::rerun-if-changed=data/ui/window.blp");
     println!("cargo::rerun-if-changed=data/ui/calendar-management.blp");
+    println!("cargo::rerun-if-changed=data/ui/preferences.blp");
     println!("cargo::rerun-if-changed=data/ui/common/date-chooser.blp");
     println!("cargo::rerun-if-changed=data/ui/common/date-chooser-row.blp");
     println!("cargo::rerun-if-changed=data/ui/common/calendar-list.blp");
@@ -36,6 +37,7 @@ fn main() {
             "data/ui",
             "data/ui/window.blp",
             "data/ui/calendar-management.blp",
+            "data/ui/preferences.blp",
             "data/ui/common/date-chooser.blp",
             "data/ui/common/date-chooser-row.blp",
             "data/ui/common/calendar-list.blp",

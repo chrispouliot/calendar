@@ -5,6 +5,7 @@ use calendar::backend::reminders::reminder_occurrences_in_window;
 use calendar::backend::sync::{AccountSyncSummary, AccountSyncWorkerError, sync_account_on_worker};
 use calendar::backend::{AccountRepository, CalendarRepository, EventRepository, SqliteRepository};
 use calendar::model::{Account, Event};
+use calendar::preferences::format_wall_time;
 use calendar::viewer_time::{now_local_fixed, to_local_fixed};
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset};
 use gtk::glib;
@@ -508,7 +509,7 @@ fn check_reminders(
         let (event_title, occurrence_start, description) = &due[0];
         let due_line = format!(
             "Due at {}",
-            to_local_fixed(occurrence_start).format("%-I:%M %p")
+            format_wall_time(to_local_fixed(occurrence_start).time())
         );
         let description = description.trim();
         if description.is_empty()
@@ -524,7 +525,7 @@ fn check_reminders(
             .map(|(event_title, occurrence_start, _)| {
                 format!(
                     "{event_title} — {}",
-                    to_local_fixed(occurrence_start).format("%-I:%M %p")
+                    format_wall_time(to_local_fixed(occurrence_start).time())
                 )
             })
             .collect::<Vec<_>>()

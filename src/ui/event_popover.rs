@@ -3,8 +3,9 @@ use std::cell::RefCell;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event, EventSchedule};
+use calendar::preferences::format_wall_time;
 use calendar::viewer_time::to_local_fixed;
-use chrono::{Datelike, NaiveDate, Timelike};
+use chrono::{Datelike, NaiveDate};
 use gtk::glib;
 
 /// Edit-Details callback: invoked with the persisted event ID when the user
@@ -36,6 +37,9 @@ mod imp {
 
         pub on_edit_details: RefCell<Option<EditDetailsFn>>,
         pub event_id: RefCell<Option<uuid::Uuid>>,
+        pub current_event: RefCell<Option<Event>>,
+        pub current_calendar: RefCell<Option<Calendar>>,
+        pub current_today: RefCell<Option<NaiveDate>>,
     }
 
     #[glib::object_subclass]
@@ -118,6 +122,9 @@ impl EventPopover {
     pub fn set_event(&self, event: &Event, calendar: Option<&Calendar>, today: NaiveDate) {
         let imp = self.imp();
         *imp.event_id.borrow_mut() = Some(event.id);
+        *imp.current_event.borrow_mut() = Some(event.clone());
+        *imp.current_calendar.borrow_mut() = calendar.cloned();
+        *imp.current_today.borrow_mut() = Some(today);
 
         imp.summary_label.set_label(&event.title);
 
@@ -155,6 +162,15 @@ impl EventPopover {
             imp.action_button.set_tooltip_text(Some("Edit Details"));
         }
     }
+
+    pub fn refresh_time_format(&self) {
+        let event = self.imp().current_event.borrow().clone();
+        let calendar = self.imp().current_calendar.borrow().clone();
+        let today = self.imp().current_today.borrow().as_ref().copied();
+        if let (Some(event), Some(today)) = (event, today) {
+            self.set_event(&event, calendar.as_ref(), today);
+        }
+    }
 }
 
 // ── Schedule formatting (display-only, no EDS/time-format deps) ──
@@ -188,8 +204,8 @@ fn format_schedule(schedule: &EventSchedule, today: NaiveDate) -> String {
             let end = to_local_fixed(end);
             let start_naive = start.date_naive();
             let end_naive = end.date_naive();
-            let start_time = format!("{:02}:{:02}", start.hour(), start.minute());
-            let end_time = format!("{:02}:{:02}", end.hour(), end.minute());
+            let start_time = format_wall_time(start.time());
+            let end_time = format_wall_time(end.time());
 
             if start_naive == end_naive {
                 // Same-day timed.

@@ -148,9 +148,11 @@ template $CalendarWindow: Adw.ApplicationWindow {
           }
 
           [center]
-          Adw.ViewSwitcher view_switcher {
-            stack: views_stack;
-            policy: wide;
+          Adw.Bin view_switcher_bin {
+            child: Adw.ViewSwitcher view_switcher_wide {
+              stack: views_stack;
+              policy: wide;
+            };
           }
 
           [end]
@@ -169,7 +171,15 @@ template $CalendarWindow: Adw.ApplicationWindow {
 
     setters {
       split_view.collapsed: true;
-      view_switcher.policy: narrow;
+    }
+  }
+
+  Adw.Breakpoint {
+    condition ("max-width: 800sp")
+
+    setters {
+      split_view.collapsed: true;
+      view_switcher_bin.child: view_switcher_narrow;
     }
   }
 
@@ -178,7 +188,8 @@ template $CalendarWindow: Adw.ApplicationWindow {
 
     setters {
       split_view.collapsed: true;
-      view_switcher.visible: false;
+      view_switcher_bin.child: view_switcher_narrow;
+      view_switcher_bin.visible: false;
       previous_date_button.visible: false;
       next_date_button.visible: false;
       split_view.show-sidebar: false;
@@ -191,6 +202,12 @@ template $CalendarWindow: Adw.ApplicationWindow {
   }
 }
 
+Adw.InlineViewSwitcher view_switcher_narrow {
+  styles ["flat"]
+  stack: views_stack;
+  display-mode: icons;
+}
+
 PopoverMenu win_menu {
   menu-model: menu;
 }
@@ -200,6 +217,13 @@ menu menu {
     item {
       label: "_Calendars";
       action: "win.show-calendars";
+    }
+  }
+
+  section {
+    item {
+      label: "_Preferences";
+      action: "win.show-preferences";
     }
   }
 

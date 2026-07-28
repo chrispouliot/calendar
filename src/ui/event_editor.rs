@@ -338,6 +338,15 @@ impl EventEditor {
         imp.clear_error();
         imp.ensure_forward_range();
     }
+
+    pub fn refresh_time_format(&self) {
+        if let Some(chooser) = self.imp().start_date_time_state.borrow().as_ref() {
+            chooser.refresh_time_format();
+        }
+        if let Some(chooser) = self.imp().end_date_time_state.borrow().as_ref() {
+            chooser.refresh_time_format();
+        }
+    }
 }
 
 impl imp::EventEditor {

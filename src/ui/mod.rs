@@ -8,5 +8,6 @@ pub mod date_time_chooser;
 pub mod event_editor;
 pub mod event_popover;
 pub mod month_view;
+pub mod preferences;
 pub mod quick_add_popover;
 pub mod week_view;
