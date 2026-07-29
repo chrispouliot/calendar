@@ -18,6 +18,7 @@
     <file compressed="true">style.css</file>
   </gresource>
   <gresource prefix="/dev/chris/calendar">
+    <file compressed="true">icons/hicolor/scalable/apps/dev.chris.calendar.svg</file>
     <file compressed="true">icons/scalable/actions/checkmark-small-symbolic.svg</file>
     <file compressed="true">icons/scalable/emblems/calendar-month-symbolic.svg</file>
     <file compressed="true">icons/scalable/emblems/calendar-week-symbolic.svg</file>
