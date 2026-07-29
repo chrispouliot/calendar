@@ -9,13 +9,24 @@ template $AgendaView: Adw.Bin {
     vscrollbar-policy: automatic;
     overlay-scrolling: true;
 
-    child: Box agenda_days_box {
-      orientation: vertical;
-      spacing: 18;
-      margin-top: 18;
-      margin-bottom: 18;
-      margin-start: 24;
-      margin-end: 24;
+    child: Adw.Clamp agenda_clamp {
+      maximum-size: 900;
+      tightening-threshold: bind agenda_clamp.maximum-size;
+      halign: fill;
+      hexpand: true;
+
+      child: Box agenda_days_box {
+        orientation: vertical;
+        spacing: 16;
+        margin-top: 28;
+        margin-bottom: 28;
+        margin-start: 24;
+        margin-end: 24;
+        halign: fill;
+        hexpand: true;
+        vexpand: true;
+        css-classes: ["agenda-content"];
+      };
     };
   }
 }

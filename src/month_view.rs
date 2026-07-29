@@ -331,13 +331,16 @@ fn project_dates(
             None => continue,
         };
 
+        let Some((first_event_date, last_event_date)) =
+            event_date_bounds(&event.schedule, localizer)
+        else {
+            continue;
+        };
+
         match &event.schedule {
-            EventSchedule::AllDay {
-                start_date,
-                end_date_exclusive,
-            } => {
-                let mut date = *start_date;
-                while date < *end_date_exclusive {
+            EventSchedule::AllDay { .. } => {
+                let mut date = first_event_date;
+                while date <= last_event_date {
                     if let Some(day) = projection.iter_mut().find(|d| d.date == date) {
                         day.all_day.push(EventChip {
                             event_id: event.id,
@@ -346,7 +349,9 @@ fn project_dates(
                             color: cal.color.clone(),
                             is_all_day: true,
                             start_time: None,
-                            viewer_local_end: ViewerLocalEnd::AllDay(*end_date_exclusive),
+                            viewer_local_end: ViewerLocalEnd::AllDay(
+                                last_event_date + Duration::days(1),
+                            ),
                         });
                     }
                     date += Duration::days(1);
@@ -355,16 +360,9 @@ fn project_dates(
             EventSchedule::Timed { start, end, .. } => {
                 let start = localizer.localize(start);
                 let end = localizer.localize(end);
-                let start_date = start.date_naive();
-                let end_date = end.date_naive();
-                let end_is_midnight =
-                    end.time() == NaiveTime::from_hms_opt(0, 0, 0).expect("valid midnight");
 
-                let mut date = start_date;
-                while date <= end_date {
-                    if date == end_date && end_is_midnight {
-                        break;
-                    }
+                let mut date = first_event_date;
+                while date <= last_event_date {
                     if let Some(day) = projection.iter_mut().find(|d| d.date == date) {
                         day.timed.push(EventChip {
                             event_id: event.id,
@@ -383,6 +381,59 @@ fn project_dates(
     }
 
     projection
+}
+
+fn event_date_bounds(
+    schedule: &EventSchedule,
+    localizer: &impl ViewerLocalizer,
+) -> Option<(NaiveDate, NaiveDate)> {
+    match schedule {
+        EventSchedule::AllDay {
+            start_date,
+            end_date_exclusive,
+        } => end_date_exclusive
+            .checked_sub_signed(Duration::days(1))
+            .filter(|last_date| start_date <= last_date)
+            .map(|last_date| (*start_date, last_date)),
+        EventSchedule::Timed { start, end, .. } => {
+            let start = localizer.localize(start);
+            let end = localizer.localize(end);
+            if end <= start {
+                return None;
+            }
+            let last_date = if end.time() == NaiveTime::MIN {
+                end.date_naive().checked_sub_signed(Duration::days(1))?
+            } else {
+                end.date_naive()
+            };
+            Some((start.date_naive(), last_date))
+        }
+    }
+}
+
+/// Return the first date on which a visible event can be projected on or after
+/// `today`.
+///
+/// This uses the same recurrence expansion and timezone date-boundary rules as
+/// the normal agenda projection. Invalid recurrence data deliberately falls
+/// back to the event's non-recurring schedule, matching `expand_event`.
+pub(crate) fn earliest_projected_event_date_in_timezone<Tz: TimeZone>(
+    today: NaiveDate,
+    calendars: &[Calendar],
+    events: &[Event],
+    viewer_timezone: &Tz,
+) -> Option<NaiveDate> {
+    let visible_calendar_ids: std::collections::HashSet<uuid::Uuid> = calendars
+        .iter()
+        .filter(|calendar| calendar.visible)
+        .map(|calendar| calendar.id)
+        .collect();
+
+    events
+        .iter()
+        .filter(|event| visible_calendar_ids.contains(&event.calendar_id))
+        .filter_map(|event| earliest_event_date(event, today, viewer_timezone))
+        .min()
 }
 
 const RECURRENCE_LIMIT: u16 = 4096;
@@ -411,33 +462,109 @@ fn expand_event(event: &Event, first: NaiveDate, last: NaiveDate) -> Vec<Event> 
 
     dates
         .into_iter()
-        .filter_map(|date| {
-            let schedule = match &event.schedule {
-                EventSchedule::AllDay { .. } => {
-                    let start_date = date.date_naive();
-                    let end_date_exclusive = start_date.checked_add_signed(duration)?;
-                    EventSchedule::AllDay {
-                        start_date,
-                        end_date_exclusive,
-                    }
-                }
-                EventSchedule::Timed { timezone, .. } => {
-                    let start = date.fixed_offset();
-                    let end = start.checked_add_signed(duration)?;
-                    EventSchedule::Timed {
-                        start,
-                        end,
-                        timezone: timezone.clone(),
-                    }
-                }
-            };
-            Some(Event {
-                schedule,
-                recurrence: None,
-                ..event.clone()
-            })
-        })
+        .filter_map(|date| occurrence_event(event, date, duration))
         .collect()
+}
+
+fn earliest_event_date<Tz: TimeZone>(
+    event: &Event,
+    today: NaiveDate,
+    viewer_timezone: &Tz,
+) -> Option<NaiveDate> {
+    let localizer = TimezoneLocalizer(viewer_timezone);
+    if event.recurrence.is_none() {
+        return event_date_bounds(&event.schedule, &localizer)
+            .filter(|(_, last_date)| *last_date >= today)
+            .map(|(first_date, _)| first_date.max(today));
+    }
+    let Ok(source) = recurrence_source(event) else {
+        return event_date_bounds(&event.schedule, &localizer)
+            .filter(|(_, last_date)| *last_date >= today)
+            .map(|(first_date, _)| first_date.max(today));
+    };
+    let Ok(set) = source.parse::<RRuleSet>() else {
+        return event_date_bounds(&event.schedule, &localizer)
+            .filter(|(_, last_date)| *last_date >= today)
+            .map(|(first_date, _)| first_date.max(today));
+    };
+    let duration = match &event.schedule {
+        EventSchedule::AllDay {
+            start_date,
+            end_date_exclusive,
+        } => Duration::days((*end_date_exclusive - *start_date).num_days()),
+        EventSchedule::Timed { start, end, .. } => *end - *start,
+    };
+
+    // Apply the recurrence limit after seeking to today.  Limiting from the
+    // DTSTART would exhaust the result set on long-running unbounded rules
+    // before any upcoming occurrence is reached.  The small lookahead also
+    // covers an occurrence whose end is exactly today's local midnight; its
+    // date bounds do not occupy today even though its start is just inside
+    // this lower bound.
+    let recurrence_timezone = recurrence_timezone(event);
+    let today_start = viewer_timezone
+        .with_ymd_and_hms(today.year(), today.month(), today.day(), 0, 0, 0)
+        .single()
+        .expect("projection dates are valid")
+        .with_timezone(&recurrence_timezone);
+    let lower = today_start - duration - Duration::seconds(1);
+
+    // RRuleSet does not emit DTSTART when the source has only RDATE
+    // properties.  DTSTART is nevertheless the event's first recurrence
+    // instance, unless explicitly excluded.
+    let recurrence_start = *set.get_dt_start();
+    let start_is_excluded = set
+        .get_exdate()
+        .iter()
+        .any(|date| date.timestamp() == recurrence_start.timestamp());
+
+    let mut dates = set
+        .after(lower)
+        .all(2)
+        .dates
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if recurrence_start > lower && !start_is_excluded {
+        dates.push(recurrence_start);
+    }
+
+    dates.sort_by(|a, b| a.partial_cmp(b).expect("rrule dates are orderable"));
+    dates.dedup();
+    dates
+        .into_iter()
+        .filter_map(|date| occurrence_event(event, date, duration))
+        .filter_map(|event| event_date_bounds(&event.schedule, &localizer))
+        .filter(|(_, last_date)| *last_date >= today)
+        .map(|(first_date, _)| first_date.max(today))
+        .min()
+}
+
+fn occurrence_event(event: &Event, date: DateTime<RRuleTz>, duration: Duration) -> Option<Event> {
+    let schedule = match &event.schedule {
+        EventSchedule::AllDay { .. } => {
+            let start_date = date.date_naive();
+            let end_date_exclusive = start_date.checked_add_signed(duration)?;
+            EventSchedule::AllDay {
+                start_date,
+                end_date_exclusive,
+            }
+        }
+        EventSchedule::Timed { timezone, .. } => {
+            let start = date.fixed_offset();
+            let end = start.checked_add_signed(duration)?;
+            EventSchedule::Timed {
+                start,
+                end,
+                timezone: timezone.clone(),
+            }
+        }
+    };
+    Some(Event {
+        schedule,
+        recurrence: None,
+        ..event.clone()
+    })
 }
 
 fn recurrence_source(event: &Event) -> Result<String, ()> {

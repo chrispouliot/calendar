@@ -209,34 +209,134 @@ calendar-view.week-view button.weekview-all-day-event {
 }
 
 /* ── Agenda View ── */
-.agenda-day-heading {
-  margin-top: 4px;
-  margin-bottom: 2px;
+.agenda-content {
+  min-width: 0;
 }
 
-button.agenda-event {
-  border: 1px solid alpha(currentColor, 0.16);
-  border-radius: 6px;
+.agenda-group {
+  min-width: 0;
+}
+
+.agenda-date-rail {
+  padding-top: 4px;
+  color: alpha(currentColor, 0.55);
+}
+
+.agenda-date-rail.today {
+  color: var(--accent-color);
+}
+
+.agenda-date-weekday,
+.agenda-date-month {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.agenda-date-number {
+  font-size: 2.2rem;
+  font-weight: 400;
+}
+
+.agenda-event-card {
+  min-width: 0;
+  border: 1px solid alpha(currentColor, 0.15);
+  border-radius: 16px;
+  background-color: alpha(currentColor, 0.015);
+}
+
+button.agenda-event-row {
+  min-width: 0;
+  border-radius: 0;
+  background-color: transparent;
+  color: inherit;
+}
+
+button.agenda-event-row:hover {
   background-color: alpha(var(--accent-bg-color), 0.12);
 }
 
-button.agenda-event:hover {
-  background-color: alpha(var(--accent-bg-color), 0.24);
-}
-
-button.agenda-event:focus-visible {
+button.agenda-event-row:focus-visible {
   outline: 2px solid var(--accent-color);
-  outline-offset: 2px;
+  outline-offset: -2px;
 }
 
-button.agenda-event .agenda-event-time,
-button.agenda-event .agenda-event-location {
-  font-size: smaller;
+button.agenda-event-row.current {
+  background-color: alpha(var(--accent-bg-color), 0.18);
 }
 
-.agenda-empty-row {
-  min-height: 36px;
-  padding: 8px 10px;
+button.agenda-event-row.past {
+  opacity: 0.62;
+}
+
+.agenda-event-dot {
+  font-size: 1.1rem;
+  min-width: 12px;
+}
+
+button.agenda-event-row .agenda-event-time {
+  font-size: 0.95rem;
+  min-width: 0;
+}
+
+button.agenda-event-row .agenda-event-title {
+  min-width: 0;
+  font-size: 1rem;
+}
+
+.agenda-event-separator {
+  opacity: 0.7;
+}
+
+.agenda-now {
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.current-text {
+  color: var(--accent-color);
+  font-weight: 700;
+}
+
+.agenda-empty-divider {
+  min-width: 0;
+  color: alpha(currentColor, 0.52);
+}
+
+.agenda-empty-divider separator {
+  min-height: 1px;
+  min-width: 20px;
+  opacity: 0.65;
+}
+
+.agenda-empty-divider label {
+  font-size: 0.9rem;
+}
+
+.agenda-today-empty {
+  min-height: 88px;
+  padding: 0 18px;
+}
+
+button.agenda-new-event {
+  min-height: 38px;
+  padding-left: 16px;
+  padding-right: 16px;
+  color: var(--accent-color);
+}
+
+.agenda-no-upcoming {
+  padding: 32px 20px;
+}
+
+.agenda-no-upcoming .agenda-empty-icon {
+  min-width: 64px;
+  min-height: 64px;
+  padding: 18px;
+  border-radius: 20px;
+  color: alpha(currentColor, 0.55);
+  background-color: alpha(currentColor, 0.08);
 }
 
 /* ── Quick-Add popover ──

@@ -1,3 +1,5 @@
+pub mod agenda_presentation;
+pub mod agenda_render_plan;
 pub mod backend;
 pub mod calendar_grid;
 pub mod model;

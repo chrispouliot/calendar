@@ -209,6 +209,14 @@ mod imp {
                     }
                 }
             });
+            agenda_view.set_on_new_event({
+                let win_weak = win_weak.clone();
+                move || {
+                    if let Some(win) = win_weak.upgrade() {
+                        win.imp().open_quick_add_from_button();
+                    }
+                }
+            });
             self.agenda_view_bin.set_child(Some(&agenda_view));
 
             // Blueprint wires the ViewSwitcher to this stack, so observe the
