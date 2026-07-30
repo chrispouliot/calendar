@@ -389,3 +389,48 @@ label.no-events {
   min-height: 32px;
   padding: 2px 8px;
 }
+
+/* Event editor timed schedule chooser. */
+.time-card {
+  padding: 12px;
+}
+
+.time-summary {
+  min-height: 50px;
+  padding: 6px 10px;
+  border: 1px solid alpha(currentColor, 0.14);
+  border-radius: 12px;
+  background-color: transparent;
+}
+
+.time-summary:checked {
+  border-color: var(--accent-color);
+  background-color: alpha(var(--accent-bg-color), 0.08);
+}
+
+.time-summary:checked label:last-child {
+  color: var(--accent-color);
+}
+
+button.time-choice {
+  min-width: 46px;
+  min-height: 30px;
+  padding: 2px;
+  font-size: 0.85em;
+  font-weight: normal;
+  border: 1px solid alpha(currentColor, 0.14);
+  border-radius: 10px;
+  background-color: transparent;
+}
+
+button.time-choice.selected {
+  color: var(--accent-fg-color);
+  background-color: var(--accent-bg-color);
+  border-color: var(--accent-color);
+}
+
+.time-period button {
+  min-height: 30px;
+  padding: 2px 10px;
+  font-size: 0.9em;
+}

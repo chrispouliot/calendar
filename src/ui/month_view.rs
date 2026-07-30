@@ -13,11 +13,11 @@ use chrono::{Datelike, NaiveDate, Timelike};
 use gtk::{gdk, glib, graphene};
 use uuid::Uuid;
 
-/// Callback type for day activation: first click on an empty day cell
+/// Callback type for day activation: click on unused space in a day cell
 /// opens Quick Add.  Carries the (row, col) of the originating cell so
 /// the host can anchor the popover at that cell rather than as a
-/// free-floating dialog.  Days that contain event chips do not fire this
-/// callback — event-chip preview is handled by `on_event_activate`.
+/// free-floating dialog.  Event-chip preview is handled separately by
+/// `on_event_activate`.
 type ActivateFn = Box<dyn Fn(usize, usize, NaiveDate)>;
 type GeometryFn = Box<dyn Fn(i32, f64)>;
 
@@ -961,25 +961,11 @@ fn project_buffer_dates(
 impl MonthView {
     /// Handle a click on the day cell at (row, col).
     ///
-    /// If the cell has no event chips, fire the activation callback
-    /// immediately (first click → Quick Add).  Chips are handled
-    /// separately by the per-chip gesture controller, which intercepts
-    /// clicks at Capture phase before they reach this handler.
+    /// Fire the activation callback for unused space in the cell.  Chips are
+    /// handled separately by the per-chip gesture controller, which claims
+    /// their click sequence at Capture phase before it reaches this handler.
     fn handle_day_click(&self, row: usize, col: usize) {
         let imp = self.imp();
-        let idx = row * 7 + col;
-        let has_chips = imp
-            .chip_boxes
-            .borrow()
-            .get(idx)
-            .map(|chip_box| chip_box.first_child().is_some())
-            .unwrap_or(false);
-
-        if has_chips {
-            return; // individual chip gestures handle event preview
-        }
-
-        // First click on an empty day → open Quick Add.
         let buf = imp.weeks_buffer.borrow();
         let date = buf.row_dates(row)[col];
         drop(buf);

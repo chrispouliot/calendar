@@ -40,9 +40,7 @@ mod imp {
         #[template_child]
         pub end_date_row: TemplateChild<crate::ui::date_chooser_row::DateChooserRow>,
         #[template_child]
-        pub start_date_time: TemplateChild<crate::ui::date_time_chooser::DateTimeChooser>,
-        #[template_child]
-        pub end_date_time: TemplateChild<crate::ui::date_time_chooser::DateTimeChooser>,
+        pub timed_schedule: TemplateChild<crate::ui::date_time_chooser::DateTimeChooser>,
         #[template_child]
         pub description_view: TemplateChild<gtk::TextView>,
         #[template_child]
@@ -63,8 +61,7 @@ mod imp {
         pub original_timed_event: RefCell<Option<OriginalTimedEvent>>,
         pub start_date_row_state: RefCell<Option<crate::ui::date_chooser_row::DateChooserRow>>,
         pub end_date_row_state: RefCell<Option<crate::ui::date_chooser_row::DateChooserRow>>,
-        pub start_date_time_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
-        pub end_date_time_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
+        pub timed_schedule_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
         pub reminder_selection_user_changed: Cell<bool>,
         pub reminder_selection_syncing: Cell<bool>,
         pub on_save: RefCell<Option<SaveFn>>,
@@ -94,14 +91,10 @@ mod imp {
 
             let start_date_row = self.start_date_row.get();
             let end_date_row = self.end_date_row.get();
-            let start_date_time = self.start_date_time.get();
-            let end_date_time = self.end_date_time.get();
-            start_date_time.set_labels("Start Date", "Start Time");
-            end_date_time.set_labels("End Date", "End Time");
+            let timed_schedule = self.timed_schedule.get();
             *self.start_date_row_state.borrow_mut() = Some(start_date_row.clone());
             *self.end_date_row_state.borrow_mut() = Some(end_date_row.clone());
-            *self.start_date_time_state.borrow_mut() = Some(start_date_time.clone());
-            *self.end_date_time_state.borrow_mut() = Some(end_date_time.clone());
+            *self.timed_schedule_state.borrow_mut() = Some(timed_schedule.clone());
 
             let weak = self.obj().downgrade();
             start_date_row.set_on_date_changed(move |_| {
@@ -116,13 +109,7 @@ mod imp {
                 }
             });
             let weak = self.obj().downgrade();
-            start_date_time.set_on_changed(move || {
-                if let Some(editor) = weak.upgrade() {
-                    editor.imp().schedule_changed();
-                }
-            });
-            let weak = self.obj().downgrade();
-            end_date_time.set_on_changed(move || {
+            timed_schedule.set_on_changed(move || {
                 if let Some(editor) = weak.upgrade() {
                     editor.imp().schedule_changed();
                 }
@@ -142,6 +129,28 @@ mod imp {
                     editor.imp().save_clicked();
                 }
             });
+
+            let dismiss_popovers = gtk::GestureClick::new();
+            dismiss_popovers.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = self.obj().downgrade();
+            dismiss_popovers.connect_pressed(move |gesture, _, x, y| {
+                if gesture.current_button() != 1 {
+                    return;
+                }
+                let Some(editor) = weak.upgrade() else {
+                    return;
+                };
+                let target = editor.pick(x, y, gtk::PickFlags::DEFAULT);
+                let in_time_popover = target.is_some_and(|target| {
+                    [editor.imp().timed_schedule.get()]
+                        .iter()
+                        .any(|chooser| chooser.is_time_popover_widget(&target))
+                });
+                if !in_time_popover {
+                    editor.imp().timed_schedule.close_time_popover();
+                }
+            });
+            self.obj().add_controller(dismiss_popovers);
 
             let weak = self.obj().downgrade();
             self.reminders_row.connect_selected_notify(move |_| {
@@ -246,21 +255,14 @@ impl EventEditor {
         *imp.original_timed_event.borrow_mut() = None;
         select_calendar(&imp.calendar_row, &imp.calendars.borrow(), calendar_id);
         imp.schedule_stack.set_visible_child_name("all-day");
-        if let (
-            Some(start_date_row),
-            Some(end_date_row),
-            Some(start_date_time),
-            Some(end_date_time),
-        ) = (
+        if let (Some(start_date_row), Some(end_date_row), Some(timed_schedule)) = (
             imp.start_date_row_state.borrow().as_ref(),
             imp.end_date_row_state.borrow().as_ref(),
-            imp.start_date_time_state.borrow().as_ref(),
-            imp.end_date_time_state.borrow().as_ref(),
+            imp.timed_schedule_state.borrow().as_ref(),
         ) {
             start_date_row.set_date(date);
             end_date_row.set_date(date);
-            start_date_time.set_date_time(date, 9, 0);
-            end_date_time.set_date_time(date, 10, 0);
+            timed_schedule.set_date_times(date, 9, 0, date, 10, 0);
         }
         imp.clear_error();
         imp.ensure_forward_range();
@@ -295,12 +297,11 @@ impl EventEditor {
                     end_date_row
                         .set_date(end_date_exclusive.pred_opt().unwrap_or(*end_date_exclusive));
                 }
-                if let (Some(start_date_time), Some(end_date_time)) = (
-                    imp.start_date_time_state.borrow().as_ref(),
-                    imp.end_date_time_state.borrow().as_ref(),
-                ) {
-                    start_date_time.set_date_time(*start_date, 9, 0);
-                    end_date_time.set_date_time(
+                if let Some(timed_schedule) = imp.timed_schedule_state.borrow().as_ref() {
+                    timed_schedule.set_date_times(
+                        *start_date,
+                        9,
+                        0,
                         end_date_exclusive.pred_opt().unwrap_or(*end_date_exclusive),
                         10,
                         0,
@@ -318,16 +319,11 @@ impl EventEditor {
                     timezone: timezone.clone(),
                 });
                 imp.schedule_stack.set_visible_child_name("time-slot");
-                if let (Some(start_date_time), Some(end_date_time)) = (
-                    imp.start_date_time_state.borrow().as_ref(),
-                    imp.end_date_time_state.borrow().as_ref(),
-                ) {
-                    start_date_time.set_date_time(
+                if let Some(timed_schedule) = imp.timed_schedule_state.borrow().as_ref() {
+                    timed_schedule.set_date_times(
                         start.date_naive(),
                         start.hour() as i32,
                         start.minute() as i32,
-                    );
-                    end_date_time.set_date_time(
                         end.date_naive(),
                         end.hour() as i32,
                         end.minute() as i32,
@@ -340,10 +336,7 @@ impl EventEditor {
     }
 
     pub fn refresh_time_format(&self) {
-        if let Some(chooser) = self.imp().start_date_time_state.borrow().as_ref() {
-            chooser.refresh_time_format();
-        }
-        if let Some(chooser) = self.imp().end_date_time_state.borrow().as_ref() {
+        if let Some(chooser) = self.imp().timed_schedule_state.borrow().as_ref() {
             chooser.refresh_time_format();
         }
     }
@@ -407,30 +400,33 @@ impl imp::EventEditor {
             ) else {
                 return;
             };
-            if let (Some(start_chooser), Some(end_chooser)) = (
-                self.start_date_time_state.borrow().as_ref(),
-                self.end_date_time_state.borrow().as_ref(),
-            ) {
-                let start_time = start_chooser
-                    .date_time_parts()
+            if let Some(timed_schedule) = self.timed_schedule_state.borrow().as_ref() {
+                let start_time = timed_schedule
+                    .start_date_time_parts()
                     .map(|(_, hour, minute)| (hour, minute))
                     .unwrap_or((9, 0));
-                let end_time = end_chooser
-                    .date_time_parts()
+                let end_time = timed_schedule
+                    .end_date_time_parts()
                     .map(|(_, hour, minute)| (hour, minute))
                     .unwrap_or((10, 0));
-                start_chooser.set_date_time(start, start_time.0, start_time.1);
-                end_chooser.set_date_time(end, end_time.0, end_time.1);
+                timed_schedule.set_date_times(
+                    start,
+                    start_time.0,
+                    start_time.1,
+                    end,
+                    end_time.0,
+                    end_time.1,
+                );
             }
         } else if let (Some(start), Some(end)) = (
-            self.start_date_time_state
+            self.timed_schedule_state
                 .borrow()
                 .as_ref()
-                .and_then(|chooser| chooser.date_time_parts()),
-            self.end_date_time_state
+                .and_then(|chooser| chooser.start_date_time_parts()),
+            self.timed_schedule_state
                 .borrow()
                 .as_ref()
-                .and_then(|chooser| chooser.date_time_parts()),
+                .and_then(|chooser| chooser.end_date_time_parts()),
         ) && let (Some(start_row), Some(end_row)) = (
             self.start_date_row_state.borrow().as_ref(),
             self.end_date_row_state.borrow().as_ref(),
@@ -460,24 +456,24 @@ impl imp::EventEditor {
                 && let Some(row) = self.end_date_row_state.borrow().as_ref()
             {
                 row.set_date(start);
-                if let Some(chooser) = self.end_date_time_state.borrow().as_ref()
-                    && let Some((_, hour, minute)) = chooser.date_time_parts()
+                if let Some(chooser) = self.timed_schedule_state.borrow().as_ref()
+                    && let Some((_, hour, minute)) = chooser.end_date_time_parts()
                 {
-                    chooser.set_date_time(start, hour, minute);
+                    chooser.set_end_date_time(start, hour, minute);
                 }
             }
             return;
         }
 
         let (Some(start_parts), Some(end_parts)) = (
-            self.start_date_time_state
+            self.timed_schedule_state
                 .borrow()
                 .as_ref()
-                .and_then(|chooser| chooser.date_time_parts()),
-            self.end_date_time_state
+                .and_then(|chooser| chooser.start_date_time_parts()),
+            self.timed_schedule_state
                 .borrow()
                 .as_ref()
-                .and_then(|chooser| chooser.date_time_parts()),
+                .and_then(|chooser| chooser.end_date_time_parts()),
         ) else {
             return;
         };
@@ -517,15 +513,15 @@ impl imp::EventEditor {
         };
         if let Some((date, hour, minute)) = shifted {
             if target {
-                if let Some(chooser) = self.start_date_time_state.borrow().as_ref() {
-                    chooser.set_date_time(date, hour, minute);
+                if let Some(chooser) = self.timed_schedule_state.borrow().as_ref() {
+                    chooser.set_start_date_time(date, hour, minute);
                 }
                 if let Some(row) = self.start_date_row_state.borrow().as_ref() {
                     row.set_date(date);
                 }
             } else {
-                if let Some(chooser) = self.end_date_time_state.borrow().as_ref() {
-                    chooser.set_date_time(date, hour, minute);
+                if let Some(chooser) = self.timed_schedule_state.borrow().as_ref() {
+                    chooser.set_end_date_time(date, hour, minute);
                 }
                 if let Some(row) = self.end_date_row_state.borrow().as_ref() {
                     row.set_date(date);
@@ -585,19 +581,19 @@ impl imp::EventEditor {
             }
         } else {
             let Some((start_date, start_hour, start_minute)) = self
-                .start_date_time_state
+                .timed_schedule_state
                 .borrow()
                 .as_ref()
-                .and_then(|chooser| chooser.date_time_parts())
+                .and_then(|chooser| chooser.start_date_time_parts())
             else {
                 self.show_error("Choose a valid start time.");
                 return;
             };
             let Some((end_date, end_hour, end_minute)) = self
-                .end_date_time_state
+                .timed_schedule_state
                 .borrow()
                 .as_ref()
-                .and_then(|chooser| chooser.date_time_parts())
+                .and_then(|chooser| chooser.end_date_time_parts())
             else {
                 self.show_error("Choose a valid end time.");
                 return;

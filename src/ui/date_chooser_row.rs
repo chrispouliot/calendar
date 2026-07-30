@@ -125,4 +125,13 @@ impl DateChooserRow {
     pub fn set_on_date_changed<F: Fn(NaiveDate) + 'static>(&self, callback: F) {
         *self.imp().on_date_changed.borrow_mut() = Some(Box::new(callback));
     }
+
+    pub fn close_date_popover(&self) {
+        self.imp().date_popover.popdown();
+    }
+
+    pub fn is_date_popover_widget(&self, widget: &gtk::Widget) -> bool {
+        let popover = self.imp().date_popover.upcast_ref::<gtk::Widget>();
+        widget == popover || widget.is_ancestor(popover)
+    }
 }

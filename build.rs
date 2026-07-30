@@ -19,6 +19,7 @@ fn main() {
     println!("cargo::rerun-if-changed=data/resources.gresource.xml");
     println!("cargo::rerun-if-changed=data/icons/hicolor/scalable/apps/dev.chris.calendar.svg");
     println!("cargo::rerun-if-changed=data/icons/scalable/actions/checkmark-small-symbolic.svg");
+    println!("cargo::rerun-if-changed=data/icons/scalable/actions/clock-symbolic.svg");
     println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-month-symbolic.svg");
     println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-week-symbolic.svg");
     println!("cargo::rerun-if-changed=data/icons/scalable/emblems/calendar-agenda-symbolic.svg");

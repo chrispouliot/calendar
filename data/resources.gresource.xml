@@ -20,6 +20,7 @@
   <gresource prefix="/dev/chris/calendar">
     <file compressed="true">icons/hicolor/scalable/apps/dev.chris.calendar.svg</file>
     <file compressed="true">icons/scalable/actions/checkmark-small-symbolic.svg</file>
+    <file compressed="true">icons/scalable/actions/clock-symbolic.svg</file>
     <file compressed="true">icons/scalable/emblems/calendar-month-symbolic.svg</file>
     <file compressed="true">icons/scalable/emblems/calendar-week-symbolic.svg</file>
     <file compressed="true">icons/scalable/emblems/calendar-agenda-symbolic.svg</file>

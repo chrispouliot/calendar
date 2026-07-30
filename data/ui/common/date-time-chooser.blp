@@ -1,50 +1,106 @@
 using Gtk 4.0;
 using Adw 1;
 
-template $DateTimeChooser: Adw.PreferencesGroup {
-  $DateChooserRow date_row {}
+template $DateTimeChooser: Box {
+  orientation: vertical;
+  spacing: 6;
 
-  Adw.ActionRow time_row {
-    activatable: true;
+  Adw.PreferencesGroup date_group {
+    $DateChooserRow start_date_row {
+      title: _("Start Date");
+    }
+    $DateChooserRow end_date_row {
+      title: _("End Date");
+    }
+  }
 
-    MenuButton time_button {
-      icon-name: "clock-alt-symbolic";
-      valign: center;
-      tooltip-text: _("Edit Time");
+  Box time_card {
+    orientation: vertical;
+    spacing: 8;
+    margin-top: 4;
+    margin-bottom: 4;
+    margin-start: 4;
+    margin-end: 4;
+    styles ["card", "time-card"]
 
-      popover: Popover time_popover {
-        position: bottom;
+    Box summary_box {
+      orientation: horizontal;
+      spacing: 6;
+
+      ToggleButton start_summary {
+        hexpand: true;
         child: Box {
-          orientation: horizontal;
-          spacing: 8;
-          margin-top: 12;
-          margin-bottom: 12;
-          margin-start: 12;
-          margin-end: 12;
-
-          SpinButton hour_spin {
-            width-request: 58;
-            numeric: true;
-            digits: 0;
-          }
-
-          Label { label: ":"; }
-
-          SpinButton minute_spin {
-            width-request: 58;
-            numeric: true;
-            digits: 0;
-          }
-
-          DropDown period_dropdown {
-            width-request: 72;
-          }
+          orientation: vertical;
+          halign: start;
+          spacing: 2;
+          Label start_caption { xalign: 0; styles ["caption", "dim-label"] }
+          Label start_value { xalign: 0; styles ["title-3"] }
         };
-      };
+        styles ["time-summary"]
+      }
 
-      styles [
-        "flat",
-      ]
+      ToggleButton end_summary {
+        hexpand: true;
+        child: Box {
+          orientation: vertical;
+          halign: start;
+          spacing: 2;
+          Label end_caption { xalign: 0; styles ["caption", "dim-label"] }
+          Label end_value { xalign: 0; styles ["title-3"] }
+        };
+        styles ["time-summary"]
+      }
+    }
+
+    Box choices_box {
+      orientation: horizontal;
+      spacing: 8;
+
+      Box hour_column {
+        orientation: vertical;
+        spacing: 4;
+        hexpand: true;
+        Label { label: _("HOUR"); xalign: 0; styles ["caption", "dim-label"] }
+        Grid hour_grid {
+          row-spacing: 6;
+          column-spacing: 6;
+          row-homogeneous: true;
+          column-homogeneous: true;
+        }
+      }
+
+      Separator { orientation: vertical; }
+
+      Box minute_column {
+        orientation: vertical;
+        spacing: 4;
+        hexpand: true;
+        Label { label: _("MINUTE"); xalign: 0; styles ["caption", "dim-label"] }
+        Grid minute_grid {
+          row-spacing: 6;
+          column-spacing: 6;
+          row-homogeneous: true;
+          column-homogeneous: true;
+        }
+      }
+    }
+
+    Separator {}
+
+    Box period_box {
+      orientation: horizontal;
+      spacing: 0;
+      halign: start;
+      styles ["linked", "time-period"]
+
+      ToggleButton am_button {
+        label: _("AM");
+        width-request: 64;
+      }
+      ToggleButton pm_button {
+        label: _("PM");
+        width-request: 64;
+      }
     }
   }
 }
