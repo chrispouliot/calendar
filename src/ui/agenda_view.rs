@@ -863,7 +863,9 @@ fn create_empty_today_widget(
             .css_classes(["dim-label"])
             .build(),
     );
-    card.append(&create_new_event_button(view_weak));
+    let new_event_button = create_new_event_button(view_weak);
+    new_event_button.set_valign(gtk::Align::Center);
+    card.append(&new_event_button);
     group.append(&card);
     group
 }
