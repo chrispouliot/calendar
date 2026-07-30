@@ -5,6 +5,7 @@ pub mod calendar_grid;
 pub mod model;
 pub mod month_view;
 pub mod preferences;
+pub mod recurrence_form;
 pub mod time_format;
 pub mod view_state;
 pub mod viewer_time;

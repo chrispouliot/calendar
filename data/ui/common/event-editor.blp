@@ -98,16 +98,64 @@ template $EventEditor: Adw.Dialog {
         }
 
         Adw.PreferencesGroup recurrence_reminder_group {
-          Adw.ActionRow repeat_row {
+          Adw.ComboRow repeat_row {
             title: _("Repeat");
-            subtitle: _("Does not repeat");
-            activatable: false;
+          }
+
+          Adw.ActionRow repeat_interval_row {
+            title: _("Repeat Every");
+            visible: false;
 
             [suffix]
-            Label {
-              label: _("Additional options unavailable");
-              styles ["dim-label"]
+            SpinButton repeat_interval_spin {
+              numeric: true;
+              digits: 0;
+              valign: center;
+              width-request: 80;
             }
+          }
+
+          Adw.ActionRow repeat_weekdays_row {
+            title: _("On These Days");
+            visible: false;
+
+            [suffix]
+            Box repeat_weekdays_box {
+              spacing: 4;
+              homogeneous: true;
+              valign: center;
+            }
+          }
+
+          Adw.ComboRow repeat_end_row {
+            title: _("End Repeat");
+            visible: false;
+          }
+
+          Adw.ActionRow repeat_count_row {
+            title: _("Number of Occurrences");
+            visible: false;
+
+            [suffix]
+            SpinButton repeat_count_spin {
+              numeric: true;
+              digits: 0;
+              valign: center;
+              width-request: 100;
+            }
+          }
+
+          $DateChooserRow until_date_row {
+            title: _("End Repeat Date");
+            visible: false;
+          }
+
+          Label custom_recurrence_label {
+            label: _("Custom recurrence is read-only here. Choose a replacement to simplify it.");
+            wrap: true;
+            xalign: 0.0;
+            visible: false;
+            styles ["dim-label"]
           }
 
           Adw.ComboRow reminders_row {

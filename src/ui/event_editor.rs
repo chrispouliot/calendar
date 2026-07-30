@@ -3,6 +3,10 @@ use std::cell::{Cell, RefCell};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event, EventSchedule, ReminderSpec, validate_event};
+use calendar::recurrence_form::{
+    EndCondition, Frequency, RecurrenceForm, RecurrencePresentation, Weekday, recurrence_from_form,
+    recurrence_presentation,
+};
 use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike,
 };
@@ -13,6 +17,9 @@ type SaveFn = Box<dyn Fn(Event, bool) -> bool>;
 type DeleteFn = Box<dyn Fn(Uuid) -> bool>;
 
 const KEEP_EXISTING_REMINDERS_INDEX: u32 = 7;
+const REPEAT_CUSTOM_INDEX: u32 = 5;
+const END_COUNT: u32 = 1;
+const END_UNTIL: u32 = 2;
 
 #[derive(Clone)]
 pub struct OriginalTimedEvent {
@@ -44,7 +51,25 @@ mod imp {
         #[template_child]
         pub description_view: TemplateChild<gtk::TextView>,
         #[template_child]
-        pub repeat_row: TemplateChild<adw::ActionRow>,
+        pub repeat_row: TemplateChild<adw::ComboRow>,
+        #[template_child]
+        pub repeat_interval_row: TemplateChild<adw::ActionRow>,
+        #[template_child]
+        pub repeat_interval_spin: TemplateChild<gtk::SpinButton>,
+        #[template_child]
+        pub repeat_weekdays_row: TemplateChild<adw::ActionRow>,
+        #[template_child]
+        pub repeat_weekdays_box: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub repeat_end_row: TemplateChild<adw::ComboRow>,
+        #[template_child]
+        pub repeat_count_row: TemplateChild<adw::ActionRow>,
+        #[template_child]
+        pub repeat_count_spin: TemplateChild<gtk::SpinButton>,
+        #[template_child]
+        pub until_date_row: TemplateChild<crate::ui::date_chooser_row::DateChooserRow>,
+        #[template_child]
+        pub custom_recurrence_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub reminders_row: TemplateChild<adw::ComboRow>,
         #[template_child]
@@ -64,6 +89,8 @@ mod imp {
         pub timed_schedule_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
         pub reminder_selection_user_changed: Cell<bool>,
         pub reminder_selection_syncing: Cell<bool>,
+        pub recurrence_syncing: Cell<bool>,
+        pub weekday_buttons: RefCell<Vec<gtk::ToggleButton>>,
         pub on_save: RefCell<Option<SaveFn>>,
         pub on_delete: RefCell<Option<DeleteFn>>,
     }
@@ -96,6 +123,52 @@ mod imp {
             *self.end_date_row_state.borrow_mut() = Some(end_date_row.clone());
             *self.timed_schedule_state.borrow_mut() = Some(timed_schedule.clone());
 
+            self.repeat_interval_spin
+                .set_adjustment(&gtk::Adjustment::new(
+                    1.0,
+                    1.0,
+                    999_999_999.0,
+                    1.0,
+                    10.0,
+                    0.0,
+                ));
+            self.repeat_count_spin.set_adjustment(&gtk::Adjustment::new(
+                1.0,
+                1.0,
+                999_999_999.0,
+                1.0,
+                10.0,
+                0.0,
+            ));
+            self.set_repeat_model(false);
+            self.repeat_end_row.set_model(Some(&gtk::StringList::new(&[
+                "Never",
+                "After a number of occurrences",
+                "Until a date",
+            ])));
+
+            for (label, weekday) in [
+                ("M", Weekday::Monday),
+                ("T", Weekday::Tuesday),
+                ("W", Weekday::Wednesday),
+                ("T", Weekday::Thursday),
+                ("F", Weekday::Friday),
+                ("S", Weekday::Saturday),
+                ("S", Weekday::Sunday),
+            ] {
+                let button = gtk::ToggleButton::with_label(label);
+                button.set_tooltip_text(Some(weekday_name(weekday)));
+                button.set_hexpand(true);
+                let weak = self.obj().downgrade();
+                button.connect_toggled(move |_| {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.imp().recurrence_controls_changed();
+                    }
+                });
+                self.repeat_weekdays_box.append(&button);
+                self.weekday_buttons.borrow_mut().push(button);
+            }
+
             let weak = self.obj().downgrade();
             start_date_row.set_on_date_changed(move |_| {
                 if let Some(editor) = weak.upgrade() {
@@ -112,6 +185,37 @@ mod imp {
             timed_schedule.set_on_changed(move || {
                 if let Some(editor) = weak.upgrade() {
                     editor.imp().schedule_changed();
+                }
+            });
+
+            let weak = self.obj().downgrade();
+            self.repeat_row.connect_selected_notify(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.imp().repeat_selection_changed();
+                }
+            });
+            let weak = self.obj().downgrade();
+            self.repeat_interval_spin.connect_value_changed(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.imp().recurrence_controls_changed();
+                }
+            });
+            let weak = self.obj().downgrade();
+            self.repeat_end_row.connect_selected_notify(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.imp().end_selection_changed();
+                }
+            });
+            let weak = self.obj().downgrade();
+            self.repeat_count_spin.connect_value_changed(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.imp().recurrence_controls_changed();
+                }
+            });
+            let weak = self.obj().downgrade();
+            self.until_date_row.set_on_date_changed(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.imp().recurrence_controls_changed();
                 }
             });
 
@@ -251,7 +355,7 @@ impl EventEditor {
         imp.title_entry.set_text(title);
         imp.location_entry.set_text("");
         imp.description_view.buffer().set_text("");
-        imp.set_placeholder_state(false, &[]);
+        imp.set_placeholder_state(&[]);
         *imp.original_timed_event.borrow_mut() = None;
         select_calendar(&imp.calendar_row, &imp.calendars.borrow(), calendar_id);
         imp.schedule_stack.set_visible_child_name("all-day");
@@ -264,6 +368,11 @@ impl EventEditor {
             end_date_row.set_date(date);
             timed_schedule.set_date_times(date, 9, 0, date, 10, 0);
         }
+        let schedule = EventSchedule::AllDay {
+            start_date: date,
+            end_date_exclusive: date.succ_opt().unwrap_or(date),
+        };
+        imp.set_recurrence_state(None, &schedule);
         imp.clear_error();
         imp.ensure_forward_range();
     }
@@ -275,7 +384,7 @@ impl EventEditor {
         imp.title_entry.set_text(&event.title);
         imp.location_entry.set_text(&event.location);
         imp.description_view.buffer().set_text(&event.description);
-        imp.set_placeholder_state(event.recurrence.is_some(), &event.reminders);
+        imp.set_placeholder_state(&event.reminders);
         select_calendar(
             &imp.calendar_row,
             &imp.calendars.borrow(),
@@ -331,6 +440,7 @@ impl EventEditor {
                 }
             }
         }
+        imp.set_recurrence_state(event.recurrence.as_ref(), &event.schedule);
         imp.clear_error();
         imp.ensure_forward_range();
     }
@@ -343,14 +453,184 @@ impl EventEditor {
 }
 
 impl imp::EventEditor {
-    fn set_placeholder_state(&self, has_recurrence: bool, reminders: &[ReminderSpec]) {
-        self.repeat_row.set_subtitle(if has_recurrence {
-            "Existing recurrence"
-        } else {
-            "Does not repeat"
-        });
-
+    fn set_placeholder_state(&self, reminders: &[ReminderSpec]) {
         self.set_reminder_selection(reminders);
+    }
+
+    fn set_repeat_model(&self, include_custom: bool) {
+        let mut labels = vec!["Does not repeat", "Daily", "Weekly", "Monthly", "Yearly"];
+        if include_custom {
+            labels.push("Custom recurrence (read-only — choose replacement)");
+        }
+        self.repeat_row
+            .set_model(Some(&gtk::StringList::new(&labels)));
+    }
+
+    fn set_recurrence_state(
+        &self,
+        recurrence: Option<&calendar::model::RecurrenceSpec>,
+        schedule: &EventSchedule,
+    ) {
+        let presentation = recurrence_presentation(recurrence, schedule);
+        self.recurrence_syncing.set(true);
+        self.until_date_row.set_date(schedule_start_date(schedule));
+        match presentation {
+            RecurrencePresentation::Editable { form, summary } => {
+                self.set_repeat_model(false);
+                self.repeat_row
+                    .set_selected(frequency_index(form.frequency));
+                self.repeat_row.set_subtitle(&summary);
+                self.repeat_interval_spin.set_value(form.interval as f64);
+                self.repeat_count_spin.set_value(1.0);
+                self.set_weekday_buttons(&form.weekdays);
+                self.repeat_end_row.set_selected(end_index(&form.end));
+                match form.end {
+                    EndCondition::Count(count) => self.repeat_count_spin.set_value(count as f64),
+                    EndCondition::Until(date) => self.until_date_row.set_date(date),
+                    EndCondition::Never => {}
+                }
+                self.custom_recurrence_label.set_visible(false);
+                self.apply_repeat_visibility(form.frequency, &form.end, false);
+            }
+            RecurrencePresentation::Custom { summary } => {
+                self.set_repeat_model(true);
+                self.repeat_row.set_selected(REPEAT_CUSTOM_INDEX);
+                self.repeat_row.set_subtitle(&summary);
+                self.custom_recurrence_label.set_label(&format!(
+                    "{summary}. This recurrence is read-only here; choose a replacement above to simplify it."
+                ));
+                self.custom_recurrence_label.set_visible(true);
+                self.apply_repeat_visibility(Frequency::None, &EndCondition::Never, true);
+            }
+        }
+        self.recurrence_syncing.set(false);
+    }
+
+    fn set_weekday_buttons(&self, selected: &[Weekday]) {
+        for (index, button) in self.weekday_buttons.borrow().iter().enumerate() {
+            button.set_active(selected.contains(&weekday_for_index(index)));
+        }
+    }
+
+    fn repeat_selection_changed(&self) {
+        if self.recurrence_syncing.get() {
+            return;
+        }
+        let frequency = self.selected_frequency();
+        if frequency == Frequency::Weekly
+            && self.selected_weekdays().is_empty()
+            && let Some(date) = self.current_start_date()
+        {
+            self.set_weekday_buttons(&[weekday_for_date(date)]);
+        }
+        let custom = self.repeat_is_custom();
+        self.custom_recurrence_label.set_visible(custom);
+        self.apply_repeat_visibility(frequency, &self.selected_end(), custom);
+        self.recurrence_controls_changed();
+    }
+
+    fn end_selection_changed(&self) {
+        if self.recurrence_syncing.get() {
+            return;
+        }
+        if self.repeat_end_row.selected() == END_UNTIL
+            && self.until_date_row.date().is_none()
+            && let Some(date) = self.current_start_date()
+        {
+            self.until_date_row.set_date(date);
+        }
+        self.apply_repeat_visibility(
+            self.selected_frequency(),
+            &self.selected_end(),
+            self.repeat_is_custom(),
+        );
+        self.recurrence_controls_changed();
+    }
+
+    fn recurrence_controls_changed(&self) {
+        if self.recurrence_syncing.get() || self.repeat_is_custom() {
+            return;
+        }
+        let form = self.recurrence_form_from_controls();
+        let summary = summary_for_form(&form);
+        self.repeat_row.set_subtitle(&summary);
+    }
+
+    fn selected_frequency(&self) -> Frequency {
+        match self.repeat_row.selected() {
+            1 => Frequency::Daily,
+            2 => Frequency::Weekly,
+            3 => Frequency::Monthly,
+            4 => Frequency::Yearly,
+            _ => Frequency::None,
+        }
+    }
+
+    fn selected_end(&self) -> EndCondition {
+        match self.repeat_end_row.selected() {
+            END_COUNT => EndCondition::Count(self.repeat_count_spin.value().round() as u32),
+            END_UNTIL => self
+                .until_date_row
+                .date()
+                .map(EndCondition::Until)
+                .unwrap_or(EndCondition::Never),
+            _ => EndCondition::Never,
+        }
+    }
+
+    fn selected_weekdays(&self) -> Vec<Weekday> {
+        self.weekday_buttons
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, button)| button.is_active())
+            .map(|(index, _)| weekday_for_index(index))
+            .collect()
+    }
+
+    fn recurrence_form_from_controls(&self) -> RecurrenceForm {
+        let frequency = self.selected_frequency();
+        RecurrenceForm {
+            frequency,
+            interval: self.repeat_interval_spin.value().round().max(1.0) as u32,
+            weekdays: if frequency == Frequency::Weekly {
+                self.selected_weekdays()
+            } else {
+                Vec::new()
+            },
+            end: self.selected_end(),
+        }
+    }
+
+    fn repeat_is_custom(&self) -> bool {
+        self.repeat_row.selected() == REPEAT_CUSTOM_INDEX
+    }
+
+    fn apply_repeat_visibility(&self, frequency: Frequency, end: &EndCondition, custom: bool) {
+        let repeating = !custom && frequency != Frequency::None;
+        self.repeat_interval_row.set_visible(repeating);
+        self.repeat_weekdays_row
+            .set_visible(repeating && frequency == Frequency::Weekly);
+        self.repeat_end_row.set_visible(repeating);
+        self.repeat_count_row
+            .set_visible(repeating && matches!(end, EndCondition::Count(_)));
+        self.until_date_row
+            .set_visible(repeating && matches!(end, EndCondition::Until(_)));
+    }
+
+    fn current_start_date(&self) -> Option<NaiveDate> {
+        if self.schedule_stack.visible_child_name().as_deref() == Some("all-day") {
+            self.start_date_row_state
+                .borrow()
+                .as_ref()
+                .and_then(|row| row.date())
+        } else {
+            self.timed_schedule_state
+                .borrow()
+                .as_ref()
+                .and_then(|chooser| chooser.start_date_time_parts())
+                .map(|parts| parts.0)
+        }
     }
 
     fn set_reminder_selection(&self, reminders: &[ReminderSpec]) {
@@ -625,6 +905,19 @@ impl imp::EventEditor {
             }
         };
 
+        let recurrence = if self.repeat_is_custom() {
+            base.as_ref().and_then(|event| event.recurrence.clone())
+        } else {
+            let form = self.recurrence_form_from_controls();
+            match recurrence_from_form(&form, &schedule) {
+                Ok(recurrence) => recurrence,
+                Err(error) => {
+                    self.show_error(&error.to_string());
+                    return;
+                }
+            }
+        };
+
         let buffer = self.description_view.buffer();
         let (start, end) = buffer.bounds();
         let description = buffer.text(&start, &end, false).to_string();
@@ -648,7 +941,7 @@ impl imp::EventEditor {
             location: self.location_entry.text().to_string(),
             description,
             schedule,
-            recurrence: base.as_ref().and_then(|event| event.recurrence.clone()),
+            recurrence,
             reminders,
         };
         let Ok(event) = validate_event(event) else {
@@ -691,6 +984,105 @@ fn reminder_choice_index(seconds_before_start: i64) -> Option<usize> {
         seconds if seconds == 60 * 60 => Some(5),
         seconds if seconds == 24 * 60 * 60 => Some(6),
         _ => None,
+    }
+}
+
+fn frequency_index(frequency: Frequency) -> u32 {
+    match frequency {
+        Frequency::None => 0,
+        Frequency::Daily => 1,
+        Frequency::Weekly => 2,
+        Frequency::Monthly => 3,
+        Frequency::Yearly => 4,
+    }
+}
+
+fn end_index(end: &EndCondition) -> u32 {
+    match end {
+        EndCondition::Never => 0,
+        EndCondition::Count(_) => END_COUNT,
+        EndCondition::Until(_) => END_UNTIL,
+    }
+}
+
+fn weekday_for_index(index: usize) -> Weekday {
+    match index {
+        0 => Weekday::Monday,
+        1 => Weekday::Tuesday,
+        2 => Weekday::Wednesday,
+        3 => Weekday::Thursday,
+        4 => Weekday::Friday,
+        5 => Weekday::Saturday,
+        _ => Weekday::Sunday,
+    }
+}
+
+fn weekday_for_date(date: NaiveDate) -> Weekday {
+    match date.weekday().number_from_monday() {
+        1 => Weekday::Monday,
+        2 => Weekday::Tuesday,
+        3 => Weekday::Wednesday,
+        4 => Weekday::Thursday,
+        5 => Weekday::Friday,
+        6 => Weekday::Saturday,
+        _ => Weekday::Sunday,
+    }
+}
+
+fn schedule_start_date(schedule: &EventSchedule) -> NaiveDate {
+    match schedule {
+        EventSchedule::AllDay { start_date, .. } => *start_date,
+        EventSchedule::Timed { start, .. } => start.date_naive(),
+    }
+}
+
+fn weekday_name(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Monday => "Monday",
+        Weekday::Tuesday => "Tuesday",
+        Weekday::Wednesday => "Wednesday",
+        Weekday::Thursday => "Thursday",
+        Weekday::Friday => "Friday",
+        Weekday::Saturday => "Saturday",
+        Weekday::Sunday => "Sunday",
+    }
+}
+
+fn summary_for_form(form: &RecurrenceForm) -> String {
+    let mut summary = match form.frequency {
+        Frequency::None => "Does not repeat".to_owned(),
+        Frequency::Daily => unit_summary(form.interval, "day"),
+        Frequency::Weekly if form.weekdays.is_empty() => {
+            format!(
+                "{} (choose at least one day)",
+                unit_summary(form.interval, "week")
+            )
+        }
+        Frequency::Weekly => format!(
+            "{} on {}",
+            unit_summary(form.interval, "week"),
+            form.weekdays
+                .iter()
+                .map(|weekday| weekday_name(*weekday))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Frequency::Monthly => unit_summary(form.interval, "month"),
+        Frequency::Yearly => unit_summary(form.interval, "year"),
+    };
+    match form.end {
+        EndCondition::Never => {}
+        EndCondition::Count(count) => summary.push_str(&format!(" ({count} times)")),
+        EndCondition::Until(date) => summary.push_str(&format!(" until {date}")),
+    }
+    summary
+}
+
+fn unit_summary(interval: u32, unit: &str) -> String {
+    if interval == 1 {
+        format!("Every {unit}")
+    } else {
+        format!("Every {interval} {unit}s")
     }
 }
 
