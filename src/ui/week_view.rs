@@ -4,16 +4,18 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::model::{Calendar, Event, EventSchedule};
-use calendar::month_view::{DayProjection, EventChip, project_week};
+use calendar::model::{Calendar, DetachedEvent, Event, RecurrenceId};
+use calendar::month_view::{
+    DayProjection, EventChip, ViewerLocalSchedule, project_week_with_detached_events_in_timezone,
+};
 use calendar::preferences::format_wall_time;
 use calendar::view_state::{ViewKind, ViewState};
-use calendar::viewer_time::{now_local_fixed, to_local_fixed};
+use calendar::viewer_time::now_local_fixed;
 use chrono::{Datelike, NaiveDate, Timelike};
 use gtk::{gdk, glib, graphene, gsk};
 use uuid::Uuid;
 
-type EventActivateFn = Box<dyn Fn(Uuid, gtk::Widget)>;
+type EventActivateFn = Box<dyn Fn(Uuid, Option<RecurrenceId>, gtk::Widget)>;
 
 const HOUR_HEIGHT: f64 = 72.0;
 const MINUTES_PER_DAY: usize = 24 * 60;
@@ -123,7 +125,10 @@ impl WeekGrid {
         grid
     }
 
-    fn set_on_event_activate<F: Fn(Uuid, gtk::Widget) + 'static>(&self, f: F) {
+    fn set_on_event_activate<F: Fn(Uuid, Option<RecurrenceId>, gtk::Widget) + 'static>(
+        &self,
+        f: F,
+    ) {
         *self.imp().on_event_activate.borrow_mut() = Some(Box::new(f));
     }
 
@@ -133,7 +138,7 @@ impl WeekGrid {
         today: NaiveDate,
         now_minutes: Option<f64>,
         projections: &[DayProjection; 7],
-        events: &[Event],
+        events: &[(Event, Vec<DetachedEvent>)],
     ) {
         let imp = self.imp();
         for timed_button in imp.timed_buttons.borrow_mut().drain(..) {
@@ -143,22 +148,19 @@ impl WeekGrid {
         imp.today.set(today);
         imp.now_minutes.set(now_minutes);
 
-        let event_map: HashMap<Uuid, &Event> =
-            events.iter().map(|event| (event.id, event)).collect();
         let grid_weak = self.downgrade();
         let mut buttons = Vec::new();
 
         for (day, projection) in projections.iter().enumerate() {
             let mut segments = Vec::new();
             for chip in &projection.timed {
-                let Some(event) = event_map.get(&chip.event_id) else {
+                let Some((_, _)) = events.iter().find(|(event, _)| event.id == chip.event_id)
+                else {
                     continue;
                 };
-                let EventSchedule::Timed { start, end, .. } = &event.schedule else {
+                let Some((start, end)) = local_bounds_for_chip(chip) else {
                     continue;
                 };
-                let start = to_local_fixed(start);
-                let end = to_local_fixed(end);
                 let start_minutes = if start.date_naive() == dates[day] {
                     time_minutes(start.time())
                 } else {
@@ -284,6 +286,18 @@ impl WeekGrid {
     }
 }
 
+fn local_bounds_for_chip(
+    chip: &EventChip,
+) -> Option<(
+    chrono::DateTime<chrono::FixedOffset>,
+    chrono::DateTime<chrono::FixedOffset>,
+)> {
+    match &chip.viewer_local_schedule {
+        ViewerLocalSchedule::Timed { start, end } => Some((*start, *end)),
+        ViewerLocalSchedule::AllDay { .. } => None,
+    }
+}
+
 mod imp {
     use super::*;
 
@@ -304,7 +318,7 @@ mod imp {
         pub active_date: Cell<NaiveDate>,
         pub today_date: Cell<NaiveDate>,
         pub cached_calendars: RefCell<Vec<Calendar>>,
-        pub cached_events: RefCell<Vec<Event>>,
+        pub cached_events: RefCell<Vec<(Event, Vec<DetachedEvent>)>>,
         pub on_event_activate: RefCell<Option<EventActivateFn>>,
         pub initial_scroll_eligible: Cell<bool>,
         pub initial_scroll_pending: Cell<bool>,
@@ -377,11 +391,11 @@ mod imp {
 
             let week_grid = WeekGrid::new();
             let view_weak = self.obj().downgrade();
-            week_grid.set_on_event_activate(move |event_id, event_widget| {
+            week_grid.set_on_event_activate(move |event_id, recurrence_id, event_widget| {
                 if let Some(view) = view_weak.upgrade()
                     && let Some(callback) = view.imp().on_event_activate.borrow().as_ref()
                 {
-                    callback(event_id, event_widget);
+                    callback(event_id, recurrence_id, event_widget);
                 }
             });
             self.timeline_grid_bin.set_child(Some(&week_grid));
@@ -438,7 +452,10 @@ impl WeekView {
         glib::Object::new()
     }
 
-    pub fn set_on_event_activate<F: Fn(Uuid, gtk::Widget) + 'static>(&self, f: F) {
+    pub fn set_on_event_activate<F: Fn(Uuid, Option<RecurrenceId>, gtk::Widget) + 'static>(
+        &self,
+        f: F,
+    ) {
         *self.imp().on_event_activate.borrow_mut() = Some(Box::new(f));
     }
 
@@ -468,7 +485,7 @@ impl WeekView {
         self.render(&calendars, &events);
     }
 
-    pub fn render(&self, calendars: &[Calendar], events: &[Event]) {
+    pub fn render(&self, calendars: &[Calendar], events: &[(Event, Vec<DetachedEvent>)]) {
         self.suppress_focus_scrolling();
         let imp = self.imp();
         *imp.cached_calendars.borrow_mut() = calendars.to_vec();
@@ -476,7 +493,12 @@ impl WeekView {
 
         let state = ViewState::new(ViewKind::Week, imp.active_date.get());
         let dates = state.current_week_dates();
-        let projections = project_week(state.active_date(), calendars, events);
+        let projections = project_week_with_detached_events_in_timezone(
+            state.active_date(),
+            calendars,
+            events,
+            &chrono::Local,
+        );
         self.render_headers(&dates);
         self.render_all_day(&projections, events);
         if let Some(grid) = self.imp().week_grid.borrow().as_ref() {
@@ -520,14 +542,18 @@ impl WeekView {
         }
     }
 
-    fn render_all_day(&self, projections: &[DayProjection; 7], events: &[Event]) {
+    fn render_all_day(
+        &self,
+        projections: &[DayProjection; 7],
+        events: &[(Event, Vec<DetachedEvent>)],
+    ) {
         let imp = self.imp();
         while let Some(child) = imp.all_day_columns.first_child() {
             imp.all_day_columns.remove(&child);
         }
 
         let event_map: HashMap<Uuid, &Event> =
-            events.iter().map(|event| (event.id, event)).collect();
+            events.iter().map(|(event, _)| (event.id, event)).collect();
         let grid_weak = self
             .imp()
             .week_grid
@@ -776,6 +802,7 @@ fn create_event_button(
     button.set_child(Some(&content));
 
     let event_id = chip.event_id;
+    let recurrence_id = chip.original_recurrence_id.clone();
     let button_weak = button.downgrade();
     let grid_weak = grid_weak.clone();
     button.connect_clicked(move |_| {
@@ -783,7 +810,11 @@ fn create_event_button(
             && let Some(button) = button_weak.upgrade()
             && let Some(callback) = grid.imp().on_event_activate.borrow().as_ref()
         {
-            callback(event_id, button.upcast::<gtk::Widget>());
+            callback(
+                event_id,
+                recurrence_id.clone(),
+                button.upcast::<gtk::Widget>(),
+            );
         }
     });
     button

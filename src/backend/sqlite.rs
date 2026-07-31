@@ -1,14 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::str::FromStr;
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use reqwest::Url;
+use rrule::{RRuleSet, Tz as RRuleTz};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::model::{
-    Account, Calendar, CalendarSource, CalendarSyncState, DateTimeRange, Event, EventSchedule,
-    EventSyncState, PendingSyncOperation, RecurrenceSpec, ReminderSpec,
+    Account, Calendar, CalendarSource, CalendarSyncState, DateTimeRange, DetachedEvent, Event,
+    EventSchedule, EventSyncState, PendingSyncOperation, RecurrenceId, RecurrenceSpec,
+    ReminderSpec,
 };
 
 use super::{
@@ -16,9 +19,51 @@ use super::{
     PendingSyncOperationRepository, RemoteSnapshotSummary, RepositoryError, SyncStateRepository,
     caldav::{CaldavDiscovery, DiscoveredCalendar},
 };
+use crate::recurrence_form::{
+    RecurrencePresentation, recurrence_presentation, split_recurrence_at,
+};
 
 pub struct SqliteRepository {
     conn: Connection,
+}
+
+/// One-shot restoration state for a detached occurrence mutation.
+#[derive(Debug)]
+pub struct OccurrenceUndo {
+    master_event_id: Uuid,
+    recurrence_id: RecurrenceId,
+    prior_detached_event: Option<DetachedEvent>,
+    prior_pending_operation: Option<PendingSyncOperation>,
+    cancellation_pending_operation: Option<PendingSyncOperation>,
+    cancelled_child_id: Uuid,
+    restored: bool,
+}
+
+/// Result of splitting a recurring event into its original and future masters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowingEditResult {
+    future_master_id: Uuid,
+}
+
+impl FollowingEditResult {
+    pub fn future_master_id(&self) -> Uuid {
+        self.future_master_id
+    }
+}
+
+/// One-shot restoration state for deleting an occurrence and all following
+/// occurrences from a recurring master.
+#[derive(Debug)]
+pub struct FollowingUndo {
+    master_event_id: Uuid,
+    prior_event: Event,
+    truncated_event: Event,
+    prior_children: Vec<(Uuid, DetachedEvent)>,
+    remaining_children: Vec<(Uuid, DetachedEvent)>,
+    prior_sync_state: Option<EventSyncState>,
+    prior_pending_operation: Option<PendingSyncOperation>,
+    deletion_pending_operation: Option<PendingSyncOperation>,
+    restored: bool,
 }
 
 impl SqliteRepository {
@@ -107,11 +152,11 @@ impl SqliteRepository {
                      id BLOB PRIMARY KEY,
                      calendar_id BLOB NOT NULL,
                      event_id BLOB NOT NULL UNIQUE,
-                     remote_href TEXT NOT NULL,
-                     remote_uid TEXT NOT NULL,
-                     etag TEXT,
-                     UNIQUE (calendar_id, remote_href),
-                     FOREIGN KEY (calendar_id) REFERENCES calendars(id)
+                      remote_href TEXT NOT NULL,
+                      remote_uid TEXT NOT NULL,
+                      etag TEXT,
+                      UNIQUE (calendar_id, remote_href),
+                      FOREIGN KEY (calendar_id) REFERENCES calendars(id)
                          ON DELETE CASCADE,
                      FOREIGN KEY (event_id) REFERENCES events(id)
                          ON DELETE CASCADE
@@ -142,9 +187,54 @@ impl SqliteRepository {
                   CREATE INDEX IF NOT EXISTS pending_sync_operations_calendar_idx
                       ON pending_sync_operations(calendar_id, event_id);
 
-                 CREATE TABLE IF NOT EXISTS calendar_seed_state (
-                    id INTEGER PRIMARY KEY CHECK (id = 1)
-                );",
+                  CREATE TABLE IF NOT EXISTS calendar_seed_state (
+                     id INTEGER PRIMARY KEY CHECK (id = 1)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS detached_events (
+                     id BLOB PRIMARY KEY,
+                     master_event_id BLOB NOT NULL,
+                     recurrence_kind TEXT NOT NULL
+                         CHECK (recurrence_kind IN ('all_day', 'timed')),
+                     recurrence_date TEXT,
+                     recurrence_datetime TEXT,
+                     recurrence_timezone TEXT,
+                     recurrence_sort TEXT NOT NULL,
+                     cancelled INTEGER NOT NULL,
+                     title TEXT NOT NULL DEFAULT '',
+                     location TEXT NOT NULL DEFAULT '',
+                     description TEXT NOT NULL DEFAULT '',
+                     schedule_type TEXT
+                         CHECK (schedule_type IS NULL OR schedule_type IN ('all_day', 'timed')),
+                     start_date TEXT,
+                     end_date_exclusive TEXT,
+                     start_datetime TEXT,
+                     end_datetime TEXT,
+                     timezone TEXT,
+                     FOREIGN KEY (master_event_id) REFERENCES events(id)
+                         ON DELETE CASCADE
+                 );
+
+                 CREATE INDEX IF NOT EXISTS detached_events_master_idx
+                     ON detached_events(master_event_id, recurrence_sort, id);
+
+                 CREATE UNIQUE INDEX IF NOT EXISTS detached_events_master_recurrence_idx
+                     ON detached_events(
+                         master_event_id,
+                         recurrence_kind,
+                         COALESCE(recurrence_date, ''),
+                         COALESCE(recurrence_datetime, ''),
+                         COALESCE(recurrence_timezone, '')
+                     );
+
+                 CREATE TABLE IF NOT EXISTS detached_event_reminders (
+                     id BLOB PRIMARY KEY,
+                     detached_event_id BLOB NOT NULL,
+                     seconds_before_start INTEGER NOT NULL,
+                     description TEXT NOT NULL,
+                     FOREIGN KEY (detached_event_id) REFERENCES detached_events(id)
+                         ON DELETE CASCADE
+                 );",
             )
             .map_err(|_| RepositoryError)?;
 
@@ -245,6 +335,492 @@ impl SqliteRepository {
             }
         }
         Ok(false)
+    }
+
+    /// Replace the complete detached exception set for one recurring master.
+    /// The delete and inserts are committed as one unit so readers never see
+    /// a partially replaced resource.
+    pub fn replace_detached_events(
+        &mut self,
+        master_event_id: Uuid,
+        exceptions: &[DetachedEvent],
+    ) -> Result<(), RepositoryError> {
+        let mut recurrence_ids = HashSet::new();
+        if exceptions
+            .iter()
+            .any(|exception| !recurrence_ids.insert(detached_recurrence_identity(exception)))
+        {
+            return Err(RepositoryError);
+        }
+
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let master_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                params![master_event_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| RepositoryError)?;
+        if !master_exists {
+            return Err(RepositoryError);
+        }
+
+        replace_detached_events_in_transaction(&tx, master_event_id, exceptions)?;
+        tx.commit().map_err(|_| RepositoryError)
+    }
+
+    /// List detached exceptions in recurrence-id order.
+    pub fn list_detached_events(&self, master_event_id: Uuid) -> Vec<DetachedEvent> {
+        let mut statement = match self.conn.prepare(
+            "SELECT id, recurrence_kind, recurrence_date, recurrence_datetime,
+                    recurrence_timezone, cancelled, title, location, description,
+                    schedule_type, start_date, end_date_exclusive,
+                    start_datetime, end_datetime, timezone
+             FROM detached_events
+             WHERE master_event_id = ?1
+             ORDER BY recurrence_sort ASC, recurrence_kind ASC, id ASC",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        let mut events: Vec<(Uuid, DetachedEvent)> =
+            match statement.query_map(params![master_event_id], detached_event_from_row) {
+                Ok(rows) => rows.filter_map(|row| row.ok()).collect(),
+                Err(_) => return Vec::new(),
+            };
+        events
+            .drain(..)
+            .filter_map(|(id, mut event)| {
+                if let DetachedEvent::Modified { reminders, .. } = &mut event {
+                    *reminders = reminders_for_detached_event(&self.conn, id).ok()?;
+                }
+                Some(event)
+            })
+            .collect()
+    }
+
+    /// Replace one generated occurrence without disturbing any of its
+    /// siblings.  The sync operation is attached to the recurring master,
+    /// rather than to a detached row (detached rows have no remote identity).
+    pub fn upsert_occurrence_with_sync(
+        &mut self,
+        master_event_id: Uuid,
+        exception: &DetachedEvent,
+    ) -> Result<(), RepositoryError> {
+        let recurrence_id = detached_recurrence_id(exception);
+        if !matches!(exception, DetachedEvent::Modified { .. }) {
+            return Err(RepositoryError);
+        }
+
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let master = event_in_transaction(&tx, master_event_id)?;
+        if master.recurrence.is_none() {
+            return Err(RepositoryError);
+        }
+        let calendar = calendar_in_transaction(&tx, master.calendar_id)?;
+        if calendar.read_only || !occurrence_is_generated(&master, recurrence_id) {
+            return Err(RepositoryError);
+        }
+
+        let pending = pending_sync_operation_in_transaction(&tx, master_event_id)?;
+        let sync_state = event_sync_state_in_transaction(&tx, master_event_id)?;
+        let operation =
+            occurrence_pending_operation(&calendar, master_event_id, pending, sync_state)?;
+
+        if let Some((child_id, _)) =
+            detached_event_for_recurrence_in_transaction(&tx, master_event_id, recurrence_id)?
+        {
+            tx.execute(
+                "DELETE FROM detached_events WHERE id = ?1",
+                params![child_id],
+            )
+            .map_err(|_| RepositoryError)?;
+        }
+        insert_detached_event(&tx, master_event_id, exception)?;
+        if let Some(operation) = operation {
+            upsert_pending_sync_operation_in_transaction(&tx, &operation)?;
+        } else {
+            delete_pending_sync_operation_in_transaction(&tx, master_event_id)?;
+        }
+        tx.commit().map_err(|_| RepositoryError)
+    }
+
+    /// Cancel one generated occurrence and return a one-shot undo token.
+    pub fn cancel_occurrence_with_sync_undo(
+        &mut self,
+        master_event_id: Uuid,
+        recurrence_id: &RecurrenceId,
+    ) -> Result<OccurrenceUndo, RepositoryError> {
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let master = event_in_transaction(&tx, master_event_id)?;
+        if master.recurrence.is_none() {
+            return Err(RepositoryError);
+        }
+        let calendar = calendar_in_transaction(&tx, master.calendar_id)?;
+        if calendar.read_only || !occurrence_is_generated(&master, recurrence_id) {
+            return Err(RepositoryError);
+        }
+
+        let prior_pending_operation = pending_sync_operation_in_transaction(&tx, master_event_id)?;
+        let sync_state = event_sync_state_in_transaction(&tx, master_event_id)?;
+        let cancellation_pending_operation = occurrence_pending_operation(
+            &calendar,
+            master_event_id,
+            prior_pending_operation.clone(),
+            sync_state,
+        )?;
+        let prior_detached_event =
+            detached_event_for_recurrence_in_transaction(&tx, master_event_id, recurrence_id)?;
+        if let Some((child_id, _)) = &prior_detached_event {
+            tx.execute(
+                "DELETE FROM detached_events WHERE id = ?1",
+                params![child_id],
+            )
+            .map_err(|_| RepositoryError)?;
+        }
+        insert_detached_event(
+            &tx,
+            master_event_id,
+            &DetachedEvent::Cancelled {
+                recurrence_id: recurrence_id.clone(),
+            },
+        )?;
+        let cancelled_child_id =
+            detached_event_for_recurrence_in_transaction(&tx, master_event_id, recurrence_id)?
+                .map(|(id, _)| id)
+                .ok_or(RepositoryError)?;
+        if let Some(operation) = &cancellation_pending_operation {
+            upsert_pending_sync_operation_in_transaction(&tx, operation)?;
+        } else {
+            delete_pending_sync_operation_in_transaction(&tx, master_event_id)?;
+        }
+        tx.commit().map_err(|_| RepositoryError)?;
+
+        Ok(OccurrenceUndo {
+            master_event_id,
+            recurrence_id: recurrence_id.clone(),
+            prior_detached_event: prior_detached_event.map(|(_, event)| event),
+            prior_pending_operation,
+            cancellation_pending_operation,
+            cancelled_child_id,
+            restored: false,
+        })
+    }
+
+    /// Restore the child and pending-sync intent captured by a cancellation.
+    pub fn undo_occurrence_with_sync(
+        &mut self,
+        undo: &mut OccurrenceUndo,
+    ) -> Result<(), RepositoryError> {
+        if undo.restored {
+            return Err(RepositoryError);
+        }
+
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let current = detached_event_for_recurrence_in_transaction(
+            &tx,
+            undo.master_event_id,
+            &undo.recurrence_id,
+        )?;
+        let current_is_cancelled = current.as_ref().is_some_and(|(id, event)| {
+            *id == undo.cancelled_child_id
+                && event
+                    == &DetachedEvent::Cancelled {
+                        recurrence_id: undo.recurrence_id.clone(),
+                    }
+        });
+        if !current_is_cancelled {
+            return Err(RepositoryError);
+        }
+        let current_pending = pending_sync_operation_in_transaction(&tx, undo.master_event_id)?;
+        if current_pending != undo.cancellation_pending_operation {
+            return Err(RepositoryError);
+        }
+
+        tx.execute(
+            "DELETE FROM detached_events WHERE id = ?1",
+            params![undo.cancelled_child_id],
+        )
+        .map_err(|_| RepositoryError)?;
+        if let Some(event) = &undo.prior_detached_event {
+            insert_detached_event(&tx, undo.master_event_id, event)?;
+        }
+        delete_pending_sync_operation_in_transaction(&tx, undo.master_event_id)?;
+        if let Some(operation) = &undo.prior_pending_operation {
+            upsert_pending_sync_operation_in_transaction(&tx, operation)?;
+        }
+        tx.commit().map_err(|_| RepositoryError)?;
+        undo.restored = true;
+        Ok(())
+    }
+
+    /// Split a writable recurring master immediately before one modified
+    /// occurrence. Detached exceptions after the split are moved to the new
+    /// master and their recurrence identities are rebased to its schedule.
+    pub fn edit_this_and_following_with_sync(
+        &mut self,
+        master_event_id: Uuid,
+        edited: &DetachedEvent,
+    ) -> Result<FollowingEditResult, RepositoryError> {
+        self.edit_this_and_following_with_sync_inner(master_event_id, edited, None)
+    }
+
+    /// Split a writable recurring master while explicitly replacing the
+    /// recurrence of the future master.  Unlike the compatibility operation
+    /// above, this also permits an all-day master to become a timed future
+    /// series whose DTSTART is moved to another weekday.
+    pub fn edit_this_and_following_with_sync_and_recurrence(
+        &mut self,
+        master_event_id: Uuid,
+        edited: &DetachedEvent,
+        future_recurrence: &RecurrenceSpec,
+    ) -> Result<FollowingEditResult, RepositoryError> {
+        self.edit_this_and_following_with_sync_inner(
+            master_event_id,
+            edited,
+            Some(future_recurrence),
+        )
+    }
+
+    fn edit_this_and_following_with_sync_inner(
+        &mut self,
+        master_event_id: Uuid,
+        edited: &DetachedEvent,
+        requested_future_recurrence: Option<&RecurrenceSpec>,
+    ) -> Result<FollowingEditResult, RepositoryError> {
+        let (recurrence_id, title, location, description, schedule, reminders) = match edited {
+            DetachedEvent::Modified {
+                recurrence_id,
+                title,
+                location,
+                description,
+                schedule,
+                reminders,
+            } => (
+                recurrence_id,
+                title,
+                location,
+                description,
+                schedule,
+                reminders,
+            ),
+            DetachedEvent::Cancelled { .. } => return Err(RepositoryError),
+        };
+
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let master = event_with_reminders_in_transaction(&tx, master_event_id)?;
+        let calendar = calendar_in_transaction(&tx, master.calendar_id)?;
+        if calendar.read_only
+            || !edited_schedule_is_supported(
+                &master,
+                recurrence_id,
+                schedule,
+                requested_future_recurrence.is_some(),
+            )
+        {
+            return Err(RepositoryError);
+        }
+        let split = split_recurrence_at(&master, recurrence_id).map_err(|_| RepositoryError)?;
+        let future_recurrence = requested_future_recurrence
+            .cloned()
+            .unwrap_or(split.future_recurrence);
+        if requested_future_recurrence.is_some()
+            && !future_recurrence_is_supported(schedule, &future_recurrence)
+        {
+            return Err(RepositoryError);
+        }
+
+        let prior_pending = pending_sync_operation_in_transaction(&tx, master_event_id)?;
+        let sync_state = event_sync_state_in_transaction(&tx, master_event_id)?;
+        let original_operation = occurrence_pending_operation(
+            &calendar,
+            master_event_id,
+            prior_pending,
+            sync_state.clone(),
+        )?;
+        let future_master_id = new_future_master_id(&tx, sync_state.as_ref())?;
+        let future = Event {
+            id: future_master_id,
+            calendar_id: master.calendar_id,
+            title: title.clone(),
+            location: location.clone(),
+            description: description.clone(),
+            schedule: schedule.clone(),
+            recurrence: Some(future_recurrence),
+            reminders: reminders.clone(),
+        };
+
+        // Validate and prepare every child before changing either master. A
+        // same-date time edit changes the generated identity of all following
+        // timed instances, so merely changing the child master would make
+        // those exceptions unresolvable.
+        let children = detached_events_in_transaction(&tx, master_event_id)?;
+        let split_sort = detached_recurrence_sort(recurrence_id);
+        let mut selected_child_ids = Vec::new();
+        let mut future_children = Vec::new();
+        for (id, child) in &children {
+            let child_id = detached_recurrence_id(child);
+            if detached_recurrence_ids_match(child_id, recurrence_id) {
+                selected_child_ids.push(*id);
+            } else if detached_recurrence_sort(child_id) > split_sort {
+                if !occurrence_is_generated(&master, child_id) {
+                    return Err(RepositoryError);
+                }
+                let rebased_id = rebase_following_recurrence_id(&master, &future, child_id)?;
+                future_children.push((*id, rebase_detached_event(child, rebased_id)));
+            }
+        }
+        let mut rebased_ids = HashSet::new();
+        if future_children
+            .iter()
+            .any(|(_, child)| !rebased_ids.insert(detached_recurrence_identity(child)))
+        {
+            return Err(RepositoryError);
+        }
+
+        let mut truncated = master.clone();
+        truncated.recurrence = Some(split.original_recurrence);
+        update_event_in_transaction(&tx, &truncated)?;
+
+        insert_event(&tx, &future)?;
+
+        for child_id in selected_child_ids {
+            tx.execute(
+                "DELETE FROM detached_events WHERE id = ?1",
+                params![child_id],
+            )
+            .map_err(|_| RepositoryError)?;
+        }
+        for (child_id, child) in future_children {
+            tx.execute(
+                "DELETE FROM detached_events WHERE id = ?1",
+                params![child_id],
+            )
+            .map_err(|_| RepositoryError)?;
+            insert_detached_event_with_id(&tx, future_master_id, &child, child_id)?;
+        }
+
+        if let Some(operation) = original_operation {
+            upsert_pending_sync_operation_in_transaction(&tx, &operation)?;
+        } else {
+            delete_pending_sync_operation_in_transaction(&tx, master_event_id)?;
+        }
+        if !matches!(calendar.source, CalendarSource::Local) {
+            let remote_uid = distinct_remote_uid(future_master_id, sync_state.as_ref());
+            upsert_pending_sync_operation_in_transaction(
+                &tx,
+                &PendingSyncOperation::Create {
+                    calendar_id: master.calendar_id,
+                    event_id: future_master_id,
+                    remote_uid,
+                },
+            )?;
+        }
+        tx.commit().map_err(|_| RepositoryError)?;
+        Ok(FollowingEditResult { future_master_id })
+    }
+
+    /// Delete one generated occurrence and all following occurrences from a
+    /// recurring master, retaining a one-shot token for exact restoration.
+    pub fn delete_this_and_following_with_sync_undo(
+        &mut self,
+        master_event_id: Uuid,
+        recurrence_id: &RecurrenceId,
+    ) -> Result<FollowingUndo, RepositoryError> {
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let prior_event = event_with_reminders_in_transaction(&tx, master_event_id)?;
+        let calendar = calendar_in_transaction(&tx, prior_event.calendar_id)?;
+        if calendar.read_only || prior_event.recurrence.is_none() {
+            return Err(RepositoryError);
+        }
+        let truncated_recurrence = truncate_recurrence_for_delete(&prior_event, recurrence_id)?;
+        let prior_children = detached_events_in_transaction(&tx, master_event_id)?;
+        let split_sort = detached_recurrence_sort(recurrence_id);
+        let (remaining_children, removed_children): (Vec<_>, Vec<_>) =
+            prior_children.iter().cloned().partition(|(_, child)| {
+                detached_recurrence_sort(detached_recurrence_id(child)) < split_sort
+            });
+
+        let prior_pending_operation = pending_sync_operation_in_transaction(&tx, master_event_id)?;
+        let prior_sync_state = event_sync_state_in_transaction(&tx, master_event_id)?;
+        let deletion_pending_operation = occurrence_pending_operation(
+            &calendar,
+            master_event_id,
+            prior_pending_operation.clone(),
+            prior_sync_state.clone(),
+        )?;
+
+        let mut truncated_event = prior_event.clone();
+        truncated_event.recurrence = Some(truncated_recurrence);
+        update_event_in_transaction(&tx, &truncated_event)?;
+        for (child_id, _) in removed_children {
+            tx.execute(
+                "DELETE FROM detached_events WHERE id = ?1",
+                params![child_id],
+            )
+            .map_err(|_| RepositoryError)?;
+        }
+        if let Some(operation) = &deletion_pending_operation {
+            upsert_pending_sync_operation_in_transaction(&tx, operation)?;
+        } else {
+            delete_pending_sync_operation_in_transaction(&tx, master_event_id)?;
+        }
+        tx.commit().map_err(|_| RepositoryError)?;
+
+        Ok(FollowingUndo {
+            master_event_id,
+            prior_event,
+            truncated_event,
+            prior_children,
+            remaining_children,
+            prior_sync_state,
+            prior_pending_operation,
+            deletion_pending_operation,
+            restored: false,
+        })
+    }
+
+    /// Restore a following-occurrence deletion exactly once.
+    pub fn undo_this_and_following_with_sync(
+        &mut self,
+        undo: &mut FollowingUndo,
+    ) -> Result<(), RepositoryError> {
+        if undo.restored {
+            return Err(RepositoryError);
+        }
+        let tx = self.conn.transaction().map_err(|_| RepositoryError)?;
+        let current_event = event_with_reminders_in_transaction(&tx, undo.master_event_id)?;
+        let current_children = detached_events_in_transaction(&tx, undo.master_event_id)?;
+        let current_pending = pending_sync_operation_in_transaction(&tx, undo.master_event_id)?;
+        let current_sync_state = event_sync_state_in_transaction(&tx, undo.master_event_id)?;
+        if current_event != undo.truncated_event
+            || current_children != undo.remaining_children
+            || current_pending != undo.deletion_pending_operation
+            || current_sync_state != undo.prior_sync_state
+        {
+            return Err(RepositoryError);
+        }
+        let calendar = calendar_in_transaction(&tx, undo.prior_event.calendar_id)?;
+        if calendar.read_only {
+            return Err(RepositoryError);
+        }
+
+        update_event_in_transaction(&tx, &undo.prior_event)?;
+        tx.execute(
+            "DELETE FROM detached_events WHERE master_event_id = ?1",
+            params![undo.master_event_id],
+        )
+        .map_err(|_| RepositoryError)?;
+        for (child_id, child) in &undo.prior_children {
+            insert_detached_event_with_id(&tx, undo.master_event_id, child, *child_id)?;
+        }
+        delete_pending_sync_operation_in_transaction(&tx, undo.master_event_id)?;
+        if let Some(operation) = &undo.prior_pending_operation {
+            upsert_pending_sync_operation_in_transaction(&tx, operation)?;
+        }
+        tx.commit().map_err(|_| RepositoryError)?;
+        undo.restored = true;
+        Ok(())
     }
 
     /// Atomically persist an account and the calendars returned by CalDAV
@@ -486,28 +1062,34 @@ impl SqliteRepository {
 
             let event_id = tracked.map_or_else(Uuid::new_v4, |state| state.event_id);
             let mapped =
-                match super::caldav::map_icalendar_event(calendar_data, event_id, calendar_id) {
+                match super::caldav::map_icalendar_resource(calendar_data, event_id, calendar_id) {
                     Ok(mapped) => mapped,
                     Err(_) => {
                         summary.skipped += 1;
                         continue;
                     }
                 };
+            if !detached_events_are_valid(&mapped.exceptions) {
+                summary.skipped += 1;
+                continue;
+            }
             let state = EventSyncState {
                 calendar_id,
                 event_id,
                 remote_href: resource.href.clone(),
-                remote_uid: mapped.remote_uid,
+                remote_uid: mapped.master.remote_uid.clone(),
                 etag: resource.etag.clone(),
             };
 
             if tracked.is_some() {
-                replace_remote_event(&tx, &mapped.event)?;
+                replace_remote_event(&tx, &mapped.master.event)?;
                 upsert_event_sync_state_in_transaction(&tx, &state)?;
+                replace_detached_events_in_transaction(&tx, event_id, &mapped.exceptions)?;
                 summary.updated += 1;
             } else {
-                insert_event(&tx, &mapped.event)?;
+                insert_event(&tx, &mapped.master.event)?;
                 upsert_event_sync_state_in_transaction(&tx, &state)?;
+                replace_detached_events_in_transaction(&tx, event_id, &mapped.exceptions)?;
                 summary.added += 1;
             }
         }
@@ -629,28 +1211,34 @@ impl SqliteRepository {
 
             let event_id = tracked.map_or_else(Uuid::new_v4, |state| state.event_id);
             let mapped =
-                match super::caldav::map_icalendar_event(calendar_data, event_id, calendar_id) {
+                match super::caldav::map_icalendar_resource(calendar_data, event_id, calendar_id) {
                     Ok(mapped) => mapped,
                     Err(_) => {
                         summary.skipped += 1;
                         continue;
                     }
                 };
+            if !detached_events_are_valid(&mapped.exceptions) {
+                summary.skipped += 1;
+                continue;
+            }
             let state = EventSyncState {
                 calendar_id,
                 event_id,
                 remote_href: resource.href.clone(),
-                remote_uid: mapped.remote_uid,
+                remote_uid: mapped.master.remote_uid.clone(),
                 etag: resource.etag.clone(),
             };
 
             if tracked.is_some() {
-                replace_remote_event(&tx, &mapped.event)?;
+                replace_remote_event(&tx, &mapped.master.event)?;
                 upsert_event_sync_state_in_transaction(&tx, &state)?;
+                replace_detached_events_in_transaction(&tx, event_id, &mapped.exceptions)?;
                 summary.updated += 1;
             } else {
-                insert_event(&tx, &mapped.event)?;
+                insert_event(&tx, &mapped.master.event)?;
                 upsert_event_sync_state_in_transaction(&tx, &state)?;
+                replace_detached_events_in_transaction(&tx, event_id, &mapped.exceptions)?;
                 summary.added += 1;
             }
         }
@@ -1893,6 +2481,975 @@ fn recurrence_from_storage(data: &str) -> RecurrenceSpec {
         }
     }
     recurrence
+}
+
+fn detached_event_from_row(row: &rusqlite::Row) -> rusqlite::Result<(Uuid, DetachedEvent)> {
+    let id: Uuid = row.get(0)?;
+    let recurrence_kind: String = row.get(1)?;
+    let recurrence_date: Option<NaiveDate> = row.get(2)?;
+    let recurrence_datetime: Option<DateTime<FixedOffset>> = row.get(3)?;
+    let recurrence_timezone: Option<String> = row.get(4)?;
+    let cancelled: bool = row.get::<_, i32>(5)? != 0;
+    let recurrence_id = match recurrence_kind.as_str() {
+        "all_day" => RecurrenceId::AllDay(recurrence_date.ok_or_else(|| {
+            rusqlite::Error::InvalidColumnName("missing all-day recurrence date".to_owned())
+        })?),
+        "timed" => RecurrenceId::Timed {
+            date_time: recurrence_datetime.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("missing timed recurrence date".to_owned())
+            })?,
+            timezone: recurrence_timezone,
+        },
+        _ => {
+            return Err(rusqlite::Error::InvalidColumnName(
+                "unknown detached recurrence kind".to_owned(),
+            ));
+        }
+    };
+
+    if cancelled {
+        return Ok((id, DetachedEvent::Cancelled { recurrence_id }));
+    }
+
+    let title: String = row.get(6)?;
+    let location: String = row.get(7)?;
+    let description: String = row.get(8)?;
+    let schedule_type: String = row.get::<_, Option<String>>(9)?.ok_or_else(|| {
+        rusqlite::Error::InvalidColumnName("missing detached schedule type".to_owned())
+    })?;
+    let schedule = match schedule_type.as_str() {
+        "all_day" => EventSchedule::AllDay {
+            start_date: row.get::<_, Option<NaiveDate>>(10)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("missing detached start date".to_owned())
+            })?,
+            end_date_exclusive: row.get::<_, Option<NaiveDate>>(11)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("missing detached end date".to_owned())
+            })?,
+        },
+        "timed" => EventSchedule::Timed {
+            start: row
+                .get::<_, Option<DateTime<FixedOffset>>>(12)?
+                .ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnName("missing detached start datetime".to_owned())
+                })?,
+            end: row
+                .get::<_, Option<DateTime<FixedOffset>>>(13)?
+                .ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnName("missing detached end datetime".to_owned())
+                })?,
+            timezone: row.get(14)?,
+        },
+        _ => {
+            return Err(rusqlite::Error::InvalidColumnName(
+                "unknown detached schedule type".to_owned(),
+            ));
+        }
+    };
+
+    Ok((
+        id,
+        DetachedEvent::Modified {
+            recurrence_id,
+            title,
+            location,
+            description,
+            schedule,
+            reminders: Vec::new(),
+        },
+    ))
+}
+
+fn detached_recurrence_sort(recurrence_id: &RecurrenceId) -> String {
+    match recurrence_id {
+        RecurrenceId::AllDay(date) => format!("{}T00:00:00+00:00", date.format("%Y-%m-%d")),
+        RecurrenceId::Timed { date_time, .. } => date_time.with_timezone(&Utc).to_rfc3339(),
+    }
+}
+
+fn detached_recurrence_identity(detached: &DetachedEvent) -> (String, String, Option<String>) {
+    let recurrence_id = match detached {
+        DetachedEvent::Modified { recurrence_id, .. }
+        | DetachedEvent::Cancelled { recurrence_id } => recurrence_id,
+    };
+    match recurrence_id {
+        RecurrenceId::AllDay(date) => ("all_day".to_owned(), date.to_string(), None),
+        RecurrenceId::Timed {
+            date_time,
+            timezone,
+        } => ("timed".to_owned(), date_time.to_rfc3339(), timezone.clone()),
+    }
+}
+
+fn detached_events_are_valid(exceptions: &[DetachedEvent]) -> bool {
+    let mut recurrence_ids = HashSet::new();
+    exceptions
+        .iter()
+        .all(|exception| recurrence_ids.insert(detached_recurrence_identity(exception)))
+}
+
+fn replace_detached_events_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    master_event_id: Uuid,
+    exceptions: &[DetachedEvent],
+) -> Result<(), RepositoryError> {
+    tx.execute(
+        "DELETE FROM detached_events WHERE master_event_id = ?1",
+        params![master_event_id],
+    )
+    .map_err(|_| RepositoryError)?;
+    for exception in exceptions {
+        insert_detached_event(tx, master_event_id, exception)?;
+    }
+    Ok(())
+}
+
+fn insert_detached_event(
+    tx: &rusqlite::Transaction<'_>,
+    master_event_id: Uuid,
+    detached: &DetachedEvent,
+) -> Result<(), RepositoryError> {
+    insert_detached_event_with_id(tx, master_event_id, detached, Uuid::new_v4())
+}
+
+fn insert_detached_event_with_id(
+    tx: &rusqlite::Transaction<'_>,
+    master_event_id: Uuid,
+    detached: &DetachedEvent,
+    id: Uuid,
+) -> Result<(), RepositoryError> {
+    let (recurrence_id, cancelled, title, location, description, schedule, reminders) =
+        match detached {
+            DetachedEvent::Modified {
+                recurrence_id,
+                title,
+                location,
+                description,
+                schedule,
+                reminders,
+            } => (
+                recurrence_id,
+                false,
+                title.as_str(),
+                location.as_str(),
+                description.as_str(),
+                Some(schedule),
+                reminders.as_slice(),
+            ),
+            DetachedEvent::Cancelled { recurrence_id } => {
+                (recurrence_id, true, "", "", "", None, &[][..])
+            }
+        };
+
+    let (recurrence_kind, recurrence_date, recurrence_datetime, recurrence_timezone) =
+        match recurrence_id {
+            RecurrenceId::AllDay(date) => ("all_day", Some(*date), None, None::<String>),
+            RecurrenceId::Timed {
+                date_time,
+                timezone,
+            } => ("timed", None, Some(*date_time), timezone.clone()),
+        };
+
+    let mut schedule_type = None;
+    let mut start_date = None;
+    let mut end_date_exclusive = None;
+    let mut start_datetime = None;
+    let mut end_datetime = None;
+    let mut schedule_timezone = None;
+    if let Some(schedule) = schedule {
+        match schedule {
+            EventSchedule::AllDay {
+                start_date: start,
+                end_date_exclusive: end,
+            } => {
+                schedule_type = Some("all_day");
+                start_date = Some(*start);
+                end_date_exclusive = Some(*end);
+            }
+            EventSchedule::Timed {
+                start,
+                end,
+                timezone,
+            } => {
+                schedule_type = Some("timed");
+                start_datetime = Some(*start);
+                end_datetime = Some(*end);
+                schedule_timezone = timezone.clone();
+            }
+        }
+    }
+
+    tx.execute(
+        "INSERT INTO detached_events
+             (id, master_event_id, recurrence_kind, recurrence_date,
+              recurrence_datetime, recurrence_timezone, recurrence_sort, cancelled,
+              title, location, description, schedule_type, start_date,
+              end_date_exclusive, start_datetime, end_datetime, timezone)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            id,
+            master_event_id,
+            recurrence_kind,
+            recurrence_date,
+            recurrence_datetime,
+            recurrence_timezone,
+            detached_recurrence_sort(recurrence_id),
+            cancelled as i32,
+            title,
+            location,
+            description,
+            schedule_type,
+            start_date,
+            end_date_exclusive,
+            start_datetime,
+            end_datetime,
+            schedule_timezone,
+        ],
+    )
+    .map_err(|_| RepositoryError)?;
+
+    for reminder in reminders {
+        tx.execute(
+            "INSERT INTO detached_event_reminders
+                 (id, detached_event_id, seconds_before_start, description)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                Uuid::new_v4(),
+                id,
+                reminder.seconds_before_start,
+                reminder.description,
+            ],
+        )
+        .map_err(|_| RepositoryError)?;
+    }
+    Ok(())
+}
+
+fn reminders_for_detached_event(
+    conn: &Connection,
+    detached_event_id: Uuid,
+) -> rusqlite::Result<Vec<ReminderSpec>> {
+    let mut statement = conn.prepare(
+        "SELECT seconds_before_start, description
+         FROM detached_event_reminders
+         WHERE detached_event_id = ?1
+         ORDER BY rowid",
+    )?;
+    statement
+        .query_map(params![detached_event_id], |row| {
+            Ok(ReminderSpec {
+                seconds_before_start: row.get(0)?,
+                description: row.get(1)?,
+            })
+        })?
+        .collect()
+}
+
+fn event_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: Uuid,
+) -> Result<Event, RepositoryError> {
+    tx.query_row(
+        "SELECT id, calendar_id, title, location, description,
+                schedule_type, start_date, end_date_exclusive,
+                start_datetime, end_datetime, timezone,
+                start_unix, recurrence_enabled, recurrence_data
+         FROM events WHERE id = ?1",
+        params![event_id],
+        event_from_row,
+    )
+    .optional()
+    .map_err(|_| RepositoryError)?
+    .ok_or(RepositoryError)
+}
+
+fn event_with_reminders_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: Uuid,
+) -> Result<Event, RepositoryError> {
+    let mut event = event_in_transaction(tx, event_id)?;
+    event.reminders = reminders_for_event(tx, event_id).map_err(|_| RepositoryError)?;
+    Ok(event)
+}
+
+fn detached_events_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    master_event_id: Uuid,
+) -> Result<Vec<(Uuid, DetachedEvent)>, RepositoryError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT id, recurrence_kind, recurrence_date, recurrence_datetime,
+                    recurrence_timezone, cancelled, title, location, description,
+                    schedule_type, start_date, end_date_exclusive,
+                    start_datetime, end_datetime, timezone
+             FROM detached_events
+             WHERE master_event_id = ?1
+             ORDER BY recurrence_sort ASC, recurrence_kind ASC, id ASC",
+        )
+        .map_err(|_| RepositoryError)?;
+    let rows = statement
+        .query_map(params![master_event_id], detached_event_from_row)
+        .map_err(|_| RepositoryError)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| RepositoryError)?;
+    drop(statement);
+    rows.into_iter()
+        .map(|(id, mut event)| {
+            if let DetachedEvent::Modified { reminders, .. } = &mut event {
+                *reminders = reminders_for_detached_event(tx, id).map_err(|_| RepositoryError)?;
+            }
+            Ok((id, event))
+        })
+        .collect()
+}
+
+fn new_future_master_id(
+    tx: &rusqlite::Transaction<'_>,
+    sync_state: Option<&EventSyncState>,
+) -> Result<Uuid, RepositoryError> {
+    for _ in 0..8 {
+        let id = Uuid::new_v4();
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|_| RepositoryError)?;
+        if !exists
+            && distinct_remote_uid(id, sync_state)
+                != sync_state.map(|s| s.remote_uid.clone()).unwrap_or_default()
+        {
+            return Ok(id);
+        }
+    }
+    Err(RepositoryError)
+}
+
+fn distinct_remote_uid(id: Uuid, sync_state: Option<&EventSyncState>) -> String {
+    let uid = id.to_string();
+    if sync_state.is_some_and(|state| state.remote_uid == uid) {
+        format!("{uid}-following")
+    } else {
+        uid
+    }
+}
+
+fn edited_schedule_is_supported(
+    master: &Event,
+    recurrence_id: &RecurrenceId,
+    schedule: &EventSchedule,
+    allow_kind_change: bool,
+) -> bool {
+    if allow_kind_change
+        && let (
+            EventSchedule::AllDay { .. },
+            RecurrenceId::AllDay(_),
+            EventSchedule::Timed {
+                start,
+                end,
+                timezone,
+            },
+        ) = (&master.schedule, recurrence_id, schedule)
+    {
+        return end > start
+            && timezone
+                .as_deref()
+                .map(|timezone| chrono_tz::Tz::from_str(timezone).is_ok())
+                .unwrap_or(true);
+    }
+
+    match (&master.schedule, recurrence_id, schedule) {
+        (
+            EventSchedule::AllDay { .. },
+            RecurrenceId::AllDay(date),
+            EventSchedule::AllDay {
+                start_date,
+                end_date_exclusive,
+            },
+        ) => start_date == date && end_date_exclusive > start_date,
+        (
+            EventSchedule::Timed { timezone, .. },
+            RecurrenceId::Timed {
+                date_time,
+                timezone: identity_timezone,
+            },
+            EventSchedule::Timed {
+                start,
+                end,
+                timezone: edited_timezone,
+            },
+        ) => {
+            timezone == edited_timezone
+                && end > start
+                && match timezone.as_deref() {
+                    Some(timezone) => chrono_tz::Tz::from_str(timezone)
+                        .map(|timezone| {
+                            start.with_timezone(&timezone).date_naive()
+                                == date_time.with_timezone(&timezone).date_naive()
+                        })
+                        .unwrap_or(false),
+                    None => {
+                        identity_timezone.is_none() && start.date_naive() == date_time.date_naive()
+                    }
+                }
+        }
+        _ => false,
+    }
+}
+
+fn future_recurrence_is_supported(schedule: &EventSchedule, recurrence: &RecurrenceSpec) -> bool {
+    matches!(
+        recurrence_presentation(Some(recurrence), schedule),
+        RecurrencePresentation::Editable { .. }
+    )
+}
+
+fn rebase_detached_event(detached: &DetachedEvent, recurrence_id: RecurrenceId) -> DetachedEvent {
+    match detached {
+        DetachedEvent::Modified {
+            title,
+            location,
+            description,
+            schedule,
+            reminders,
+            ..
+        } => DetachedEvent::Modified {
+            recurrence_id,
+            title: title.clone(),
+            location: location.clone(),
+            description: description.clone(),
+            schedule: schedule.clone(),
+            reminders: reminders.clone(),
+        },
+        DetachedEvent::Cancelled { .. } => DetachedEvent::Cancelled { recurrence_id },
+    }
+}
+
+fn rebase_following_recurrence_id(
+    master: &Event,
+    future: &Event,
+    recurrence_id: &RecurrenceId,
+) -> Result<RecurrenceId, RepositoryError> {
+    let date = detached_recurrence_date(master, recurrence_id).ok_or(RepositoryError)?;
+    let rebased = match &future.schedule {
+        EventSchedule::AllDay { .. } => RecurrenceId::AllDay(date),
+        EventSchedule::Timed { timezone, .. } => {
+            future_timed_recurrence_id_for_date(future, date, timezone.as_deref())?
+        }
+    };
+    if occurrence_is_generated(future, &rebased) {
+        Ok(rebased)
+    } else {
+        Err(RepositoryError)
+    }
+}
+
+fn detached_recurrence_date(master: &Event, recurrence_id: &RecurrenceId) -> Option<NaiveDate> {
+    match (&master.schedule, recurrence_id) {
+        (EventSchedule::AllDay { .. }, RecurrenceId::AllDay(date)) => Some(*date),
+        (
+            EventSchedule::Timed { timezone, .. },
+            RecurrenceId::Timed {
+                date_time,
+                timezone: identity_timezone,
+            },
+        ) if timezone == identity_timezone => match timezone.as_deref() {
+            Some(timezone) => chrono_tz::Tz::from_str(timezone)
+                .ok()
+                .map(|timezone| date_time.with_timezone(&timezone).date_naive()),
+            None => Some(date_time.date_naive()),
+        },
+        _ => None,
+    }
+}
+
+fn future_timed_recurrence_id_for_date(
+    future: &Event,
+    date: NaiveDate,
+    timezone: Option<&str>,
+) -> Result<RecurrenceId, RepositoryError> {
+    let recurrence = future.recurrence.as_ref().ok_or(RepositoryError)?;
+    let source = recurrence_source_for_timed(
+        match &future.schedule {
+            EventSchedule::Timed { start, .. } => *start,
+            _ => return Err(RepositoryError),
+        },
+        timezone,
+        recurrence,
+    )
+    .ok_or(RepositoryError)?;
+    let set = source.parse::<RRuleSet>().map_err(|_| RepositoryError)?;
+    let (lower, upper, rule_timezone) = match timezone {
+        Some(timezone) => {
+            let timezone = chrono_tz::Tz::from_str(timezone).map_err(|_| RepositoryError)?;
+            let lower = timezone
+                .from_local_datetime(&date.and_hms_opt(0, 0, 0).ok_or(RepositoryError)?)
+                .single()
+                .ok_or(RepositoryError)?;
+            let next_date = date.succ_opt().ok_or(RepositoryError)?;
+            let upper = timezone
+                .from_local_datetime(&next_date.and_hms_opt(0, 0, 0).ok_or(RepositoryError)?)
+                .single()
+                .ok_or(RepositoryError)?;
+            let rule_timezone = RRuleTz::from(timezone);
+            (
+                lower.with_timezone(&rule_timezone),
+                upper.with_timezone(&rule_timezone),
+                rule_timezone,
+            )
+        }
+        None => {
+            let utc = FixedOffset::east_opt(0).ok_or(RepositoryError)?;
+            let lower = utc
+                .from_local_datetime(&date.and_hms_opt(0, 0, 0).ok_or(RepositoryError)?)
+                .single()
+                .ok_or(RepositoryError)?
+                .with_timezone(&RRuleTz::UTC);
+            let next_date = date.succ_opt().ok_or(RepositoryError)?;
+            let upper = utc
+                .from_local_datetime(&next_date.and_hms_opt(0, 0, 0).ok_or(RepositoryError)?)
+                .single()
+                .ok_or(RepositoryError)?
+                .with_timezone(&RRuleTz::UTC);
+            (lower, upper, RRuleTz::UTC)
+        }
+    };
+    let mut occurrences = set
+        .after(lower - Duration::seconds(1))
+        .before(upper + Duration::seconds(1))
+        .all(u16::MAX)
+        .dates;
+    if let EventSchedule::Timed { start, .. } = &future.schedule {
+        let first = start.with_timezone(&rule_timezone);
+        if first >= lower - Duration::seconds(1) && first <= upper + Duration::seconds(1) {
+            occurrences.push(first);
+        }
+    }
+    occurrences.sort();
+    occurrences.dedup();
+    let occurrence = occurrences
+        .into_iter()
+        .find(|occurrence| occurrence.with_timezone(&rule_timezone).date_naive() == date)
+        .ok_or(RepositoryError)?;
+    Ok(RecurrenceId::Timed {
+        date_time: occurrence.fixed_offset(),
+        timezone: timezone.map(str::to_owned),
+    })
+}
+
+fn truncate_recurrence_for_delete(
+    master: &Event,
+    recurrence_id: &RecurrenceId,
+) -> Result<RecurrenceSpec, RepositoryError> {
+    match split_recurrence_at(master, recurrence_id) {
+        Ok(split) => Ok(split.original_recurrence),
+        Err(_) => {
+            let Some(recurrence) = master.recurrence.as_ref() else {
+                return Err(RepositoryError);
+            };
+            if !matches!(
+                recurrence_presentation(Some(recurrence), &master.schedule),
+                RecurrencePresentation::Editable { .. }
+            ) {
+                return Err(RepositoryError);
+            }
+            let Some(total) = recurrence_rule_count(recurrence.rrule.first().map(String::as_str))
+            else {
+                return Err(RepositoryError);
+            };
+            let Some(index) = generated_occurrence_index(master, recurrence_id) else {
+                return Err(RepositoryError);
+            };
+            if index == 0 || index.saturating_add(1) != total as usize {
+                return Err(RepositoryError);
+            }
+            Ok(RecurrenceSpec {
+                rrule: vec![rule_with_count(&recurrence.rrule[0], index as u32)],
+                rdate: Vec::new(),
+                exdate: Vec::new(),
+            })
+        }
+    }
+}
+
+fn recurrence_rule_count(rule: Option<&str>) -> Option<u32> {
+    rule?.split_once(':')?.1.split(';').find_map(|item| {
+        let (key, value) = item.split_once('=')?;
+        key.eq_ignore_ascii_case("COUNT")
+            .then(|| value.parse().ok())?
+    })
+}
+
+fn rule_with_count(rule: &str, count: u32) -> String {
+    let (property, value) = rule.split_once(':').expect("validated recurrence rule");
+    let mut found = false;
+    let mut items = Vec::new();
+    for item in value.split(';') {
+        if let Some((key, _)) = item.split_once('=') {
+            if key.eq_ignore_ascii_case("COUNT") {
+                items.push(format!("COUNT={count}"));
+                found = true;
+                continue;
+            }
+            if key.eq_ignore_ascii_case("UNTIL") {
+                continue;
+            }
+        }
+        items.push(item.to_owned());
+    }
+    if !found {
+        items.push(format!("COUNT={count}"));
+    }
+    format!("{property}:{}", items.join(";"))
+}
+
+fn generated_occurrence_index(master: &Event, recurrence_id: &RecurrenceId) -> Option<usize> {
+    let recurrence = master.recurrence.as_ref()?;
+    let rule = recurrence.rrule.first()?;
+    let source = match &master.schedule {
+        EventSchedule::AllDay { start_date, .. } => {
+            recurrence_source_for_all_day(*start_date, recurrence)
+        }
+        EventSchedule::Timed {
+            start, timezone, ..
+        } => recurrence_source_for_timed(*start, timezone.as_deref(), recurrence)?,
+    };
+    if recurrence.rrule.len() != 1 || rule.is_empty() {
+        return None;
+    }
+    let set = source.parse::<RRuleSet>().ok()?;
+    let first = match &master.schedule {
+        EventSchedule::AllDay { start_date, .. } => {
+            utc_midnight_for_occurrence(*start_date).fixed_offset()
+        }
+        EventSchedule::Timed { start, .. } => start.with_timezone(&Utc).fixed_offset(),
+    };
+    let target = match (recurrence_id, &master.schedule) {
+        (RecurrenceId::AllDay(date), EventSchedule::AllDay { .. }) => {
+            utc_midnight_for_occurrence(*date).fixed_offset()
+        }
+        (RecurrenceId::Timed { date_time, .. }, EventSchedule::Timed { .. }) => {
+            date_time.with_timezone(&Utc).fixed_offset()
+        }
+        _ => return None,
+    };
+    if target <= first {
+        return Some(0);
+    }
+    let lower = first.checked_sub_signed(Duration::seconds(1))?;
+    let upper = target.checked_add_signed(Duration::seconds(1))?;
+    let timezone = match &master.schedule {
+        EventSchedule::AllDay { .. } => RRuleTz::UTC,
+        EventSchedule::Timed {
+            timezone: Some(timezone),
+            ..
+        } => RRuleTz::from(chrono_tz::Tz::from_str(timezone).ok()?),
+        EventSchedule::Timed { timezone: None, .. } => RRuleTz::UTC,
+    };
+    let mut occurrences = vec![first];
+    occurrences.extend(
+        set.after(lower.with_timezone(&timezone))
+            .before(upper.with_timezone(&timezone))
+            .all(u16::MAX)
+            .dates
+            .into_iter()
+            .map(|date| date.fixed_offset()),
+    );
+    occurrences.sort();
+    occurrences.dedup();
+    occurrences
+        .iter()
+        .position(|occurrence| match (recurrence_id, &master.schedule) {
+            (RecurrenceId::AllDay(date), EventSchedule::AllDay { .. }) => {
+                occurrence.date_naive() == *date
+            }
+            (
+                RecurrenceId::Timed {
+                    date_time,
+                    timezone: identity_timezone,
+                },
+                EventSchedule::Timed {
+                    timezone: schedule_timezone,
+                    ..
+                },
+            ) => {
+                if identity_timezone != schedule_timezone {
+                    return false;
+                }
+                match schedule_timezone.as_deref() {
+                    Some(timezone) => chrono_tz::Tz::from_str(timezone)
+                        .map(|timezone| {
+                            occurrence.with_timezone(&timezone).naive_local()
+                                == date_time.with_timezone(&timezone).naive_local()
+                        })
+                        .unwrap_or(false),
+                    None => *occurrence == *date_time,
+                }
+            }
+            _ => false,
+        })
+}
+
+fn detached_event_for_recurrence_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    master_event_id: Uuid,
+    recurrence_id: &RecurrenceId,
+) -> Result<Option<(Uuid, DetachedEvent)>, RepositoryError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT id, recurrence_kind, recurrence_date, recurrence_datetime,
+                    recurrence_timezone, cancelled, title, location, description,
+                    schedule_type, start_date, end_date_exclusive,
+                    start_datetime, end_datetime, timezone
+             FROM detached_events
+             WHERE master_event_id = ?1
+             ORDER BY recurrence_sort ASC, recurrence_kind ASC, id ASC",
+        )
+        .map_err(|_| RepositoryError)?;
+    let rows = statement
+        .query_map(params![master_event_id], detached_event_from_row)
+        .map_err(|_| RepositoryError)?;
+    for row in rows {
+        let (id, mut event) = row.map_err(|_| RepositoryError)?;
+        if !detached_recurrence_ids_match(detached_recurrence_id(&event), recurrence_id) {
+            continue;
+        }
+        if let DetachedEvent::Modified { reminders, .. } = &mut event {
+            *reminders = reminders_for_detached_event(tx, id).map_err(|_| RepositoryError)?;
+        }
+        return Ok(Some((id, event)));
+    }
+    Ok(None)
+}
+
+fn occurrence_pending_operation(
+    calendar: &Calendar,
+    master_event_id: Uuid,
+    prior: Option<PendingSyncOperation>,
+    sync_state: Option<EventSyncState>,
+) -> Result<Option<PendingSyncOperation>, RepositoryError> {
+    if matches!(calendar.source, CalendarSource::Local) {
+        return Ok(None);
+    }
+
+    if matches!(prior, Some(PendingSyncOperation::Delete { .. })) {
+        return Err(RepositoryError);
+    }
+    if let Some(state) = sync_state {
+        if state.calendar_id != calendar.id || state.event_id != master_event_id {
+            return Err(RepositoryError);
+        }
+        return Ok(Some(PendingSyncOperation::Update {
+            calendar_id: state.calendar_id,
+            event_id: state.event_id,
+            remote_href: state.remote_href,
+            remote_uid: state.remote_uid,
+            base_etag: state.etag,
+        }));
+    }
+
+    match prior {
+        Some(operation @ PendingSyncOperation::Create { .. }) => Ok(Some(operation)),
+        Some(PendingSyncOperation::Update { .. }) | None => Err(RepositoryError),
+        Some(PendingSyncOperation::Delete { .. }) => Err(RepositoryError),
+    }
+}
+
+fn detached_recurrence_id(detached: &DetachedEvent) -> &RecurrenceId {
+    match detached {
+        DetachedEvent::Modified { recurrence_id, .. }
+        | DetachedEvent::Cancelled { recurrence_id } => recurrence_id,
+    }
+}
+
+fn detached_recurrence_ids_match(left: &RecurrenceId, right: &RecurrenceId) -> bool {
+    match (left, right) {
+        (RecurrenceId::AllDay(left), RecurrenceId::AllDay(right)) => left == right,
+        (
+            RecurrenceId::Timed {
+                date_time: left_time,
+                timezone: left_timezone,
+            },
+            RecurrenceId::Timed {
+                date_time: right_time,
+                timezone: right_timezone,
+            },
+        ) if left_timezone == right_timezone => match left_timezone.as_deref() {
+            Some(timezone) => chrono_tz::Tz::from_str(timezone)
+                .map(|timezone| {
+                    left_time.with_timezone(&timezone).naive_local()
+                        == right_time.with_timezone(&timezone).naive_local()
+                })
+                .unwrap_or(false),
+            None => left_time == right_time,
+        },
+        _ => false,
+    }
+}
+
+fn occurrence_is_generated(master: &Event, recurrence_id: &RecurrenceId) -> bool {
+    let Some(recurrence) = master.recurrence.as_ref() else {
+        return false;
+    };
+    match (&master.schedule, recurrence_id) {
+        (EventSchedule::AllDay { start_date, .. }, RecurrenceId::AllDay(target_date)) => {
+            let Some(offset) = FixedOffset::east_opt(0) else {
+                return false;
+            };
+            let Some(target) = offset
+                .from_local_datetime(
+                    &target_date
+                        .and_hms_opt(0, 0, 0)
+                        .expect("valid recurrence date has a midnight"),
+                )
+                .single()
+            else {
+                return false;
+            };
+            let Some(lower) = target.checked_sub_signed(Duration::days(2)) else {
+                return false;
+            };
+            let Some(upper) = target.checked_add_signed(Duration::days(2)) else {
+                return false;
+            };
+            let source = recurrence_source_for_all_day(*start_date, recurrence);
+            let Ok(set) = source.parse::<RRuleSet>() else {
+                return false;
+            };
+            let start_is_excluded = set
+                .get_exdate()
+                .iter()
+                .any(|date| date.date_naive() == *start_date);
+            let lower = lower.with_timezone(&RRuleTz::UTC);
+            let upper = upper.with_timezone(&RRuleTz::UTC);
+            let mut dates = set.after(lower).before(upper).all(u16::MAX).dates;
+            let recurrence_start = utc_midnight_for_occurrence(*start_date);
+            if !start_is_excluded && recurrence_start > lower && recurrence_start < upper {
+                dates.push(recurrence_start);
+            }
+            dates
+                .into_iter()
+                .any(|date| date.date_naive() == *target_date)
+        }
+        (
+            EventSchedule::Timed {
+                start, timezone, ..
+            },
+            RecurrenceId::Timed {
+                date_time: target,
+                timezone: target_timezone,
+            },
+        ) if timezone == target_timezone => {
+            let Some(lower) = target.checked_sub_signed(Duration::days(2)) else {
+                return false;
+            };
+            let Some(upper) = target.checked_add_signed(Duration::days(2)) else {
+                return false;
+            };
+            let Some(source) = recurrence_source_for_timed(*start, timezone.as_deref(), recurrence)
+            else {
+                return false;
+            };
+            let Ok(set) = source.parse::<RRuleSet>() else {
+                return false;
+            };
+            let recurrence_start = match timezone.as_deref() {
+                Some(timezone) => {
+                    let Ok(timezone) = chrono_tz::Tz::from_str(timezone) else {
+                        return false;
+                    };
+                    start.with_timezone(&RRuleTz::from(timezone))
+                }
+                None => start.with_timezone(&RRuleTz::UTC),
+            };
+            let timezone = match timezone.as_deref() {
+                Some(timezone) => {
+                    let Ok(timezone) = chrono_tz::Tz::from_str(timezone) else {
+                        return false;
+                    };
+                    RRuleTz::from(timezone)
+                }
+                None => RRuleTz::UTC,
+            };
+            let lower = lower.with_timezone(&timezone);
+            let upper = upper.with_timezone(&timezone);
+            let start_is_excluded = set
+                .get_exdate()
+                .iter()
+                .any(|date| date.timestamp() == recurrence_start.timestamp());
+            let mut dates = set.after(lower).before(upper).all(u16::MAX).dates;
+            if !start_is_excluded && recurrence_start > lower && recurrence_start < upper {
+                dates.push(recurrence_start);
+            }
+            dates.into_iter().any(|date| {
+                let occurrence = date.fixed_offset();
+                detached_recurrence_ids_match(
+                    &RecurrenceId::Timed {
+                        date_time: occurrence,
+                        timezone: target_timezone.clone(),
+                    },
+                    recurrence_id,
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
+fn recurrence_source_for_all_day(start_date: NaiveDate, recurrence: &RecurrenceSpec) -> String {
+    let mut source = format!("DTSTART;VALUE=DATE:{}", start_date.format("%Y%m%d"));
+    for line in recurrence
+        .rrule
+        .iter()
+        .chain(&recurrence.rdate)
+        .chain(&recurrence.exdate)
+    {
+        source.push('\n');
+        source.push_str(line);
+    }
+    source
+}
+
+fn recurrence_source_for_timed(
+    start: DateTime<FixedOffset>,
+    timezone: Option<&str>,
+    recurrence: &RecurrenceSpec,
+) -> Option<String> {
+    let mut source = match timezone {
+        None => format!(
+            "DTSTART:{}",
+            start.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ")
+        ),
+        Some(timezone) => {
+            let timezone = chrono_tz::Tz::from_str(timezone).ok()?;
+            format!(
+                "DTSTART;TZID={timezone}:{}",
+                start.with_timezone(&timezone).format("%Y%m%dT%H%M%S")
+            )
+        }
+    };
+    for line in recurrence
+        .rrule
+        .iter()
+        .chain(&recurrence.rdate)
+        .chain(&recurrence.exdate)
+    {
+        source.push('\n');
+        source.push_str(line);
+    }
+    Some(source)
+}
+
+fn utc_midnight_for_occurrence(date: NaiveDate) -> DateTime<RRuleTz> {
+    let utc = FixedOffset::east_opt(0).expect("UTC offset is valid");
+    utc.from_local_datetime(
+        &date
+            .and_hms_opt(0, 0, 0)
+            .expect("valid recurrence date has a midnight"),
+    )
+    .single()
+    .expect("a fixed offset has no ambiguous local times")
+    .with_timezone(&RRuleTz::UTC)
 }
 
 fn calendar_in_transaction(

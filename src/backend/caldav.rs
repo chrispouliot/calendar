@@ -494,6 +494,43 @@ impl std::fmt::Display for EventMappingError {
 
 impl std::error::Error for EventMappingError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappedResource {
+    pub master: MappedEvent,
+    pub exceptions: Vec<DetachedEvent>,
+}
+
+pub use crate::model::{DetachedEvent, RecurrenceId};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceMappingError {
+    MixedUids,
+    DuplicateMasters,
+    OrphanException,
+    Event(EventMappingError),
+}
+
+impl std::fmt::Display for ResourceMappingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MixedUids => write!(formatter, "VEVENTs use different UIDs"),
+            Self::DuplicateMasters => {
+                write!(formatter, "calendar contains duplicate VEVENT masters")
+            }
+            Self::OrphanException => write!(formatter, "detached VEVENT has no recurring master"),
+            Self::Event(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ResourceMappingError {}
+
+impl From<EventMappingError> for ResourceMappingError {
+    fn from(error: EventMappingError) -> Self {
+        Self::Event(error)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSerializationError {
     EmptyUid,
@@ -521,6 +558,17 @@ pub fn serialize_icalendar_event(
     event: &crate::model::Event,
     remote_uid: &str,
 ) -> Result<String, EventSerializationError> {
+    let serialized_event = serialize_icalendar_event_component(event, remote_uid)?;
+    let mut calendar = Calendar::new();
+    calendar.push(serialized_event);
+    std::convert::TryInto::<String>::try_into(&calendar)
+        .map_err(|_| EventSerializationError::Serialization)
+}
+
+fn serialize_icalendar_event_component(
+    event: &crate::model::Event,
+    remote_uid: &str,
+) -> Result<icalendar::Event, EventSerializationError> {
     if remote_uid.trim().is_empty() {
         return Err(EventSerializationError::EmptyUid);
     }
@@ -582,11 +630,186 @@ pub fn serialize_icalendar_event(
         }
     }
 
-    let serialized_event = serialized_event.done();
+    Ok(serialized_event.done())
+}
+
+/// Serialize a recurring master and its detached instances as one VCALENDAR.
+pub fn serialize_icalendar_resource(
+    master: &crate::model::Event,
+    detached_events: &[crate::model::DetachedEvent],
+    remote_uid: &str,
+) -> Result<String, EventSerializationError> {
     let mut calendar = Calendar::new();
-    calendar.push(serialized_event);
+    calendar.push(serialize_icalendar_event_component(master, remote_uid)?);
+
+    for detached in detached_events {
+        let serialized_event = match detached {
+            crate::model::DetachedEvent::Modified {
+                recurrence_id,
+                title,
+                location,
+                description,
+                schedule,
+                reminders,
+            } => {
+                validate_recurrence_identity(&master.schedule, recurrence_id)?;
+                let event = crate::model::Event {
+                    id: master.id,
+                    calendar_id: master.calendar_id,
+                    title: title.clone(),
+                    location: location.clone(),
+                    description: description.clone(),
+                    schedule: schedule.clone(),
+                    recurrence: None,
+                    reminders: reminders.clone(),
+                };
+                let mut serialized_event = serialize_icalendar_event_component(&event, remote_uid)?;
+                add_recurrence_id(&mut serialized_event, recurrence_id)?;
+                serialized_event
+            }
+            crate::model::DetachedEvent::Cancelled { recurrence_id } => {
+                let schedule = cancelled_schedule(&master.schedule, recurrence_id)?;
+                let event = crate::model::Event {
+                    id: master.id,
+                    calendar_id: master.calendar_id,
+                    title: String::new(),
+                    location: String::new(),
+                    description: String::new(),
+                    schedule,
+                    recurrence: None,
+                    reminders: Vec::new(),
+                };
+                let mut serialized_event = serialize_icalendar_event_component(&event, remote_uid)?;
+                serialized_event.add_property("STATUS", "CANCELLED");
+                add_recurrence_id(&mut serialized_event, recurrence_id)?;
+                serialized_event
+            }
+        };
+        calendar.push(serialized_event);
+    }
+
     std::convert::TryInto::<String>::try_into(&calendar)
         .map_err(|_| EventSerializationError::Serialization)
+}
+
+fn add_recurrence_id(
+    event: &mut icalendar::Event,
+    recurrence_id: &crate::model::RecurrenceId,
+) -> Result<(), EventSerializationError> {
+    let (key, value) = serialize_recurrence_id(recurrence_id)?;
+    event.add_property(&key, &value);
+    Ok(())
+}
+
+fn serialize_recurrence_id(
+    recurrence_id: &crate::model::RecurrenceId,
+) -> Result<(String, String), EventSerializationError> {
+    match recurrence_id {
+        crate::model::RecurrenceId::AllDay(date) => Ok((
+            "RECURRENCE-ID;VALUE=DATE".to_owned(),
+            date.format("%Y%m%d").to_string(),
+        )),
+        crate::model::RecurrenceId::Timed {
+            date_time,
+            timezone,
+        } => match timezone.as_deref() {
+            None => Ok((
+                "RECURRENCE-ID".to_owned(),
+                date_time
+                    .with_timezone(&Utc)
+                    .format("%Y%m%dT%H%M%SZ")
+                    .to_string(),
+            )),
+            Some(tzid) => {
+                let timezone =
+                    Tz::from_str(tzid).map_err(|_| EventSerializationError::InvalidSchedule)?;
+                let value = serialize_tz_value(*date_time, tzid, timezone)?;
+                let CalendarDateTime::WithTimezone { date_time, .. } = value else {
+                    return Err(EventSerializationError::Serialization);
+                };
+                Ok((
+                    format!("RECURRENCE-ID;TZID={tzid}"),
+                    date_time.format("%Y%m%dT%H%M%S").to_string(),
+                ))
+            }
+        },
+    }
+}
+
+fn validate_recurrence_identity(
+    master_schedule: &crate::model::EventSchedule,
+    recurrence_id: &crate::model::RecurrenceId,
+) -> Result<(), EventSerializationError> {
+    let compatible = matches!(
+        (master_schedule, recurrence_id),
+        (
+            crate::model::EventSchedule::AllDay { .. },
+            crate::model::RecurrenceId::AllDay(_)
+        )
+    ) || matches!(
+        (master_schedule, recurrence_id),
+        (
+            crate::model::EventSchedule::Timed { timezone, .. },
+            crate::model::RecurrenceId::Timed {
+                timezone: recurrence_timezone,
+                ..
+            }
+        ) if timezone == recurrence_timezone
+    );
+    if compatible {
+        Ok(())
+    } else {
+        Err(EventSerializationError::InvalidSchedule)
+    }
+}
+
+fn cancelled_schedule(
+    master_schedule: &crate::model::EventSchedule,
+    recurrence_id: &crate::model::RecurrenceId,
+) -> Result<crate::model::EventSchedule, EventSerializationError> {
+    validate_recurrence_identity(master_schedule, recurrence_id)?;
+    match (master_schedule, recurrence_id) {
+        (
+            crate::model::EventSchedule::AllDay {
+                start_date,
+                end_date_exclusive,
+            },
+            crate::model::RecurrenceId::AllDay(occurrence_date),
+        ) => {
+            let duration = end_date_exclusive.signed_duration_since(*start_date);
+            let end_date_exclusive = occurrence_date
+                .checked_add_signed(duration)
+                .ok_or(EventSerializationError::InvalidSchedule)?;
+            Ok(crate::model::EventSchedule::AllDay {
+                start_date: *occurrence_date,
+                end_date_exclusive,
+            })
+        }
+        (
+            crate::model::EventSchedule::Timed {
+                start,
+                end,
+                timezone: _,
+            },
+            crate::model::RecurrenceId::Timed {
+                date_time,
+                timezone,
+            },
+        ) => {
+            if end <= start {
+                return Err(EventSerializationError::InvalidSchedule);
+            }
+            let end = date_time
+                .checked_add_signed(end.signed_duration_since(*start))
+                .ok_or(EventSerializationError::InvalidSchedule)?;
+            Ok(crate::model::EventSchedule::Timed {
+                start: *date_time,
+                end,
+                timezone: timezone.clone(),
+            })
+        }
+        _ => Err(EventSerializationError::InvalidSchedule),
+    }
 }
 
 fn serialize_timed_values(
@@ -637,17 +860,7 @@ pub fn map_icalendar_event(
     event_id: Uuid,
     calendar_id: Uuid,
 ) -> Result<MappedEvent, EventMappingError> {
-    let normalized = icalendar::parser::unfold(resource);
-    let roots = icalendar::parser::read_calendar_simple(&normalized)
-        .map_err(|error| EventMappingError::Parse(error.to_string()))?;
-    if roots.len() != 1 || roots[0].name.as_ref() != "VCALENDAR" {
-        return Err(EventMappingError::Parse(
-            "resource is not exactly one VCALENDAR".to_owned(),
-        ));
-    }
-    let calendar = icalendar::parser::read_calendar(&normalized)
-        .map_err(EventMappingError::Parse)
-        .map(Into::<Calendar>::into)?;
+    let calendar = parse_icalendar_resource(resource)?;
     let mut events = calendar
         .components
         .iter()
@@ -660,6 +873,100 @@ pub fn map_icalendar_event(
         return Err(EventMappingError::MultipleEvents);
     }
 
+    map_event_component(event, event_id, calendar_id)
+}
+
+/// Map one CalDAV resource containing a master VEVENT and its detached
+/// instances.  Detached instances remain separate from the local event model
+/// because they have their own recurrence identity and may be cancelled.
+pub fn map_icalendar_resource(
+    resource: &str,
+    event_id: Uuid,
+    calendar_id: Uuid,
+) -> Result<MappedResource, ResourceMappingError> {
+    let calendar = parse_icalendar_resource(resource)?;
+    let events: Vec<&icalendar::Event> = calendar
+        .components
+        .iter()
+        .filter_map(|component| match component {
+            CalendarComponent::Event(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+
+    let Some(master) = events
+        .iter()
+        .copied()
+        .find(|event| !has_property(event, "RECURRENCE-ID"))
+    else {
+        if events.is_empty() {
+            return Err(EventMappingError::NoEvents.into());
+        }
+        return Err(ResourceMappingError::OrphanException);
+    };
+
+    let master_uid = master
+        .get_uid()
+        .filter(|uid| !uid.trim().is_empty())
+        .ok_or(EventMappingError::MissingUid)?;
+    if events.iter().any(|event| {
+        event
+            .get_uid()
+            .filter(|uid| !uid.trim().is_empty())
+            .is_none()
+    }) {
+        return Err(EventMappingError::MissingUid.into());
+    }
+    if events
+        .iter()
+        .any(|event| event.get_uid().is_some_and(|uid| uid != master_uid))
+    {
+        return Err(ResourceMappingError::MixedUids);
+    }
+    if events
+        .iter()
+        .filter(|event| !has_property(event, "RECURRENCE-ID"))
+        .nth(1)
+        .is_some()
+    {
+        return Err(ResourceMappingError::DuplicateMasters);
+    }
+
+    let mapped_master = map_event_component(master, event_id, calendar_id)?;
+    let mut exceptions = Vec::new();
+    for event in events {
+        if std::ptr::eq(event, master) {
+            continue;
+        }
+        exceptions.push(map_detached_event(event)?);
+    }
+
+    Ok(MappedResource {
+        master: mapped_master,
+        exceptions,
+    })
+}
+
+fn parse_icalendar_resource(resource: &str) -> Result<Calendar, EventMappingError> {
+    let normalized = icalendar::parser::unfold(resource);
+    let roots = icalendar::parser::read_calendar_simple(&normalized)
+        .map_err(|error| EventMappingError::Parse(error.to_string()))?;
+    if roots.len() != 1 || roots[0].name.as_ref() != "VCALENDAR" {
+        return Err(EventMappingError::Parse(
+            "resource is not exactly one VCALENDAR".to_owned(),
+        ));
+    }
+    let calendar = icalendar::parser::read_calendar(&normalized)
+        .map_err(EventMappingError::Parse)
+        .map(Into::<Calendar>::into)?;
+    Ok(calendar)
+}
+
+fn map_event_component(
+    event: &icalendar::Event,
+    event_id: Uuid,
+    calendar_id: Uuid,
+) -> Result<MappedEvent, EventMappingError> {
     let uid = event
         .get_uid()
         .filter(|uid| !uid.trim().is_empty())
@@ -672,16 +979,7 @@ pub fn map_icalendar_event(
             "DURATION is not supported".to_owned(),
         ));
     }
-    let mut reminders = Vec::new();
-    for component in event.components() {
-        if component.component_kind().eq_ignore_ascii_case("VALARM") {
-            reminders.push(map_alarm(component)?);
-        } else {
-            return Err(EventMappingError::UnsupportedData(
-                "nested non-VALARM components are not supported".to_owned(),
-            ));
-        }
-    }
+    let reminders = map_event_reminders(event)?;
 
     let start = event.get_start().ok_or_else(|| {
         if has_property(event, "DTSTART") {
@@ -692,7 +990,7 @@ pub fn map_icalendar_event(
     })?;
     let end = event.get_end();
     let schedule = map_schedule(start, end)?;
-    let recurrence = recurrence_spec(&normalized, &schedule)?;
+    let recurrence = recurrence_spec(event, &schedule)?;
     let mapped = crate::model::Event {
         id: event_id,
         calendar_id,
@@ -708,6 +1006,69 @@ pub fn map_icalendar_event(
         event: mapped,
         remote_uid: uid.to_owned(),
     })
+}
+
+fn map_detached_event(event: &icalendar::Event) -> Result<DetachedEvent, ResourceMappingError> {
+    let recurrence_id = event
+        .get_recurrence_id()
+        .ok_or_else(|| {
+            ResourceMappingError::Event(EventMappingError::UnsupportedData(
+                "detached VEVENT has an invalid RECURRENCE-ID".to_owned(),
+            ))
+        })
+        .and_then(map_recurrence_id)?;
+
+    if event
+        .properties()
+        .get("STATUS")
+        .is_some_and(|status| status.value().eq_ignore_ascii_case("CANCELLED"))
+    {
+        return Ok(DetachedEvent::Cancelled { recurrence_id });
+    }
+
+    let start = event
+        .get_start()
+        .ok_or(EventMappingError::MissingDtstart)
+        .map_err(ResourceMappingError::Event)?;
+    let schedule = map_schedule(start, event.get_end())?;
+    let reminders = map_event_reminders(event).map_err(ResourceMappingError::Event)?;
+    Ok(DetachedEvent::Modified {
+        recurrence_id,
+        title: event.get_summary().unwrap_or_default().to_owned(),
+        location: event.get_location().unwrap_or_default().to_owned(),
+        description: event.get_description().unwrap_or_default().to_owned(),
+        schedule,
+        reminders,
+    })
+}
+
+fn map_recurrence_id(value: DatePerhapsTime) -> Result<RecurrenceId, ResourceMappingError> {
+    match value {
+        DatePerhapsTime::Date(date) => Ok(RecurrenceId::AllDay(date)),
+        DatePerhapsTime::DateTime(date_time) => {
+            let (date_time, timezone) = map_datetime(date_time)?;
+            Ok(RecurrenceId::Timed {
+                date_time,
+                timezone,
+            })
+        }
+    }
+}
+
+fn map_event_reminders(
+    event: &icalendar::Event,
+) -> Result<Vec<crate::model::ReminderSpec>, EventMappingError> {
+    let mut reminders = Vec::new();
+    for component in event.components() {
+        if component.component_kind().eq_ignore_ascii_case("VALARM") {
+            reminders.push(map_alarm(component)?);
+        } else {
+            return Err(EventMappingError::UnsupportedData(
+                "nested non-VALARM components are not supported".to_owned(),
+            ));
+        }
+    }
+    Ok(reminders)
 }
 
 fn map_alarm<C: Component>(component: &C) -> Result<crate::model::ReminderSpec, EventMappingError> {
@@ -868,34 +1229,15 @@ fn add_recurrence_property(
 }
 
 fn recurrence_spec(
-    resource: &str,
+    event: &icalendar::Event,
     schedule: &crate::model::EventSchedule,
 ) -> Result<Option<crate::model::RecurrenceSpec>, EventMappingError> {
-    let mut in_event = false;
     let mut recurrence = crate::model::RecurrenceSpec::default();
-    for line in resource.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.eq_ignore_ascii_case("BEGIN:VEVENT") {
-            in_event = true;
-            continue;
-        }
-        if line.eq_ignore_ascii_case("END:VEVENT") {
-            in_event = false;
-            continue;
-        }
-        if !in_event {
-            continue;
-        }
-        let Some((key, _)) = line.split_once(':') else {
-            continue;
-        };
-        let name = key.split(';').next().unwrap_or_default();
-        match name.to_ascii_uppercase().as_str() {
-            "RRULE" => recurrence.rrule.push(line.to_owned()),
-            "RDATE" => recurrence.rdate.push(line.to_owned()),
-            "EXDATE" => recurrence.exdate.push(line.to_owned()),
-            _ => {}
-        }
+    for property in event.properties().values() {
+        add_recurrence_line(&mut recurrence, property);
+    }
+    for property in event.multi_properties().values().flatten() {
+        add_recurrence_line(&mut recurrence, property);
     }
     if recurrence.rrule.is_empty() && recurrence.rdate.is_empty() && recurrence.exdate.is_empty() {
         return Ok(None);
@@ -915,6 +1257,33 @@ fn recurrence_spec(
     validate_recurrence(schedule, &recurrence)
         .map_err(|message| EventMappingError::UnsupportedData(message.to_owned()))?;
     Ok(Some(recurrence))
+}
+
+fn add_recurrence_line(
+    recurrence: &mut crate::model::RecurrenceSpec,
+    property: &icalendar::Property,
+) {
+    let name = property.key().to_ascii_uppercase();
+    let line = icalendar_property_line(property);
+    match name.as_str() {
+        "RRULE" => recurrence.rrule.push(line),
+        "RDATE" => recurrence.rdate.push(line),
+        "EXDATE" => recurrence.exdate.push(line),
+        _ => {}
+    }
+}
+
+fn icalendar_property_line(property: &icalendar::Property) -> String {
+    let mut line = property.key().to_owned();
+    for parameter in property.params().values() {
+        line.push(';');
+        line.push_str(parameter.key());
+        line.push('=');
+        line.push_str(parameter.value());
+    }
+    line.push(':');
+    line.push_str(property.value());
+    line
 }
 
 fn validate_recurrence(

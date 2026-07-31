@@ -38,6 +38,32 @@ pub struct Event {
     pub reminders: Vec<ReminderSpec>,
 }
 
+/// A recurring event instance that is stored separately from its master.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachedEvent {
+    Modified {
+        recurrence_id: RecurrenceId,
+        title: String,
+        location: String,
+        description: String,
+        schedule: EventSchedule,
+        reminders: Vec<ReminderSpec>,
+    },
+    Cancelled {
+        recurrence_id: RecurrenceId,
+    },
+}
+
+/// The recurrence identity of a detached event instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecurrenceId {
+    AllDay(NaiveDate),
+    Timed {
+        date_time: DateTime<FixedOffset>,
+        timezone: Option<String>,
+    },
+}
+
 /// Durable identity for a calendar on its remote CalDAV server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalendarSyncState {

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::model::{Calendar, Event, EventSchedule};
+use calendar::model::{Calendar, Event, EventSchedule, RecurrenceId};
 use calendar::preferences::format_wall_time;
 use calendar::viewer_time::to_local_fixed;
 use chrono::{Datelike, NaiveDate};
@@ -10,7 +10,7 @@ use gtk::glib;
 
 /// Edit-Details callback: invoked with the persisted event ID when the user
 /// presses the action button.
-type EditDetailsFn = Box<dyn Fn(uuid::Uuid)>;
+type EditDetailsFn = Box<dyn Fn(uuid::Uuid, Option<RecurrenceId>)>;
 
 mod imp {
     use super::*;
@@ -37,6 +37,7 @@ mod imp {
 
         pub on_edit_details: RefCell<Option<EditDetailsFn>>,
         pub event_id: RefCell<Option<uuid::Uuid>>,
+        pub recurrence_id: RefCell<Option<RecurrenceId>>,
         pub current_event: RefCell<Option<Event>>,
         pub current_calendar: RefCell<Option<Calendar>>,
         pub current_today: RefCell<Option<NaiveDate>>,
@@ -66,7 +67,7 @@ mod imp {
             if let Some(id) = *self.event_id.borrow()
                 && let Some(cb) = self.on_edit_details.borrow().as_ref()
             {
-                cb(id);
+                cb(id, self.recurrence_id.borrow().clone());
             }
             self.obj().popdown();
         }
@@ -110,7 +111,7 @@ impl EventPopover {
     }
 
     /// Register the Edit Details callback.
-    pub fn set_on_edit_details<F: Fn(uuid::Uuid) + 'static>(&self, f: F) {
+    pub fn set_on_edit_details<F: Fn(uuid::Uuid, Option<RecurrenceId>) + 'static>(&self, f: F) {
         *self.imp().on_edit_details.borrow_mut() = Some(Box::new(f));
     }
 
@@ -119,9 +120,16 @@ impl EventPopover {
     /// `today` is the current date used for relative date labels
     /// (Today / Tomorrow / Yesterday).  `calendar` provides the
     /// read-only flag to select the correct action icon and tooltip.
-    pub fn set_event(&self, event: &Event, calendar: Option<&Calendar>, today: NaiveDate) {
+    pub fn set_event(
+        &self,
+        event: &Event,
+        calendar: Option<&Calendar>,
+        today: NaiveDate,
+        recurrence_id: Option<&RecurrenceId>,
+    ) {
         let imp = self.imp();
         *imp.event_id.borrow_mut() = Some(event.id);
+        *imp.recurrence_id.borrow_mut() = recurrence_id.cloned();
         *imp.current_event.borrow_mut() = Some(event.clone());
         *imp.current_calendar.borrow_mut() = calendar.cloned();
         *imp.current_today.borrow_mut() = Some(today);
@@ -168,7 +176,8 @@ impl EventPopover {
         let calendar = self.imp().current_calendar.borrow().clone();
         let today = self.imp().current_today.borrow().as_ref().copied();
         if let (Some(event), Some(today)) = (event, today) {
-            self.set_event(&event, calendar.as_ref(), today);
+            let recurrence_id = self.imp().recurrence_id.borrow().clone();
+            self.set_event(&event, calendar.as_ref(), today, recurrence_id.as_ref());
         }
     }
 }

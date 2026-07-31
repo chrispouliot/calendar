@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::model::{Calendar, Event, EventSchedule, ReminderSpec, validate_event};
+use calendar::model::{Calendar, Event, EventSchedule, RecurrenceId, ReminderSpec, validate_event};
 use calendar::recurrence_form::{
     EndCondition, Frequency, RecurrenceForm, RecurrencePresentation, Weekday, recurrence_from_form,
     recurrence_presentation,
@@ -13,8 +13,37 @@ use chrono::{
 use gtk::glib;
 use uuid::Uuid;
 
-type SaveFn = Box<dyn Fn(Event, bool) -> bool>;
-type DeleteFn = Box<dyn Fn(Uuid) -> bool>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccurrenceScope {
+    OnlyThis,
+    ThisAndFollowing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceEditContext {
+    recurrence_id: RecurrenceId,
+    scope: OccurrenceScope,
+}
+
+impl OccurrenceEditContext {
+    pub fn new(recurrence_id: RecurrenceId, scope: OccurrenceScope) -> Self {
+        Self {
+            recurrence_id,
+            scope,
+        }
+    }
+
+    pub fn recurrence_id(&self) -> &RecurrenceId {
+        &self.recurrence_id
+    }
+
+    pub fn scope(&self) -> OccurrenceScope {
+        self.scope
+    }
+}
+
+type SaveFn = Box<dyn Fn(Event, bool, Option<OccurrenceEditContext>) -> bool>;
+type DeleteFn = Box<dyn Fn(Uuid, Option<OccurrenceEditContext>) -> bool>;
 
 const KEEP_EXISTING_REMINDERS_INDEX: u32 = 7;
 const REPEAT_CUSTOM_INDEX: u32 = 5;
@@ -53,6 +82,8 @@ mod imp {
         #[template_child]
         pub repeat_row: TemplateChild<adw::ComboRow>,
         #[template_child]
+        pub occurrence_only_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub repeat_interval_row: TemplateChild<adw::ActionRow>,
         #[template_child]
         pub repeat_interval_spin: TemplateChild<gtk::SpinButton>,
@@ -83,6 +114,8 @@ mod imp {
 
         pub calendars: RefCell<Vec<Calendar>>,
         pub editing_event: RefCell<Option<Event>>,
+        pub occurrence_recurrence_id: RefCell<Option<RecurrenceId>>,
+        pub occurrence_scope: Cell<Option<OccurrenceScope>>,
         pub original_timed_event: RefCell<Option<OriginalTimedEvent>>,
         pub start_date_row_state: RefCell<Option<crate::ui::date_chooser_row::DateChooserRow>>,
         pub end_date_row_state: RefCell<Option<crate::ui::date_chooser_row::DateChooserRow>>,
@@ -292,7 +325,7 @@ mod imp {
                     .on_delete
                     .borrow()
                     .as_ref()
-                    .is_some_and(|callback| callback(event_id))
+                    .is_some_and(|callback| callback(event_id, editor.imp().occurrence_context()))
                 {
                     adw::prelude::AdwDialogExt::force_close(&editor);
                 }
@@ -321,11 +354,17 @@ impl EventEditor {
         glib::Object::new()
     }
 
-    pub fn set_on_save<F: Fn(Event, bool) -> bool + 'static>(&self, callback: F) {
+    pub fn set_on_save<F: Fn(Event, bool, Option<OccurrenceEditContext>) -> bool + 'static>(
+        &self,
+        callback: F,
+    ) {
         *self.imp().on_save.borrow_mut() = Some(Box::new(callback));
     }
 
-    pub fn set_on_delete<F: Fn(Uuid) -> bool + 'static>(&self, callback: F) {
+    pub fn set_on_delete<F: Fn(Uuid, Option<OccurrenceEditContext>) -> bool + 'static>(
+        &self,
+        callback: F,
+    ) {
         *self.imp().on_delete.borrow_mut() = Some(Box::new(callback));
     }
 
@@ -351,7 +390,22 @@ impl EventEditor {
     pub fn set_create_defaults(&self, title: &str, calendar_id: Uuid, date: NaiveDate) {
         let imp = self.imp();
         *imp.editing_event.borrow_mut() = None;
+        *imp.occurrence_recurrence_id.borrow_mut() = None;
+        imp.occurrence_scope.set(None);
+        imp.occurrence_only_label.set_visible(false);
+        imp.calendar_row.set_sensitive(true);
+        if let Some(row) = imp.start_date_row_state.borrow().as_ref() {
+            row.set_sensitive(true);
+        }
+        if let Some(row) = imp.end_date_row_state.borrow().as_ref() {
+            row.set_sensitive(true);
+        }
+        if let Some(chooser) = imp.timed_schedule_state.borrow().as_ref() {
+            chooser.set_date_controls_sensitive(true, true);
+        }
+        imp.set_recurrence_controls_sensitive(true);
         imp.delete_event_row.set_visible(false);
+        imp.delete_event_row.set_title("_Delete Event");
         imp.title_entry.set_text(title);
         imp.location_entry.set_text("");
         imp.description_view.buffer().set_text("");
@@ -380,7 +434,22 @@ impl EventEditor {
     pub fn set_event(&self, event: &Event) {
         let imp = self.imp();
         *imp.editing_event.borrow_mut() = Some(event.clone());
+        *imp.occurrence_recurrence_id.borrow_mut() = None;
+        imp.occurrence_scope.set(None);
+        imp.occurrence_only_label.set_visible(false);
+        imp.calendar_row.set_sensitive(true);
+        if let Some(row) = imp.start_date_row_state.borrow().as_ref() {
+            row.set_sensitive(true);
+        }
+        if let Some(row) = imp.end_date_row_state.borrow().as_ref() {
+            row.set_sensitive(true);
+        }
+        if let Some(chooser) = imp.timed_schedule_state.borrow().as_ref() {
+            chooser.set_date_controls_sensitive(true, true);
+        }
+        imp.set_recurrence_controls_sensitive(true);
         imp.delete_event_row.set_visible(true);
+        imp.delete_event_row.set_title("_Delete Event");
         imp.title_entry.set_text(&event.title);
         imp.location_entry.set_text(&event.location);
         imp.description_view.buffer().set_text(&event.description);
@@ -445,6 +514,55 @@ impl EventEditor {
         imp.ensure_forward_range();
     }
 
+    /// Populate the editor with one resolved recurring occurrence. Saving
+    /// this mode creates a detached modification rather than changing the
+    /// master's recurrence rule.
+    pub fn set_occurrence_event(&self, event: &Event, recurrence_id: &RecurrenceId) {
+        self.set_occurrence_context(event, recurrence_id, OccurrenceScope::OnlyThis);
+    }
+
+    pub fn set_occurrence_and_following_event(&self, event: &Event, recurrence_id: &RecurrenceId) {
+        self.set_occurrence_context(event, recurrence_id, OccurrenceScope::ThisAndFollowing);
+    }
+
+    fn set_occurrence_context(
+        &self,
+        event: &Event,
+        recurrence_id: &RecurrenceId,
+        scope: OccurrenceScope,
+    ) {
+        self.set_event(event);
+        let imp = self.imp();
+        *imp.occurrence_recurrence_id.borrow_mut() = Some(recurrence_id.clone());
+        imp.occurrence_scope.set(Some(scope));
+        imp.occurrence_only_label.set_label(match scope {
+            OccurrenceScope::OnlyThis => {
+                "Only this occurrence will be changed. The recurrence rule is not editable here."
+            }
+            OccurrenceScope::ThisAndFollowing => {
+                "This and all following occurrences will be changed. The calendar cannot be changed, but the schedule and recurrence can be edited."
+            }
+        });
+        imp.occurrence_only_label.set_visible(true);
+        imp.calendar_row.set_sensitive(false);
+        imp.set_recurrence_controls_sensitive(matches!(scope, OccurrenceScope::ThisAndFollowing));
+        imp.delete_event_row.set_title(match scope {
+            OccurrenceScope::OnlyThis => "_Delete This Event",
+            OccurrenceScope::ThisAndFollowing => "_Delete This and Following",
+        });
+        if matches!(scope, OccurrenceScope::ThisAndFollowing) {
+            if let Some(row) = imp.start_date_row_state.borrow().as_ref() {
+                row.set_sensitive(true);
+            }
+            if let Some(row) = imp.end_date_row_state.borrow().as_ref() {
+                row.set_sensitive(true);
+            }
+            if let Some(chooser) = imp.timed_schedule_state.borrow().as_ref() {
+                chooser.set_date_controls_sensitive(true, true);
+            }
+        }
+    }
+
     pub fn refresh_time_format(&self) {
         if let Some(chooser) = self.imp().timed_schedule_state.borrow().as_ref() {
             chooser.refresh_time_format();
@@ -453,6 +571,13 @@ impl EventEditor {
 }
 
 impl imp::EventEditor {
+    fn occurrence_context(&self) -> Option<OccurrenceEditContext> {
+        Some(OccurrenceEditContext::new(
+            self.occurrence_recurrence_id.borrow().clone()?,
+            self.occurrence_scope.get()?,
+        ))
+    }
+
     fn set_placeholder_state(&self, reminders: &[ReminderSpec]) {
         self.set_reminder_selection(reminders);
     }
@@ -464,6 +589,19 @@ impl imp::EventEditor {
         }
         self.repeat_row
             .set_model(Some(&gtk::StringList::new(&labels)));
+    }
+
+    fn set_recurrence_controls_sensitive(&self, sensitive: bool) {
+        self.repeat_row.set_sensitive(sensitive);
+        self.repeat_interval_row.set_sensitive(sensitive);
+        self.repeat_interval_spin.set_sensitive(sensitive);
+        self.repeat_weekdays_row.set_sensitive(sensitive);
+        self.repeat_weekdays_box.set_sensitive(sensitive);
+        self.repeat_end_row.set_sensitive(sensitive);
+        self.repeat_count_row.set_sensitive(sensitive);
+        self.repeat_count_spin.set_sensitive(sensitive);
+        self.until_date_row.set_sensitive(sensitive);
+        self.custom_recurrence_label.set_sensitive(sensitive);
     }
 
     fn set_recurrence_state(
@@ -905,7 +1043,14 @@ impl imp::EventEditor {
             }
         };
 
+        let following = self.occurrence_scope.get() == Some(OccurrenceScope::ThisAndFollowing);
         let recurrence = if self.repeat_is_custom() {
+            if following {
+                self.show_error(
+                    "This and Following requires a simple replacement recurrence. Choose a recurrence from the list.",
+                );
+                return;
+            }
             base.as_ref().and_then(|event| event.recurrence.clone())
         } else {
             let form = self.recurrence_form_from_controls();
@@ -917,6 +1062,12 @@ impl imp::EventEditor {
                 }
             }
         };
+        if following && recurrence.is_none() {
+            self.show_error(
+                "This and Following requires a recurrence. Choose a simple recurrence instead of Does not repeat.",
+            );
+            return;
+        }
 
         let buffer = self.description_view.buffer();
         let (start, end) = buffer.bounds();
@@ -951,7 +1102,7 @@ impl imp::EventEditor {
 
         let editing = base.is_some();
         if let Some(callback) = self.on_save.borrow().as_ref()
-            && callback(event, editing)
+            && callback(event, editing, self.occurrence_context())
         {
             let editor = self.obj().clone();
             adw::prelude::AdwDialogExt::force_close(&editor);

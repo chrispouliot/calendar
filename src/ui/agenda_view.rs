@@ -5,8 +5,10 @@ use std::time::Duration as StdDuration;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::agenda_presentation::{AgendaEventState, AgendaTimeLayout, event_state, time_text};
-use calendar::agenda_render_plan::{AgendaRange, AgendaRenderPlan, render_agenda};
-use calendar::model::{Calendar, Event, EventSchedule};
+use calendar::agenda_render_plan::{
+    AgendaRange, AgendaRenderPlan, render_agenda_with_detached_events_in_timezone,
+};
+use calendar::model::{Calendar, DetachedEvent, Event, EventSchedule, RecurrenceId};
 use calendar::month_view::{AgendaGroup, EventChip};
 use calendar::preferences::{load_time_format_preference, system_clock_format};
 use calendar::viewer_time::now_local_fixed;
@@ -14,7 +16,7 @@ use chrono::{Datelike, Duration, NaiveDate, Timelike};
 use gtk::glib;
 use uuid::Uuid;
 
-type EventActivateFn = Box<dyn Fn(Uuid, gtk::Widget)>;
+type EventActivateFn = Box<dyn Fn(Uuid, Option<RecurrenceId>, gtk::Widget)>;
 type NewEventFn = Box<dyn Fn()>;
 
 const INITIAL_FUTURE_DAYS: i64 = 56;
@@ -51,7 +53,7 @@ mod imp {
         pub active_date: Cell<NaiveDate>,
         pub agenda_range: RefCell<AgendaRange>,
         pub cached_calendars: RefCell<Vec<Calendar>>,
-        pub cached_events: RefCell<Vec<Event>>,
+        pub cached_events: RefCell<Vec<(Event, Vec<DetachedEvent>)>>,
         pub rendered_groups: RefCell<Vec<AgendaGroup>>,
         pub(crate) agenda_rows: RefCell<Vec<AgendaRowState>>,
         pub applied_compact: Cell<Option<bool>>,
@@ -177,7 +179,10 @@ impl AgendaView {
         glib::Object::new()
     }
 
-    pub fn set_on_event_activate<F: Fn(Uuid, gtk::Widget) + 'static>(&self, f: F) {
+    pub fn set_on_event_activate<F: Fn(Uuid, Option<RecurrenceId>, gtk::Widget) + 'static>(
+        &self,
+        f: F,
+    ) {
         *self.imp().on_event_activate.borrow_mut() = Some(Box::new(f));
     }
 
@@ -198,7 +203,7 @@ impl AgendaView {
         self.imp().active_date.get()
     }
 
-    pub fn render(&self, calendars: &[Calendar], events: &[Event]) {
+    pub fn render(&self, calendars: &[Calendar], events: &[(Event, Vec<DetachedEvent>)]) {
         let imp = self.imp();
         *imp.cached_calendars.borrow_mut() = calendars.to_vec();
         *imp.cached_events.borrow_mut() = events.to_vec();
@@ -260,7 +265,7 @@ impl AgendaView {
         let events = imp.cached_events.borrow();
         let today = local_today();
         let viewer_timezone = now_local_fixed().offset().to_owned();
-        let plan = render_agenda(
+        let plan = render_agenda_with_detached_events_in_timezone(
             today,
             &imp.agenda_range.borrow(),
             &calendars,
@@ -268,7 +273,7 @@ impl AgendaView {
             &viewer_timezone,
         );
         let event_map: HashMap<Uuid, &Event> =
-            events.iter().map(|event| (event.id, event)).collect();
+            events.iter().map(|(event, _)| (event.id, event)).collect();
         let view_weak = self.downgrade();
         let mut agenda_rows = Vec::new();
 
@@ -644,8 +649,8 @@ fn create_event_card<'a>(
                     .build(),
             );
         }
-        if let Some(event) = event_map.get(&chip.event_id) {
-            let (button, row_state) = create_event_row(chip, event, view_weak, compact, now);
+        if event_map.contains_key(&chip.event_id) {
+            let (button, row_state) = create_event_row(chip, view_weak, compact, now);
             card.append(&button);
             agenda_rows.push(row_state);
         }
@@ -655,12 +660,11 @@ fn create_event_card<'a>(
 
 fn create_event_row(
     chip: &EventChip,
-    event: &Event,
     view_weak: &glib::WeakRef<AgendaView>,
     compact: bool,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> (gtk::Button, AgendaRowState) {
-    let schedule = occurrence_schedule(event, chip);
+    let schedule = viewer_schedule(chip);
     let state = event_state(&schedule, now);
     let preference = load_time_format_preference();
     let system_format = system_clock_format();
@@ -683,7 +687,7 @@ fn create_event_row(
         .css_classes(["agenda-event-row", "flat"])
         .halign(gtk::Align::Fill)
         .can_focus(true)
-        .tooltip_text(&event.title)
+        .tooltip_text(&chip.title)
         .build();
     match state {
         AgendaEventState::Past => button.add_css_class("past"),
@@ -723,7 +727,7 @@ fn create_event_row(
     content.append(&time_label);
 
     let title = gtk::Label::builder()
-        .label(&event.title)
+        .label(&chip.title)
         .hexpand(true)
         .halign(gtk::Align::Fill)
         .xalign(0.0)
@@ -748,11 +752,12 @@ fn create_event_row(
         now_indicator,
         schedule,
         time_text: time,
-        title: event.title.clone(),
+        title: chip.title.clone(),
     };
     apply_row_state(&row_state, state);
 
     let event_id = chip.event_id;
+    let recurrence_id = chip.original_recurrence_id.clone();
     let button_weak = button.downgrade();
     let view_weak = view_weak.clone();
     button.connect_clicked(move |_| {
@@ -760,45 +765,30 @@ fn create_event_row(
             && let Some(button) = button_weak.upgrade()
             && let Some(callback) = view.imp().on_event_activate.borrow().as_ref()
         {
-            callback(event_id, button.upcast::<gtk::Widget>());
+            callback(
+                event_id,
+                recurrence_id.clone(),
+                button.upcast::<gtk::Widget>(),
+            );
         }
     });
     (button, row_state)
 }
 
-fn occurrence_schedule(event: &Event, chip: &EventChip) -> EventSchedule {
-    match (&event.schedule, &chip.viewer_local_end) {
-        (
-            EventSchedule::Timed {
-                start,
-                end,
-                timezone,
-            },
-            calendar::month_view::ViewerLocalEnd::Timed(viewer_end),
-        ) => EventSchedule::Timed {
-            start: viewer_end
-                .checked_sub_signed(*end - *start)
-                .unwrap_or(*viewer_end),
-            end: *viewer_end,
-            timezone: timezone.clone(),
+fn viewer_schedule(chip: &EventChip) -> EventSchedule {
+    match &chip.viewer_local_schedule {
+        calendar::month_view::ViewerLocalSchedule::Timed { start, end } => EventSchedule::Timed {
+            start: *start,
+            end: *end,
+            timezone: None,
         },
-        (
-            EventSchedule::AllDay {
-                start_date,
-                end_date_exclusive,
-            },
-            calendar::month_view::ViewerLocalEnd::AllDay(viewer_end),
-        ) => {
-            let duration = (*end_date_exclusive - *start_date).num_days();
-            let start_date = viewer_end
-                .checked_sub_signed(Duration::days(duration))
-                .unwrap_or(*viewer_end);
-            EventSchedule::AllDay {
-                start_date,
-                end_date_exclusive: *viewer_end,
-            }
-        }
-        _ => event.schedule.clone(),
+        calendar::month_view::ViewerLocalSchedule::AllDay {
+            start_date,
+            end_date_exclusive,
+        } => EventSchedule::AllDay {
+            start_date: *start_date,
+            end_date_exclusive: *end_date_exclusive,
+        },
     }
 }
 

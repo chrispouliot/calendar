@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use uuid::Uuid;
 
-use super::caldav::{CaldavClient, CaldavError, serialize_icalendar_event};
+use super::caldav::{
+    CaldavClient, CaldavError, EventSerializationError, serialize_icalendar_event,
+    serialize_icalendar_resource,
+};
 use super::{
     CalendarRepository, EventRepository, PendingSyncOperationRepository, RemoteSnapshotSummary,
     RepositoryError, SqliteRepository, SyncStateRepository,
@@ -398,7 +401,8 @@ pub fn push_pending_operations(
                     summary.skipped += 1;
                     continue;
                 };
-                let Ok(calendar_data) = serialize_icalendar_event(&event, remote_uid) else {
+                let Ok(calendar_data) = serialize_event_for_push(repository, &event, remote_uid)
+                else {
                     summary.skipped += 1;
                     continue;
                 };
@@ -438,7 +442,8 @@ pub fn push_pending_operations(
                     summary.skipped += 1;
                     continue;
                 };
-                let Ok(calendar_data) = serialize_icalendar_event(&event, remote_uid) else {
+                let Ok(calendar_data) = serialize_event_for_push(repository, &event, remote_uid)
+                else {
                     summary.skipped += 1;
                     continue;
                 };
@@ -500,4 +505,21 @@ fn resource_url(calendar_url: &str, event_id: Uuid) -> Result<String, PushSyncEr
         .join(&format!("{event_id}.ics"))
         .map(|url| url.to_string())
         .map_err(|_| PushSyncError::Caldav(CaldavError::Url))
+}
+
+fn serialize_event_for_push(
+    repository: &SqliteRepository,
+    event: &crate::model::Event,
+    remote_uid: &str,
+) -> Result<String, EventSerializationError> {
+    if event.recurrence.is_none() {
+        return serialize_icalendar_event(event, remote_uid);
+    }
+
+    let detached_events = repository.list_detached_events(event.id);
+    if detached_events.is_empty() {
+        serialize_icalendar_event(event, remote_uid)
+    } else {
+        serialize_icalendar_resource(event, &detached_events, remote_uid)
+    }
 }

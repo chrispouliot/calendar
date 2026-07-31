@@ -1,9 +1,10 @@
 use chrono::{Duration, FixedOffset, NaiveDate};
 
 use crate::agenda_presentation::{display_groups, has_no_upcoming_events};
-use crate::model::{Calendar, Event};
+use crate::model::{Calendar, DetachedEvent, Event};
 use crate::month_view::{
-    AgendaGroup, earliest_projected_event_date_in_timezone, project_agenda_range_in_timezone,
+    AgendaGroup, earliest_projected_event_date_in_timezone,
+    project_agenda_range_with_detached_events_in_timezone,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,14 +50,40 @@ pub fn render_agenda(
     events: &[Event],
     viewer_timezone: &FixedOffset,
 ) -> AgendaRenderPlan {
+    let events_with_detached = events
+        .iter()
+        .cloned()
+        .map(|event| (event, Vec::new()))
+        .collect::<Vec<_>>();
+    render_agenda_with_detached_events_in_timezone(
+        today,
+        range,
+        calendars,
+        &events_with_detached,
+        viewer_timezone,
+    )
+}
+
+/// Build an agenda plan while applying detached recurring-instance changes.
+pub fn render_agenda_with_detached_events_in_timezone(
+    today: NaiveDate,
+    range: &AgendaRange,
+    calendars: &[Calendar],
+    events: &[(Event, Vec<DetachedEvent>)],
+    viewer_timezone: &FixedOffset,
+) -> AgendaRenderPlan {
+    let masters = events
+        .iter()
+        .map(|(event, _)| event.clone())
+        .collect::<Vec<_>>();
     let source_end =
-        earliest_projected_event_date_in_timezone(today, calendars, events, viewer_timezone)
+        earliest_projected_event_date_in_timezone(today, calendars, &masters, viewer_timezone)
             .and_then(|date| date.succ_opt());
     let end_date_exclusive = source_end
         .unwrap_or(range.end_date_exclusive)
         .max(range.end_date_exclusive);
 
-    let projected = project_agenda_range_in_timezone(
+    let projected = project_agenda_range_with_detached_events_in_timezone(
         today,
         end_date_exclusive,
         calendars,

@@ -1,10 +1,10 @@
 use adw::gio;
 use adw::prelude::*;
 use calendar::backend::credentials::{CredentialError, lookup_on_worker};
-use calendar::backend::reminders::reminder_occurrences_in_window;
+use calendar::backend::reminders::reminder_occurrences_with_detached_in_window;
 use calendar::backend::sync::{AccountSyncSummary, AccountSyncWorkerError, sync_account_on_worker};
 use calendar::backend::{AccountRepository, CalendarRepository, EventRepository, SqliteRepository};
-use calendar::model::{Account, Event};
+use calendar::model::{Account, DetachedEvent, Event};
 use calendar::preferences::format_wall_time;
 use calendar::viewer_time::{now_local_fixed, to_local_fixed};
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset};
@@ -330,9 +330,11 @@ struct ReminderSchedulerState {
     app: adw::Application,
     last_checked: DateTime<FixedOffset>,
     delivered: HashSet<DeliveredReminder>,
-    startup_receiver: Option<(DateTime<FixedOffset>, Receiver<Vec<Event>>)>,
-    check_receiver: Option<(DateTime<FixedOffset>, Receiver<Vec<Event>>)>,
+    startup_receiver: Option<(DateTime<FixedOffset>, Receiver<Vec<ReminderEvent>>)>,
+    check_receiver: Option<(DateTime<FixedOffset>, Receiver<Vec<ReminderEvent>>)>,
 }
+
+type ReminderEvent = (Event, Vec<DetachedEvent>);
 
 impl ReminderScheduler {
     fn new(app: &adw::Application, database_path: PathBuf) -> Self {
@@ -385,7 +387,7 @@ impl ReminderScheduler {
     }
 }
 
-fn load_reminder_events_on_worker(database_path: PathBuf) -> Receiver<Vec<Event>> {
+fn load_reminder_events_on_worker(database_path: PathBuf) -> Receiver<Vec<ReminderEvent>> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let worker = move || {
         let events = SqliteRepository::open(database_path)
@@ -394,6 +396,10 @@ fn load_reminder_events_on_worker(database_path: PathBuf) -> Receiver<Vec<Event>
                 repo.list_calendars()
                     .into_iter()
                     .flat_map(|calendar| repo.list_events_for_calendar(calendar.id))
+                    .map(|event| {
+                        let detached_events = repo.list_detached_events(event.id);
+                        (event, detached_events)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -453,12 +459,14 @@ fn poll_reminders(state: &Rc<RefCell<ReminderSchedulerState>>) -> glib::ControlF
 fn seed_startup_reminders(
     state: &Rc<RefCell<ReminderSchedulerState>>,
     now: DateTime<FixedOffset>,
-    events: &[Event],
+    events: &[ReminderEvent],
 ) {
     let start = reminder_window_start(now);
     let mut state = state.borrow_mut();
-    for event in events {
-        for occurrence in reminder_occurrences_in_window(event, start, now) {
+    for (event, detached_events) in events {
+        for occurrence in
+            reminder_occurrences_with_detached_in_window(event, detached_events, start, now)
+        {
             state.delivered.insert(delivered_reminder_key(
                 occurrence.event_id,
                 occurrence.occurrence_start,
@@ -472,7 +480,7 @@ fn seed_startup_reminders(
 fn check_reminders(
     state: &Rc<RefCell<ReminderSchedulerState>>,
     now: DateTime<FixedOffset>,
-    events: &[Event],
+    events: &[ReminderEvent],
 ) {
     let start = reminder_window_start(now);
     {
@@ -484,8 +492,10 @@ fn check_reminders(
     }
 
     let mut due: Vec<(String, DateTime<FixedOffset>, String)> = Vec::new();
-    for event in events {
-        for occurrence in reminder_occurrences_in_window(event, start, now) {
+    for (event, detached_events) in events {
+        for occurrence in
+            reminder_occurrences_with_detached_in_window(event, detached_events, start, now)
+        {
             let key = delivered_reminder_key(
                 occurrence.event_id,
                 occurrence.occurrence_start,
@@ -494,7 +504,7 @@ fn check_reminders(
             );
             if state.borrow_mut().delivered.insert(key) {
                 due.push((
-                    event.title.clone(),
+                    occurrence.title,
                     occurrence.occurrence_start,
                     occurrence.description,
                 ));

@@ -3,11 +3,12 @@ use adw::subclass::prelude::*;
 use calendar::backend::caldav::CaldavDiscovery;
 use calendar::backend::credentials::delete_on_worker;
 use calendar::backend::{
-    AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository, RepositoryError,
-    SqliteRepository,
+    AccountRepository, CalendarRepository, EventDeletionUndo, EventRepository, FollowingUndo,
+    OccurrenceUndo, RepositoryError, SqliteRepository,
 };
 use calendar::model::{
-    Account, Calendar, CalendarSource, EmptyQuickAddTitle, Event, new_quick_add_event,
+    Account, Calendar, CalendarSource, DetachedEvent, EmptyQuickAddTitle, Event, RecurrenceId,
+    new_quick_add_event,
 };
 use calendar::view_state::{ViewKind, ViewState};
 use chrono::{Datelike, NaiveDate};
@@ -191,9 +192,10 @@ mod imp {
             let week_view = crate::ui::week_view::WeekView::new();
             week_view.set_on_event_activate({
                 let win_weak = win_weak.clone();
-                move |event_id, event_widget| {
+                move |event_id, recurrence_id, event_widget| {
                     if let Some(win) = win_weak.upgrade() {
-                        win.imp().open_event_preview(event_id, &event_widget);
+                        win.imp()
+                            .open_event_preview(event_id, recurrence_id, &event_widget);
                     }
                 }
             });
@@ -203,9 +205,10 @@ mod imp {
             let agenda_view = crate::ui::agenda_view::AgendaView::new();
             agenda_view.set_on_event_activate({
                 let win_weak = win_weak.clone();
-                move |event_id, event_widget| {
+                move |event_id, recurrence_id, event_widget| {
                     if let Some(win) = win_weak.upgrade() {
-                        win.imp().open_event_preview(event_id, &event_widget);
+                        win.imp()
+                            .open_event_preview(event_id, recurrence_id, &event_widget);
                     }
                 }
             });
@@ -284,34 +287,37 @@ mod imp {
             let editor = crate::ui::event_editor::EventEditor::new();
             editor.set_on_save({
                 let win_weak = win_weak.clone();
-                move |event, editing| {
-                    win_weak
-                        .upgrade()
-                        .is_some_and(|win| win.imp().persist_editor_event(&event, editing))
+                move |event, editing, occurrence_context| {
+                    win_weak.upgrade().is_some_and(|win| {
+                        win.imp()
+                            .persist_editor_event(&event, editing, occurrence_context)
+                    })
                 }
             });
             editor.set_on_delete({
                 let win_weak = win_weak.clone();
-                move |event_id| {
-                    win_weak
-                        .upgrade()
-                        .is_some_and(|win| win.imp().delete_editor_event(event_id))
+                move |event_id, occurrence_context| {
+                    win_weak.upgrade().is_some_and(|win| {
+                        win.imp().delete_editor_event(event_id, occurrence_context)
+                    })
                 }
             });
 
             let win_weak3 = win_weak.clone();
-            event_popover.set_on_edit_details(move |event_id| {
+            event_popover.set_on_edit_details(move |event_id, recurrence_id| {
                 if let Some(win) = win_weak3.upgrade() {
-                    win.imp().open_event_editor_for_event(event_id);
+                    win.imp()
+                        .open_event_editor_for_event(event_id, recurrence_id);
                 }
             });
 
             // Connect MonthView on_event_activate to open the preview.
             month_view.set_on_event_activate({
                 let win_weak = win_weak.clone();
-                move |event_id, chip_widget| {
+                move |event_id, recurrence_id, chip_widget| {
                     if let Some(win) = win_weak.upgrade() {
-                        win.imp().open_event_preview(event_id, &chip_widget);
+                        win.imp()
+                            .open_event_preview(event_id, recurrence_id, &chip_widget);
                     }
                 }
             });
@@ -672,9 +678,16 @@ impl imp::CalendarWindow {
             let repo_guard = self.repository.borrow();
             let repo = repo_guard.as_ref().expect("repository must be initialised");
             let calendars = repo.list_calendars();
-            let all_events: Vec<Event> = calendars
+            let all_events: Vec<(Event, Vec<DetachedEvent>)> = calendars
                 .iter()
-                .flat_map(|c| repo.list_events_for_calendar(c.id))
+                .flat_map(|c| {
+                    repo.list_events_for_calendar(c.id)
+                        .into_iter()
+                        .map(|event| {
+                            let detached_events = repo.list_detached_events(event.id);
+                            (event, detached_events)
+                        })
+                })
                 .collect();
             (calendars, all_events)
         };
@@ -691,9 +704,16 @@ impl imp::CalendarWindow {
             let repo_guard = self.repository.borrow();
             let repo = repo_guard.as_ref().expect("repository must be initialised");
             let calendars = repo.list_calendars();
-            let all_events: Vec<Event> = calendars
+            let all_events: Vec<(Event, Vec<DetachedEvent>)> = calendars
                 .iter()
-                .flat_map(|calendar| repo.list_events_for_calendar(calendar.id))
+                .flat_map(|calendar| {
+                    repo.list_events_for_calendar(calendar.id)
+                        .into_iter()
+                        .map(|event| {
+                            let detached_events = repo.list_detached_events(event.id);
+                            (event, detached_events)
+                        })
+                })
                 .collect();
             (calendars, all_events)
         };
@@ -710,9 +730,16 @@ impl imp::CalendarWindow {
             let repo_guard = self.repository.borrow();
             let repo = repo_guard.as_ref().expect("repository must be initialised");
             let calendars = repo.list_calendars();
-            let all_events: Vec<Event> = calendars
+            let all_events: Vec<(Event, Vec<DetachedEvent>)> = calendars
                 .iter()
-                .flat_map(|calendar| repo.list_events_for_calendar(calendar.id))
+                .flat_map(|calendar| {
+                    repo.list_events_for_calendar(calendar.id)
+                        .into_iter()
+                        .map(|event| {
+                            let detached_events = repo.list_detached_events(event.id);
+                            (event, detached_events)
+                        })
+                })
                 .collect();
             (calendars, all_events)
         };
@@ -1077,7 +1104,7 @@ impl imp::CalendarWindow {
         adw::prelude::AdwDialogExt::present(&editor, Some(self.obj().upcast_ref::<gtk::Widget>()));
     }
 
-    fn open_event_editor_for_event(&self, event_id: Uuid) {
+    fn open_event_editor_for_event(&self, event_id: Uuid, recurrence_id: Option<RecurrenceId>) {
         let (event, calendar, calendars) = {
             let repo_guard = self.repository.borrow();
             let repo = repo_guard.as_ref().expect("repository must be initialised");
@@ -1097,11 +1124,81 @@ impl imp::CalendarWindow {
             return;
         };
         editor.set_calendars(&calendars);
-        editor.set_event(&event);
-        adw::prelude::AdwDialogExt::present(&editor, Some(self.obj().upcast_ref::<gtk::Widget>()));
+        let Some(recurrence_id) = recurrence_id else {
+            editor.set_event(&event);
+            adw::prelude::AdwDialogExt::present(
+                &editor,
+                Some(self.obj().upcast_ref::<gtk::Widget>()),
+            );
+            return;
+        };
+        let Some(resolved) = self.repository.borrow().as_ref().and_then(|repo| {
+            calendar::month_view::event_for_recurrence_id(
+                &event,
+                &repo.list_detached_events(event.id),
+                &recurrence_id,
+            )
+        }) else {
+            return;
+        };
+
+        let dialog = adw::AlertDialog::new(
+            Some("Edit Recurring Event"),
+            Some("Would you like to edit only this event or all events in the series?"),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("only-this", "Only This Event");
+        let split_result = calendar::recurrence_form::split_recurrence_at(&event, &recurrence_id);
+        if split_result.is_ok() {
+            dialog.add_response("this-following", "This and Following");
+        }
+        dialog.add_response("all", "All Events");
+        dialog.set_close_response("cancel");
+        let editor_weak = editor.downgrade();
+        let win_weak = self.obj().downgrade();
+        let calendars = calendars.clone();
+        dialog.connect_response(None, move |dialog, response| {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            if response == "only-this" {
+                if let Some(editor) = editor_weak.upgrade() {
+                    editor.set_calendars(&calendars);
+                    editor.set_occurrence_event(&resolved, &recurrence_id);
+                    adw::prelude::AdwDialogExt::present(
+                        &editor,
+                        Some(win.upcast_ref::<gtk::Widget>()),
+                    );
+                }
+            } else if response == "this-following" {
+                if let Some(editor) = editor_weak.upgrade() {
+                    editor.set_calendars(&calendars);
+                    let mut following_event = resolved.clone();
+                    following_event.recurrence = event.recurrence.clone();
+                    editor.set_occurrence_and_following_event(&following_event, &recurrence_id);
+                    adw::prelude::AdwDialogExt::present(
+                        &editor,
+                        Some(win.upcast_ref::<gtk::Widget>()),
+                    );
+                }
+            } else if response == "all"
+                && let Some(editor) = editor_weak.upgrade()
+            {
+                editor.set_calendars(&calendars);
+                editor.set_event(&event);
+                adw::prelude::AdwDialogExt::present(&editor, Some(win.upcast_ref::<gtk::Widget>()));
+            }
+            dialog.close();
+        });
+        dialog.present(Some(self.obj().upcast_ref::<gtk::Widget>()));
     }
 
-    fn persist_editor_event(&self, event: &Event, editing: bool) -> bool {
+    fn persist_editor_event(
+        &self,
+        event: &Event,
+        editing: bool,
+        occurrence_context: Option<crate::ui::event_editor::OccurrenceEditContext>,
+    ) -> bool {
         let result = {
             let mut repo_guard = self.repository.borrow_mut();
             let repo = repo_guard.as_mut().expect("repository must be initialised");
@@ -1115,7 +1212,32 @@ impl imp::CalendarWindow {
                     .add_toast(adw::Toast::new("Choose a writable calendar."));
                 return false;
             }
-            if editing {
+            if let Some(context) = occurrence_context {
+                let recurrence_id = context.recurrence_id().clone();
+                let exception = DetachedEvent::Modified {
+                    recurrence_id: recurrence_id.clone(),
+                    title: event.title.clone(),
+                    location: event.location.clone(),
+                    description: event.description.clone(),
+                    schedule: event.schedule.clone(),
+                    reminders: event.reminders.clone(),
+                };
+                match context.scope() {
+                    crate::ui::event_editor::OccurrenceScope::OnlyThis => {
+                        repo.upsert_occurrence_with_sync(event.id, &exception)
+                    }
+                    crate::ui::event_editor::OccurrenceScope::ThisAndFollowing => {
+                        match event.recurrence.as_ref() {
+                            Some(recurrence) => repo
+                                .edit_this_and_following_with_sync_and_recurrence(
+                                    event.id, &exception, recurrence,
+                                )
+                                .map(|_| ()),
+                            None => Err(RepositoryError),
+                        }
+                    }
+                }
+            } else if editing {
                 repo.update_event_with_sync(event)
             } else {
                 repo.create_event_with_sync(event)
@@ -1134,7 +1256,62 @@ impl imp::CalendarWindow {
         }
     }
 
-    fn delete_editor_event(&self, event_id: Uuid) -> bool {
+    fn delete_editor_event(
+        &self,
+        event_id: Uuid,
+        occurrence_context: Option<crate::ui::event_editor::OccurrenceEditContext>,
+    ) -> bool {
+        if let Some(context) = occurrence_context {
+            let recurrence_id = context.recurrence_id().clone();
+            if context.scope() == crate::ui::event_editor::OccurrenceScope::ThisAndFollowing {
+                let undo = {
+                    let mut repo_guard = self.repository.borrow_mut();
+                    let repo = repo_guard.as_mut().expect("repository must be initialised");
+                    match repo.delete_this_and_following_with_sync_undo(event_id, &recurrence_id) {
+                        Ok(undo) => undo,
+                        Err(RepositoryError) => {
+                            self.overlay
+                                .add_toast(adw::Toast::new("Could not delete event."));
+                            return false;
+                        }
+                    }
+                };
+                self.render_all_from_state();
+                self.show_following_delete_toast(undo);
+                return true;
+            }
+            let undo = {
+                let mut repo_guard = self.repository.borrow_mut();
+                let repo = repo_guard.as_mut().expect("repository must be initialised");
+                let Some(event) = repo.get_event(event_id) else {
+                    self.overlay
+                        .add_toast(adw::Toast::new("Could not delete event."));
+                    return false;
+                };
+                let Some(calendar) = repo.get_calendar(event.calendar_id) else {
+                    self.overlay
+                        .add_toast(adw::Toast::new("Could not delete event."));
+                    return false;
+                };
+                if calendar.read_only {
+                    self.overlay
+                        .add_toast(adw::Toast::new("This event is on a read-only calendar."));
+                    return false;
+                }
+                match repo.cancel_occurrence_with_sync_undo(event_id, &recurrence_id) {
+                    Ok(undo) => undo,
+                    Err(RepositoryError) => {
+                        self.overlay
+                            .add_toast(adw::Toast::new("Could not delete event."));
+                        return false;
+                    }
+                }
+            };
+            self.render_all_from_state();
+            self.show_occurrence_delete_toast(undo);
+            return true;
+        }
+
         let undo = {
             let mut repo_guard = self.repository.borrow_mut();
             let repo = repo_guard.as_mut().expect("repository must be initialised");
@@ -1209,6 +1386,92 @@ impl imp::CalendarWindow {
         }
     }
 
+    fn show_occurrence_delete_toast(&self, undo: OccurrenceUndo) {
+        let pending = Rc::new(RefCell::new(Some(undo)));
+        let toast = adw::Toast::builder()
+            .title("Event deleted")
+            .button_label("Undo")
+            .timeout(5)
+            .build();
+
+        let pending_click = pending.clone();
+        let win_weak = self.obj().downgrade();
+        toast.connect_button_clicked(move |_| {
+            let Some(mut undo) = pending_click.borrow_mut().take() else {
+                return;
+            };
+            if let Some(win) = win_weak.upgrade() {
+                let result = {
+                    let mut repo_guard = win.imp().repository.borrow_mut();
+                    let repo = repo_guard.as_mut().expect("repository must be initialised");
+                    repo.undo_occurrence_with_sync(&mut undo)
+                };
+                match result {
+                    Ok(()) => {
+                        win.imp().render_all_from_state();
+                        win.imp()
+                            .overlay
+                            .add_toast(adw::Toast::new("Event restored."));
+                    }
+                    Err(RepositoryError) => {
+                        win.imp()
+                            .overlay
+                            .add_toast(adw::Toast::new("Could not restore event."));
+                    }
+                }
+            }
+        });
+
+        let pending_dismiss = pending.clone();
+        toast.connect_dismissed(move |_| {
+            pending_dismiss.borrow_mut().take();
+        });
+        self.overlay.add_toast(toast);
+    }
+
+    fn show_following_delete_toast(&self, undo: FollowingUndo) {
+        let pending = Rc::new(RefCell::new(Some(undo)));
+        let toast = adw::Toast::builder()
+            .title("This and following events deleted")
+            .button_label("Undo")
+            .timeout(5)
+            .build();
+
+        let pending_click = pending.clone();
+        let win_weak = self.obj().downgrade();
+        toast.connect_button_clicked(move |_| {
+            let Some(mut undo) = pending_click.borrow_mut().take() else {
+                return;
+            };
+            if let Some(win) = win_weak.upgrade() {
+                let result = {
+                    let mut repo_guard = win.imp().repository.borrow_mut();
+                    let repo = repo_guard.as_mut().expect("repository must be initialised");
+                    repo.undo_this_and_following_with_sync(&mut undo)
+                };
+                match result {
+                    Ok(()) => {
+                        win.imp().render_all_from_state();
+                        win.imp()
+                            .overlay
+                            .add_toast(adw::Toast::new("Events restored."));
+                    }
+                    Err(RepositoryError) => {
+                        win.imp()
+                            .overlay
+                            .add_toast(adw::Toast::new("Could not restore events."));
+                    }
+                }
+            }
+        });
+
+        let pending_dismiss = pending.clone();
+        toast.connect_dismissed(move |_| {
+            pending_dismiss.borrow_mut().take();
+        });
+        self.overlay.add_toast(toast);
+    }
+
     /// Compute the widget's allocation rectangle in the window's
     /// coordinate space.  Returns `None` if the transform is unavailable
     /// (e.g. widget not yet realised).
@@ -1230,7 +1493,12 @@ impl imp::CalendarWindow {
     /// Resolve an event from the repository, populate the preview popover,
     /// anchor it at the chip widget, and open it.  Missing events are
     /// handled silently (the popover simply isn't shown).
-    fn open_event_preview(&self, event_id: Uuid, chip_widget: &gtk::Widget) {
+    fn open_event_preview(
+        &self,
+        event_id: Uuid,
+        recurrence_id: Option<RecurrenceId>,
+        chip_widget: &gtk::Widget,
+    ) {
         let Some(popover) = self.event_popover.borrow().clone() else {
             return;
         };
@@ -1238,16 +1506,29 @@ impl imp::CalendarWindow {
         let (event, calendar) = {
             let repo_guard = self.repository.borrow();
             let repo = repo_guard.as_ref().expect("repository must be initialised");
-            let event = match repo.get_event(event_id) {
+            let master = match repo.get_event(event_id) {
                 Some(ev) => ev,
                 None => return, // silently ignore missing events
+            };
+            let event = if let Some(recurrence_id) = recurrence_id.as_ref() {
+                let detached = repo.list_detached_events(master.id);
+                match calendar::month_view::event_for_recurrence_id(
+                    &master,
+                    &detached,
+                    recurrence_id,
+                ) {
+                    Some(event) => event,
+                    None => return, // cancelled or invalid occurrence
+                }
+            } else {
+                master
             };
             let calendar = repo.get_calendar(event.calendar_id);
             (event, calendar)
         };
 
         let today = today_local();
-        popover.set_event(&event, calendar.as_ref(), today);
+        popover.set_event(&event, calendar.as_ref(), today, recurrence_id.as_ref());
 
         let rect = self.compute_widget_rect(chip_widget);
         if let Some(r) = rect {

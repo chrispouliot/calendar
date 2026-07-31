@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::model::{Calendar, Event};
-use calendar::month_view::project_month;
+use calendar::model::{Calendar, DetachedEvent, Event, RecurrenceId};
+use calendar::month_view::project_month_with_detached_events_in_timezone;
 use calendar::preferences::format_wall_time;
 use calendar::viewer_time::now_local_fixed;
 use calendar::weeks_buffer::{TOTAL_ROWS, VISIBLE_START, WeeksBuffer};
@@ -25,7 +25,7 @@ type GeometryFn = Box<dyn Fn(i32, f64)>;
 /// a chip widget inside a day cell.  Carries the event UUID and a
 /// reference to the chip widget so the host can resolve the event from
 /// the repository and anchor the preview popover at the chip.
-type EventActivateFn = Box<dyn Fn(uuid::Uuid, gtk::Widget)>;
+type EventActivateFn = Box<dyn Fn(uuid::Uuid, Option<RecurrenceId>, gtk::Widget)>;
 
 /// Callback type for dominant-month change (title update).
 type MonthChangedFn = Box<dyn Fn(i32, u32)>;
@@ -352,7 +352,7 @@ mod imp {
 
         /// Cached calendars and events for repopulation after recycling.
         pub cached_calendars: RefCell<Vec<Calendar>>,
-        pub cached_events: RefCell<Vec<Event>>,
+        pub cached_events: RefCell<Vec<(Event, Vec<DetachedEvent>)>>,
 
         /// Day buttons: 105 buttons (15 rows × 7 columns), created once.
         pub day_buttons: RefCell<Vec<gtk::Button>>,
@@ -663,7 +663,10 @@ impl MonthView {
     /// a day cell.  The (event_id, chip_widget) pair lets the host resolve
     /// the event from the repository and anchor a preview popover at the
     /// chip's on-screen location.
-    pub fn set_on_event_activate<F: Fn(Uuid, gtk::Widget) + 'static>(&self, f: F) {
+    pub fn set_on_event_activate<F: Fn(Uuid, Option<RecurrenceId>, gtk::Widget) + 'static>(
+        &self,
+        f: F,
+    ) {
         *self.imp().on_event_activate.borrow_mut() = Some(Box::new(f));
     }
 
@@ -739,7 +742,7 @@ impl MonthView {
     // ── Rendering ──
 
     /// Store fresh calendars/events and fully repopulate all 105 cells.
-    pub fn render(&self, calendars: &[Calendar], events: &[Event]) {
+    pub fn render(&self, calendars: &[Calendar], events: &[(Event, Vec<DetachedEvent>)]) {
         let imp = self.imp();
         *imp.cached_calendars.borrow_mut() = calendars.to_vec();
         *imp.cached_events.borrow_mut() = events.to_vec();
@@ -841,6 +844,7 @@ fn create_chip_widget(
     // and a weak MonthView reference so the closure can access the callback
     // without owning the chip data past render.
     let event_id = chip.event_id;
+    let recurrence_id = chip.original_recurrence_id.clone();
     let mv_weak = month_view_weak.clone();
     let hbox_weak = hbox.downgrade();
     let gesture = gtk::GestureClick::new();
@@ -855,7 +859,7 @@ fn create_chip_widget(
             && let Some(hb) = hbox_weak.upgrade()
             && let Some(cb) = mv.imp().on_event_activate.borrow().as_ref()
         {
-            cb(event_id, hb.upcast::<gtk::Widget>());
+            cb(event_id, recurrence_id.clone(), hb.upcast::<gtk::Widget>());
         }
     });
     hbox.add_controller(gesture);
@@ -910,7 +914,7 @@ struct DayProjection {
 fn project_buffer_dates(
     buf: &WeeksBuffer,
     calendars: &[Calendar],
-    events: &[Event],
+    events: &[(Event, Vec<DetachedEvent>)],
 ) -> Vec<DayProjection> {
     let mut unique_dates: Vec<NaiveDate> = Vec::new();
     for row in 0..TOTAL_ROWS {
@@ -931,7 +935,13 @@ fn project_buffer_dates(
 
     let mut date_map: HashMap<NaiveDate, DayProjection> = HashMap::new();
     for &(year, month) in &months {
-        let proj = project_month(year, month, calendars, events);
+        let proj = project_month_with_detached_events_in_timezone(
+            year,
+            month,
+            calendars,
+            events,
+            &chrono::Local,
+        );
         for day in proj {
             if unique_dates.contains(&day.date) && !date_map.contains_key(&day.date) {
                 date_map.insert(

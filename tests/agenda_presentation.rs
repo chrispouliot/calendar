@@ -34,7 +34,9 @@ use calendar::agenda_presentation::{
     AgendaEventState, AgendaTimeLayout, event_state, has_no_upcoming_events, time_text,
 };
 use calendar::model::EventSchedule;
-use calendar::month_view::{AgendaGroup, DayProjection, EventChip, ViewerLocalEnd};
+use calendar::month_view::{
+    AgendaGroup, DayProjection, EventChip, ViewerLocalEnd, ViewerLocalSchedule,
+};
 use calendar::time_format::TimeFormatPreference;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, TimeZone};
 use uuid::Uuid;
@@ -66,6 +68,11 @@ fn timed_chip() -> EventChip {
         is_all_day: false,
         start_time: Some(time(14, 30)),
         viewer_local_end: ViewerLocalEnd::Timed(at(2026, 5, 14, 15, 45)),
+        viewer_local_schedule: ViewerLocalSchedule::Timed {
+            start: at(2026, 5, 14, 14, 30),
+            end: at(2026, 5, 14, 15, 45),
+        },
+        original_recurrence_id: None,
     }
 }
 

@@ -6,7 +6,9 @@
 // presentation function must not depend on GTK, storage, settings, or a clock.
 
 use calendar::agenda_presentation::display_groups;
-use calendar::month_view::{AgendaGroup, DayProjection, EventChip, ViewerLocalEnd};
+use calendar::month_view::{
+    AgendaGroup, DayProjection, EventChip, ViewerLocalEnd, ViewerLocalSchedule,
+};
 use chrono::NaiveDate;
 use uuid::Uuid;
 
@@ -26,6 +28,11 @@ fn event_day(day: u32, title: &str) -> AgendaGroup {
             is_all_day: true,
             start_time: None,
             viewer_local_end: ViewerLocalEnd::AllDay(date(day + 1)),
+            viewer_local_schedule: ViewerLocalSchedule::AllDay {
+                start_date: date(day),
+                end_date_exclusive: date(day + 1),
+            },
+            original_recurrence_id: None,
         }],
         timed: Vec::new(),
     })

@@ -5,7 +5,7 @@ pub mod sync;
 
 mod sqlite;
 
-pub use sqlite::SqliteRepository;
+pub use sqlite::{FollowingEditResult, FollowingUndo, OccurrenceUndo, SqliteRepository};
 
 use std::collections::HashMap;
 use uuid::Uuid;

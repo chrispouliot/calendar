@@ -5,7 +5,7 @@ use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveTime, Ti
 use rrule::{RRuleSet, Tz as RRuleTz};
 
 use crate::calendar_grid::month_grid;
-use crate::model::{Calendar, Event, EventSchedule};
+use crate::model::{Calendar, DetachedEvent, Event, EventSchedule, RecurrenceId};
 use crate::viewer_time::to_local_fixed;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub struct EventChip {
     pub is_all_day: bool,
     pub start_time: Option<NaiveTime>,
     pub viewer_local_end: ViewerLocalEnd,
+    pub viewer_local_schedule: ViewerLocalSchedule,
+    pub original_recurrence_id: Option<RecurrenceId>,
 }
 
 impl EventChip {
@@ -35,6 +37,18 @@ impl EventChip {
 pub enum ViewerLocalEnd {
     Timed(DateTime<FixedOffset>),
     AllDay(NaiveDate),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewerLocalSchedule {
+    Timed {
+        start: DateTime<FixedOffset>,
+        end: DateTime<FixedOffset>,
+    },
+    AllDay {
+        start_date: NaiveDate,
+        end_date_exclusive: NaiveDate,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +90,31 @@ pub fn project_month_in_timezone<Tz: TimeZone>(
 ) -> [DayProjection; 42] {
     let localizer = TimezoneLocalizer(viewer_timezone);
     project_month_with_localizer(year, month, calendars, events, &localizer)
+}
+
+/// Projects a fixed month grid while applying detached recurring-instance
+/// changes using the supplied timezone for timed-event date boundaries.
+pub fn project_month_with_detached_events_in_timezone<Tz: TimeZone>(
+    year: i32,
+    month: u32,
+    calendars: &[Calendar],
+    events: &[(Event, Vec<DetachedEvent>)],
+    viewer_timezone: &Tz,
+) -> [DayProjection; 42] {
+    let localizer = TimezoneLocalizer(viewer_timezone);
+    let grid = month_grid(year, month);
+    let projection = project_dates_with_detached_events(
+        grid.into_iter().map(|cell| {
+            let date =
+                NaiveDate::from_ymd_opt(cell.year, cell.month, cell.day).expect("valid grid cell");
+            (date, cell.in_displayed_month)
+        }),
+        calendars,
+        events,
+        &localizer,
+    );
+
+    projection.try_into().expect("month grid has 42 cells")
 }
 
 fn project_month_with_localizer(
@@ -120,6 +159,26 @@ pub fn project_week_in_timezone<Tz: TimeZone>(
 ) -> [DayProjection; 7] {
     let localizer = TimezoneLocalizer(viewer_timezone);
     project_week_with_localizer(active_date, calendars, events, &localizer)
+}
+
+/// Projects the Monday-first week containing `active_date` while applying
+/// detached recurring-instance changes using the supplied timezone.
+pub fn project_week_with_detached_events_in_timezone<Tz: TimeZone>(
+    active_date: NaiveDate,
+    calendars: &[Calendar],
+    events: &[(Event, Vec<DetachedEvent>)],
+    viewer_timezone: &Tz,
+) -> [DayProjection; 7] {
+    let localizer = TimezoneLocalizer(viewer_timezone);
+    let monday = active_date - Duration::days(active_date.weekday().num_days_from_monday() as i64);
+    let projection = project_dates_with_detached_events(
+        (0..7).map(|offset| (monday + Duration::days(offset), true)),
+        calendars,
+        events,
+        &localizer,
+    );
+
+    projection.try_into().expect("week has 7 days")
 }
 
 fn project_week_with_localizer(
@@ -214,6 +273,35 @@ pub fn project_agenda_range_in_timezone<Tz: TimeZone>(
     )
 }
 
+/// Projects a date range while applying detached recurring-instance changes.
+///
+/// Detached instances retain the master's event id and are resolved against
+/// the generated occurrence identified by their `RecurrenceId`.  The normal
+/// projection entry points intentionally remain unchanged; callers without
+/// detached instances should continue to use those APIs.
+pub fn project_agenda_range_with_detached_events_in_timezone<Tz: TimeZone>(
+    start_date: NaiveDate,
+    end_date_exclusive: NaiveDate,
+    calendars: &[Calendar],
+    events: &[(Event, Vec<DetachedEvent>)],
+    viewer_timezone: &Tz,
+) -> Vec<AgendaGroup> {
+    if start_date >= end_date_exclusive {
+        return Vec::new();
+    }
+
+    let localizer = TimezoneLocalizer(viewer_timezone);
+    let mut dates = Vec::new();
+    let mut date = start_date;
+    while date < end_date_exclusive {
+        dates.push((date, true));
+        date += Duration::days(1);
+    }
+
+    let days = project_dates_with_detached_events(dates, calendars, events, &localizer);
+    agenda_groups(days, end_date_exclusive)
+}
+
 fn project_agenda_range_with_localizer(
     start_date: NaiveDate,
     end_date_exclusive: NaiveDate,
@@ -233,6 +321,10 @@ fn project_agenda_range_with_localizer(
     }
 
     let days = project_dates(dates, calendars, events, localizer);
+    agenda_groups(days, end_date_exclusive)
+}
+
+fn agenda_groups(days: Vec<DayProjection>, end_date_exclusive: NaiveDate) -> Vec<AgendaGroup> {
     let mut groups = Vec::new();
     let mut empty_start = None;
 
@@ -261,8 +353,223 @@ fn project_agenda_range_with_localizer(
     groups
 }
 
+fn project_dates_with_detached_events(
+    dates: impl IntoIterator<Item = (NaiveDate, bool)>,
+    calendars: &[Calendar],
+    events: &[(Event, Vec<DetachedEvent>)],
+    localizer: &impl ViewerLocalizer,
+) -> Vec<DayProjection> {
+    let dates: Vec<(NaiveDate, bool)> = dates.into_iter().collect();
+    let projected_events = expand_events_with_detached(&dates, events);
+    let projection = dates
+        .iter()
+        .map(|(date, in_displayed_month)| DayProjection {
+            date: *date,
+            in_displayed_month: *in_displayed_month,
+            all_day: Vec::new(),
+            timed: Vec::new(),
+        })
+        .collect();
+    project_projected_events(projection, calendars, projected_events, localizer)
+}
+
+fn expand_events_with_detached(
+    dates: &[(NaiveDate, bool)],
+    events: &[(Event, Vec<DetachedEvent>)],
+) -> Vec<ProjectedEvent> {
+    let Some((first_date, _)) = dates.first() else {
+        return Vec::new();
+    };
+    let Some((last_date, _)) = dates.last() else {
+        return Vec::new();
+    };
+    let mut projected_events = Vec::new();
+
+    for (master, detached_events) in events {
+        if detached_events.is_empty() {
+            projected_events.extend(expand_event_with_identity(master, *first_date, *last_date));
+            continue;
+        }
+        if master.recurrence.is_none() {
+            projected_events.push(ProjectedEvent {
+                event: master.clone(),
+                original_recurrence_id: None,
+            });
+            continue;
+        }
+
+        for occurrence in expand_event(master, *first_date, *last_date) {
+            if detached_events.iter().any(|detached| {
+                detached_recurrence_id(detached)
+                    .is_some_and(|id| recurrence_id_matches(master, &occurrence.schedule, id))
+            }) {
+                continue;
+            }
+            projected_events.push(ProjectedEvent {
+                original_recurrence_id: recurrence_id_for_generated_occurrence(master, &occurrence),
+                event: occurrence,
+            });
+        }
+
+        for detached in detached_events {
+            let DetachedEvent::Modified {
+                recurrence_id,
+                title,
+                location,
+                description,
+                schedule,
+                reminders,
+            } = detached
+            else {
+                continue;
+            };
+
+            if generated_occurrence_for_recurrence_id(master, recurrence_id).is_none() {
+                continue;
+            }
+
+            projected_events.push(ProjectedEvent {
+                event: Event {
+                    id: master.id,
+                    calendar_id: master.calendar_id,
+                    title: title.clone(),
+                    location: location.clone(),
+                    description: description.clone(),
+                    schedule: schedule.clone(),
+                    recurrence: None,
+                    reminders: reminders.clone(),
+                },
+                original_recurrence_id: Some(recurrence_id.clone()),
+            });
+        }
+    }
+
+    projected_events
+}
+
+fn detached_recurrence_id(detached: &DetachedEvent) -> Option<&RecurrenceId> {
+    match detached {
+        DetachedEvent::Modified { recurrence_id, .. }
+        | DetachedEvent::Cancelled { recurrence_id } => Some(recurrence_id),
+    }
+}
+
+fn generated_occurrence_for_recurrence_id(
+    master: &Event,
+    recurrence_id: &RecurrenceId,
+) -> Option<Event> {
+    master.recurrence.as_ref()?;
+    let target_date = recurrence_id_date(master, recurrence_id)?;
+    expand_event(master, target_date, target_date)
+        .into_iter()
+        .find(|occurrence| {
+            occurrence.recurrence.is_none()
+                && recurrence_id_matches(master, &occurrence.schedule, recurrence_id)
+        })
+}
+
+/// Resolve one generated recurring occurrence, applying its detached change
+/// when present.  The returned event is always recurrence-free and retains the
+/// master's durable identity for both generated and detached instances.
+pub fn event_for_recurrence_id(
+    master: &Event,
+    detached_events: &[DetachedEvent],
+    recurrence_id: &RecurrenceId,
+) -> Option<Event> {
+    let generated = generated_occurrence_for_recurrence_id(master, recurrence_id)?;
+    let detached = detached_events.iter().find(|detached| {
+        detached_recurrence_id(detached).is_some_and(|detached_id| {
+            recurrence_id_matches(master, &generated.schedule, detached_id)
+        })
+    });
+
+    match detached {
+        Some(DetachedEvent::Cancelled { .. }) => None,
+        Some(DetachedEvent::Modified {
+            title,
+            location,
+            description,
+            schedule,
+            reminders,
+            ..
+        }) => Some(Event {
+            id: master.id,
+            calendar_id: master.calendar_id,
+            title: title.clone(),
+            location: location.clone(),
+            description: description.clone(),
+            schedule: schedule.clone(),
+            recurrence: None,
+            reminders: reminders.clone(),
+        }),
+        None => Some(generated),
+    }
+}
+
+fn recurrence_id_date(master: &Event, recurrence_id: &RecurrenceId) -> Option<NaiveDate> {
+    match (&master.schedule, recurrence_id) {
+        (EventSchedule::AllDay { .. }, RecurrenceId::AllDay(date)) => Some(*date),
+        (
+            EventSchedule::Timed {
+                timezone: master_timezone,
+                ..
+            },
+            RecurrenceId::Timed {
+                date_time,
+                timezone: recurrence_timezone,
+            },
+        ) if master_timezone == recurrence_timezone => match master_timezone.as_deref() {
+            Some(timezone) => {
+                let timezone = chrono_tz::Tz::from_str(timezone).ok()?;
+                Some(date_time.with_timezone(&timezone).date_naive())
+            }
+            None => Some(date_time.with_timezone(&Utc).date_naive()),
+        },
+        _ => None,
+    }
+}
+
+fn recurrence_id_matches(
+    master: &Event,
+    occurrence_schedule: &EventSchedule,
+    recurrence_id: &RecurrenceId,
+) -> bool {
+    match (&master.schedule, occurrence_schedule, recurrence_id) {
+        (
+            EventSchedule::AllDay { .. },
+            EventSchedule::AllDay { start_date, .. },
+            RecurrenceId::AllDay(recurrence_date),
+        ) => start_date == recurrence_date,
+        (
+            EventSchedule::Timed {
+                timezone: master_timezone,
+                ..
+            },
+            EventSchedule::Timed { start, .. },
+            RecurrenceId::Timed {
+                date_time,
+                timezone: recurrence_timezone,
+            },
+        ) if master_timezone == recurrence_timezone => match master_timezone.as_deref() {
+            Some(timezone) => chrono_tz::Tz::from_str(timezone)
+                .map(|timezone| {
+                    start.with_timezone(&timezone).naive_local()
+                        == date_time.with_timezone(&timezone).naive_local()
+                })
+                .unwrap_or(false),
+            None => *start == *date_time,
+        },
+        _ => false,
+    }
+}
+
 trait ViewerLocalizer {
     fn localize(&self, value: &DateTime<FixedOffset>) -> DateTime<FixedOffset>;
+}
+
+struct ProjectedEvent {
+    event: Event,
+    original_recurrence_id: Option<RecurrenceId>,
 }
 
 struct GlibLocalizer;
@@ -287,6 +594,36 @@ fn project_dates(
     events: &[Event],
     localizer: &impl ViewerLocalizer,
 ) -> Vec<DayProjection> {
+    let dates: Vec<(NaiveDate, bool)> = dates.into_iter().collect();
+    let projection = dates
+        .iter()
+        .map(|(date, in_displayed_month)| DayProjection {
+            date: *date,
+            in_displayed_month: *in_displayed_month,
+            all_day: Vec::new(),
+            timed: Vec::new(),
+        })
+        .collect();
+
+    let first_date = dates.first().map(|(date, _)| *date);
+    let last_date = dates.last().map(|(date, _)| *date);
+    let expanded_events: Vec<ProjectedEvent> = match (first_date, last_date) {
+        (Some(first), Some(last)) => events
+            .iter()
+            .flat_map(|event| expand_event_with_identity(event, first, last))
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    project_projected_events(projection, calendars, expanded_events, localizer)
+}
+
+fn project_projected_events(
+    mut projection: Vec<DayProjection>,
+    calendars: &[Calendar],
+    mut expanded_events: Vec<ProjectedEvent>,
+    localizer: &impl ViewerLocalizer,
+) -> Vec<DayProjection> {
     // Visible calendars indexed by id.
     let cal_map: HashMap<uuid::Uuid, &Calendar> = calendars
         .iter()
@@ -294,38 +631,21 @@ fn project_dates(
         .map(|c| (c.id, c))
         .collect();
 
-    // Build an empty projection in the requested date order.
-    let mut projection: Vec<DayProjection> = dates
-        .into_iter()
-        .map(|(date, in_displayed_month)| DayProjection {
-            date,
-            in_displayed_month,
-            all_day: Vec::new(),
-            timed: Vec::new(),
-        })
-        .collect();
-
-    let first_date = projection.first().map(|day| day.date);
-    let last_date = projection.last().map(|day| day.date);
-    let mut expanded_events: Vec<Event> = match (first_date, last_date) {
-        (Some(first), Some(last)) => events
-            .iter()
-            .flat_map(|event| expand_event(event, first, last))
-            .collect(),
-        _ => Vec::new(),
-    };
-    expanded_events.sort_by(|a, b| match (&a.schedule, &b.schedule) {
+    expanded_events.sort_by(|a, b| match (&a.event.schedule, &b.event.schedule) {
         (
             EventSchedule::Timed { start: a_start, .. },
             EventSchedule::Timed { start: b_start, .. },
-        ) => a_start.cmp(b_start).then_with(|| a.id.cmp(&b.id)),
+        ) => a_start
+            .cmp(b_start)
+            .then_with(|| a.event.id.cmp(&b.event.id)),
         (EventSchedule::AllDay { .. }, EventSchedule::Timed { .. }) => std::cmp::Ordering::Less,
         (EventSchedule::Timed { .. }, EventSchedule::AllDay { .. }) => std::cmp::Ordering::Greater,
         (EventSchedule::AllDay { .. }, EventSchedule::AllDay { .. }) => std::cmp::Ordering::Equal,
     });
 
     // Timed events are already ordered by each expanded occurrence's start.
-    for event in &expanded_events {
+    for projected_event in &expanded_events {
+        let event = &projected_event.event;
         let cal = match cal_map.get(&event.calendar_id) {
             Some(c) => c,
             None => continue,
@@ -352,6 +672,11 @@ fn project_dates(
                             viewer_local_end: ViewerLocalEnd::AllDay(
                                 last_event_date + Duration::days(1),
                             ),
+                            viewer_local_schedule: ViewerLocalSchedule::AllDay {
+                                start_date: first_event_date,
+                                end_date_exclusive: last_event_date + Duration::days(1),
+                            },
+                            original_recurrence_id: projected_event.original_recurrence_id.clone(),
                         });
                     }
                     date += Duration::days(1);
@@ -372,6 +697,8 @@ fn project_dates(
                             is_all_day: false,
                             start_time: Some(start.time()),
                             viewer_local_end: ViewerLocalEnd::Timed(end),
+                            viewer_local_schedule: ViewerLocalSchedule::Timed { start, end },
+                            original_recurrence_id: projected_event.original_recurrence_id.clone(),
                         });
                     }
                     date += Duration::days(1);
@@ -437,6 +764,44 @@ pub(crate) fn earliest_projected_event_date_in_timezone<Tz: TimeZone>(
 }
 
 const RECURRENCE_LIMIT: u16 = 4096;
+
+fn expand_event_with_identity(
+    event: &Event,
+    first: NaiveDate,
+    last: NaiveDate,
+) -> Vec<ProjectedEvent> {
+    expand_event(event, first, last)
+        .into_iter()
+        .map(|occurrence| {
+            let original_recurrence_id = recurrence_id_for_generated_occurrence(event, &occurrence);
+            ProjectedEvent {
+                event: occurrence,
+                original_recurrence_id,
+            }
+        })
+        .collect()
+}
+
+fn recurrence_id_for_generated_occurrence(
+    master: &Event,
+    occurrence: &Event,
+) -> Option<RecurrenceId> {
+    if master.recurrence.is_none() || occurrence.recurrence.is_some() {
+        return None;
+    }
+    match (&master.schedule, &occurrence.schedule) {
+        (EventSchedule::AllDay { .. }, EventSchedule::AllDay { start_date, .. }) => {
+            Some(RecurrenceId::AllDay(*start_date))
+        }
+        (EventSchedule::Timed { timezone, .. }, EventSchedule::Timed { start, .. }) => {
+            Some(RecurrenceId::Timed {
+                date_time: *start,
+                timezone: timezone.clone(),
+            })
+        }
+        _ => None,
+    }
+}
 
 fn expand_event(event: &Event, first: NaiveDate, last: NaiveDate) -> Vec<Event> {
     if event.recurrence.is_none() {

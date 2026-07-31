@@ -98,6 +98,14 @@ template $EventEditor: Adw.Dialog {
         }
 
         Adw.PreferencesGroup recurrence_reminder_group {
+          Label occurrence_only_label {
+            label: _("Only this occurrence will be changed. The recurrence rule is not editable here.");
+            wrap: true;
+            xalign: 0.0;
+            visible: false;
+            styles ["dim-label"]
+          }
+
           Adw.ComboRow repeat_row {
             title: _("Repeat");
           }

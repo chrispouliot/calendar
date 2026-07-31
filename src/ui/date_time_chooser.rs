@@ -213,6 +213,11 @@ impl DateTimeChooser {
         ))
     }
 
+    pub fn set_date_controls_sensitive(&self, start: bool, end: bool) {
+        self.imp().start_date_row.set_sensitive(start);
+        self.imp().end_date_row.set_sensitive(end);
+    }
+
     pub fn set_on_changed<F: Fn() + 'static>(&self, callback: F) {
         *self.imp().on_changed.borrow_mut() = Some(Box::new(callback));
     }
