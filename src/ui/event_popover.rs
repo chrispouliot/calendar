@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -11,6 +11,8 @@ use gtk::glib;
 /// Edit-Details callback: invoked with the persisted event ID when the user
 /// presses the action button.
 type EditDetailsFn = Box<dyn Fn(uuid::Uuid, Option<RecurrenceId>)>;
+
+const LOCATION_HOVER_CLASS: &str = "location-link-hover";
 
 mod imp {
     use super::*;
@@ -45,6 +47,8 @@ mod imp {
         pub current_event: RefCell<Option<Event>>,
         pub current_calendar: RefCell<Option<Calendar>>,
         pub current_today: RefCell<Option<NaiveDate>>,
+        pub location_hover_armed: Cell<bool>,
+        pub location_hover_generation: Cell<u64>,
     }
 
     #[glib::object_subclass]
@@ -77,17 +81,46 @@ mod imp {
         }
     }
 
-    impl ObjectImpl for EventPopover {}
+    impl ObjectImpl for EventPopover {
+        fn constructed(&self) {
+            self.parent_constructed();
+
+            let motion = gtk::EventControllerMotion::new();
+            let weak = self.obj().downgrade();
+            motion.connect_motion(move |_, _, _| {
+                if let Some(popover) = weak.upgrade() {
+                    popover.set_location_hover(true);
+                }
+            });
+
+            let weak = self.obj().downgrade();
+            motion.connect_leave(move |_| {
+                if let Some(popover) = weak.upgrade() {
+                    popover.set_location_hover(false);
+                }
+            });
+
+            self.location_link_button.add_controller(motion);
+        }
+    }
 
     impl WidgetImpl for EventPopover {
         fn map(&self) {
             self.parent_map();
+            let popover = self.obj();
+            popover.reset_location_hover();
+            popover.schedule_location_hover_arming();
             self.action_button.grab_focus();
             if let Some(root) = self.obj().root()
                 && let Ok(window) = root.downcast::<gtk::Window>()
             {
                 window.set_focus_visible(false);
             }
+        }
+
+        fn unmap(&self) {
+            self.obj().reset_location_hover();
+            self.parent_unmap();
         }
     }
     impl PopoverImpl for EventPopover {}
@@ -110,6 +143,51 @@ impl EventPopover {
         glib::Object::new()
     }
 
+    fn set_location_hover(&self, hovered: bool) {
+        let imp = self.imp();
+        if hovered
+            && imp.location_hover_armed.get()
+            && self.is_mapped()
+            && imp.location_box.is_visible()
+            && imp.location_link_button.is_visible()
+        {
+            imp.location_link_button.add_css_class(LOCATION_HOVER_CLASS);
+        } else {
+            imp.location_link_button
+                .remove_css_class(LOCATION_HOVER_CLASS);
+        }
+    }
+
+    fn reset_location_hover(&self) {
+        let imp = self.imp();
+        imp.location_hover_armed.set(false);
+        imp.location_hover_generation
+            .set(imp.location_hover_generation.get().wrapping_add(1));
+        imp.location_link_button
+            .remove_css_class(LOCATION_HOVER_CLASS);
+    }
+
+    fn schedule_location_hover_arming(&self) {
+        if !self.is_mapped() {
+            return;
+        }
+
+        let generation = self.imp().location_hover_generation.get();
+        let weak = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(popover) = weak.upgrade() {
+                let imp = popover.imp();
+                if imp.location_hover_generation.get() == generation
+                    && popover.is_mapped()
+                    && imp.location_box.is_visible()
+                    && imp.location_link_button.is_visible()
+                {
+                    imp.location_hover_armed.set(true);
+                }
+            }
+        });
+    }
+
     /// Register the Edit Details callback.
     pub fn set_on_edit_details<F: Fn(uuid::Uuid, Option<RecurrenceId>) + 'static>(&self, f: F) {
         *self.imp().on_edit_details.borrow_mut() = Some(Box::new(f));
@@ -127,6 +205,7 @@ impl EventPopover {
         today: NaiveDate,
         recurrence_id: Option<&RecurrenceId>,
     ) {
+        self.reset_location_hover();
         let imp = self.imp();
         *imp.event_id.borrow_mut() = Some(event.id);
         *imp.recurrence_id.borrow_mut() = recurrence_id.cloned();
@@ -153,6 +232,8 @@ impl EventPopover {
         // Location
         let loc = event.location.trim();
         if loc.is_empty() {
+            imp.location_link_button.set_visible(false);
+            imp.location_label.set_visible(false);
             imp.location_box.set_visible(false);
         } else {
             if let Some((url, label)) = interpret_location_url(loc) {
@@ -166,6 +247,10 @@ impl EventPopover {
                 imp.location_label.set_visible(true);
             }
             imp.location_box.set_visible(true);
+        }
+
+        if self.is_mapped() && imp.location_link_button.is_visible() {
+            self.schedule_location_hover_arming();
         }
 
         // Action button: read-only → view-only icon/tooltip.

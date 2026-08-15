@@ -380,7 +380,12 @@ label.no-events {
 }
 
 /* Keep the location URL link compact while making its hover state clear. */
-button.location-link:hover {
+button.location-link {
+  background-color: transparent;
+  transition: none;
+}
+
+button.location-link.location-link-hover {
   background-color: alpha(var(--accent-color), 0.12);
 }
 
