@@ -379,6 +379,11 @@ label.no-events {
   font-style: italic;
 }
 
+/* Keep the location URL link compact while making its hover state clear. */
+button.location-link:hover {
+  background-color: alpha(var(--accent-color), 0.12);
+}
+
 /* Compact calendar visibility rows, matching the navigation-sidebar list. */
 .calendar-list {
   padding-top: 4px;
