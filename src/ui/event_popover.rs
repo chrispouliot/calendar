@@ -33,6 +33,10 @@ mod imp {
         #[template_child]
         pub location_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub location_link_button: TemplateChild<gtk::LinkButton>,
+        #[template_child]
+        pub location_link_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub action_button: TemplateChild<gtk::Button>,
 
         pub on_edit_details: RefCell<Option<EditDetailsFn>>,
@@ -73,11 +77,7 @@ mod imp {
         }
     }
 
-    impl ObjectImpl for EventPopover {
-        fn constructed(&self) {
-            self.parent_constructed();
-        }
-    }
+    impl ObjectImpl for EventPopover {}
 
     impl WidgetImpl for EventPopover {
         fn map(&self) {
@@ -155,7 +155,16 @@ impl EventPopover {
         if loc.is_empty() {
             imp.location_box.set_visible(false);
         } else {
-            imp.location_label.set_label(loc);
+            if let Some((url, label)) = interpret_location_url(loc) {
+                imp.location_label.set_visible(false);
+                imp.location_link_label.set_label(&label);
+                imp.location_link_button.set_uri(&url);
+                imp.location_link_button.set_visible(true);
+            } else {
+                imp.location_link_button.set_visible(false);
+                imp.location_label.set_label(loc);
+                imp.location_label.set_visible(true);
+            }
             imp.location_box.set_visible(true);
         }
 
@@ -267,5 +276,71 @@ fn month_name(month: u32) -> &'static str {
         11 => "November",
         12 => "December",
         _ => unreachable!(),
+    }
+}
+
+fn interpret_location_url(location: &str) -> Option<(String, String)> {
+    let trimmed = location.trim();
+    let url = reqwest::Url::parse(trimmed).ok()?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+
+    let hostname = url.host_str()?;
+    let hostname = hostname.strip_prefix("www.").unwrap_or(hostname);
+    let label = if hostname == "zoom.us" || hostname.ends_with(".zoom.us") {
+        "Zoom"
+    } else {
+        hostname
+    };
+
+    Some((trimmed.to_string(), label.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Acceptance test for the pure event-location URL interpreter.
+    //!
+    //! `interpret_location_url` is a free function in this module; calling it
+    //! directly does not require GTK initialization, the GResource, or popover
+    //! construction.
+    use super::interpret_location_url;
+
+    #[test]
+    fn interprets_web_locations_as_trimmed_urls_with_friendly_site_labels() {
+        let cases = [
+            (
+                "trimmed HTTPS URL",
+                "  https://www.example.com/events/planning  ",
+                Some(("https://www.example.com/events/planning", "example.com")),
+            ),
+            (
+                "HTTP URL",
+                "http://calendar.example.org/meeting",
+                Some((
+                    "http://calendar.example.org/meeting",
+                    "calendar.example.org",
+                )),
+            ),
+            (
+                "long Zoom meeting URL",
+                "https://zoom.us/j/98765432109?pwd=very-long-meeting-password",
+                Some((
+                    "https://zoom.us/j/98765432109?pwd=very-long-meeting-password",
+                    "Zoom",
+                )),
+            ),
+            ("plain location", "Conference Room 4B", None),
+            ("non-web scheme", "mailto:team@example.com", None),
+        ];
+
+        for (description, location, expected) in cases {
+            assert_eq!(
+                interpret_location_url(location),
+                expected.map(|(url, label)| (url.to_string(), label.to_string())),
+                "{description}",
+            );
+        }
     }
 }

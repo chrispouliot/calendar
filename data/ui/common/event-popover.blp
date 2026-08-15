@@ -121,10 +121,20 @@ template $EventPopover: Popover {
               ]
             }
 
-            Label location_label {
+            Stack location_stack {
               halign: start;
-              selectable: true;
-              ellipsize: end;
+
+              Label location_label {
+                selectable: true;
+                ellipsize: end;
+              }
+
+              LinkButton location_link_button {
+                visible: false;
+                child: Label location_link_label {
+                  ellipsize: end;
+                };
+              }
             }
           }
         }
