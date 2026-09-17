@@ -1,8 +1,12 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use calendar::preferences::{load_time_format_preference, save_time_format_preference};
+use calendar::preferences::{
+    format_wall_time, load_default_reminders, load_time_format_preference, save_default_reminders,
+    save_time_format_preference,
+};
+use calendar::reminder_choice::{DefaultReminders, ReminderChoice};
 use calendar::time_format::TimeFormatPreference;
 use gtk::glib;
 
@@ -16,7 +20,12 @@ mod imp {
     pub struct PreferencesDialog {
         #[template_child]
         pub time_format_row: TemplateChild<adw::ComboRow>,
+        #[template_child]
+        pub timed_reminder_row: TemplateChild<adw::ComboRow>,
+        #[template_child]
+        pub all_day_reminder_row: TemplateChild<adw::ComboRow>,
         pub on_changed: RefCell<Option<ChangedFn>>,
+        pub reminder_rows_syncing: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -49,17 +58,59 @@ mod imp {
                     _ => TimeFormatPreference::System,
                 };
                 save_time_format_preference(preference);
-                if let Some(dialog) = weak.upgrade()
-                    && let Some(callback) = dialog.imp().on_changed.borrow().as_ref()
-                {
-                    callback();
+                if let Some(dialog) = weak.upgrade() {
+                    // All-day labels carry wall-clock times in the new format.
+                    dialog.imp().sync_reminder_rows(load_default_reminders());
+                    if let Some(callback) = dialog.imp().on_changed.borrow().as_ref() {
+                        callback();
+                    }
                 }
             });
+
+            for row in [&self.timed_reminder_row, &self.all_day_reminder_row] {
+                let weak = self.obj().downgrade();
+                row.connect_selected_notify(move |_| {
+                    if let Some(dialog) = weak.upgrade()
+                        && !dialog.imp().reminder_rows_syncing.get()
+                    {
+                        save_default_reminders(dialog.imp().selected_default_reminders());
+                    }
+                });
+            }
+            self.sync_reminder_rows(load_default_reminders());
         }
     }
 
     impl WidgetImpl for PreferencesDialog {}
     impl AdwDialogImpl for PreferencesDialog {}
+
+    impl PreferencesDialog {
+        /// Rebuild both rows' lists with current clock-format labels and
+        /// select the stored defaults without triggering a save.
+        pub fn sync_reminder_rows(&self, defaults: DefaultReminders) {
+            self.reminder_rows_syncing.set(true);
+            for (row, all_day, choice) in [
+                (&self.timed_reminder_row, false, defaults.timed),
+                (&self.all_day_reminder_row, true, defaults.all_day),
+            ] {
+                let labels = ReminderChoice::labels(all_day, format_wall_time);
+                let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+                row.set_model(Some(&gtk::StringList::new(&labels)));
+                row.set_selected(choice.index(all_day).unwrap_or(0));
+            }
+            self.reminder_rows_syncing.set(false);
+        }
+
+        fn selected_default_reminders(&self) -> DefaultReminders {
+            let fallback = DefaultReminders::default();
+            DefaultReminders {
+                timed: ReminderChoice::from_index(false, self.timed_reminder_row.selected())
+                    .unwrap_or(fallback.timed),
+                all_day: ReminderChoice::from_index(true, self.all_day_reminder_row.selected())
+                    .unwrap_or(fallback.all_day),
+            }
+        }
+    }
 }
 
 glib::wrapper! {
@@ -81,6 +132,7 @@ impl PreferencesDialog {
         self.imp()
             .time_format_row
             .set_selected(preference_index(load_time_format_preference()));
+        self.imp().sync_reminder_rows(load_default_reminders());
     }
 }
 

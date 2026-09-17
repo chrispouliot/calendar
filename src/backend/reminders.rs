@@ -58,7 +58,7 @@ pub fn reminder_occurrences_in_window(
     let reminders: Vec<_> = event
         .reminders
         .iter()
-        .filter(|reminder| reminder.seconds_before_start > 0)
+        .filter(|reminder| reminder.seconds_before_start != 0)
         .collect();
     if reminders.is_empty() {
         return Vec::new();

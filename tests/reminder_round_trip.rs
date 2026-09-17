@@ -91,3 +91,39 @@ fn display_reminders_round_trip_through_caldav_and_sqlite_and_unsupported_alarms
         ));
     }
 }
+
+#[test]
+fn after_start_display_reminders_round_trip_as_positive_triggers() {
+    let event_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let calendar_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let all_day = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:holiday\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20260701\r\nDTEND;VALUE=DATE:20260702\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;RELATED=START:PT9H\r\nDESCRIPTION:Morning of\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    let mapped = map_icalendar_event(all_day, event_id, calendar_id)
+        .expect("a positive trigger is an alarm after the start and must map");
+    assert_eq!(
+        mapped.event.reminders,
+        vec![ReminderSpec {
+            seconds_before_start: -9 * 60 * 60,
+            description: "Morning of".to_owned(),
+        }]
+    );
+
+    let serialized = serialize_icalendar_event(&mapped.event, &mapped.remote_uid)
+        .expect("an after-start reminder must serialize");
+    assert!(
+        serialized.contains("TRIGGER;RELATED=START:PT32400S"),
+        "an after-start reminder must serialize as a positive duration, got:\n{serialized}"
+    );
+    let remapped = map_icalendar_event(&serialized, event_id, calendar_id)
+        .expect("serialized after-start reminder must map");
+    assert_eq!(remapped.event.reminders, mapped.event.reminders);
+
+    let at_start = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:holiday\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20260701\r\nDTEND;VALUE=DATE:20260702\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:PT0S\r\nDESCRIPTION:At start\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert!(
+        matches!(
+            map_icalendar_event(at_start, event_id, calendar_id),
+            Err(EventMappingError::UnsupportedData(_))
+        ),
+        "a zero trigger still cannot be represented"
+    );
+}

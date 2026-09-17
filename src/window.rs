@@ -10,6 +10,7 @@ use calendar::model::{
     Account, Calendar, CalendarSource, DetachedEvent, EmptyQuickAddTitle, Event, RecurrenceId,
     new_quick_add_event,
 };
+use calendar::preferences::load_default_reminders;
 use calendar::view_state::{ViewKind, ViewState};
 use chrono::{Datelike, NaiveDate};
 use gtk::{gio, glib};
@@ -1052,7 +1053,7 @@ impl imp::CalendarWindow {
     ) {
         let event_id = Uuid::new_v4();
         let event = match new_quick_add_event(event_id, calendar_id, title, date) {
-            Ok(ev) => ev,
+            Ok(ev) => load_default_reminders().with_default_reminders(ev),
             Err(EmptyQuickAddTitle) => {
                 // Guard against edge case: popover delivered empty title.
                 self.overlay

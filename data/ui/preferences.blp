@@ -4,7 +4,7 @@ using Adw 1;
 template $PreferencesDialog: Adw.Dialog {
   title: "Preferences";
   content-width: 480;
-  content-height: 260;
+  content-height: 440;
 
   Adw.ToolbarView {
     [top]
@@ -17,6 +17,19 @@ template $PreferencesDialog: Adw.Dialog {
 
         Adw.ComboRow time_format_row {
           title: "Clock format";
+        }
+      }
+
+      Adw.PreferencesGroup {
+        title: "Default Reminders";
+        description: "Reminder added to new events. Existing events are not changed.";
+
+        Adw.ComboRow timed_reminder_row {
+          title: "Timed events";
+        }
+
+        Adw.ComboRow all_day_reminder_row {
+          title: "All-day events";
         }
       }
     };

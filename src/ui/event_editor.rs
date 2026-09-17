@@ -3,10 +3,12 @@ use std::cell::{Cell, RefCell};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use calendar::model::{Calendar, Event, EventSchedule, RecurrenceId, ReminderSpec, validate_event};
+use calendar::preferences::{format_wall_time, load_default_reminders};
 use calendar::recurrence_form::{
     EndCondition, Frequency, RecurrenceForm, RecurrencePresentation, Weekday, recurrence_from_form,
     recurrence_presentation,
 };
+use calendar::reminder_choice::ReminderChoice;
 use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike,
 };
@@ -45,7 +47,6 @@ impl OccurrenceEditContext {
 type SaveFn = Box<dyn Fn(Event, bool, Option<OccurrenceEditContext>) -> bool>;
 type DeleteFn = Box<dyn Fn(Uuid, Option<OccurrenceEditContext>) -> bool>;
 
-const KEEP_EXISTING_REMINDERS_INDEX: u32 = 7;
 const REPEAT_CUSTOM_INDEX: u32 = 5;
 const END_COUNT: u32 = 1;
 const END_UNTIL: u32 = 2;
@@ -122,6 +123,7 @@ mod imp {
         pub timed_schedule_state: RefCell<Option<crate::ui::date_time_chooser::DateTimeChooser>>,
         pub reminder_selection_user_changed: Cell<bool>,
         pub reminder_selection_syncing: Cell<bool>,
+        pub reminder_row_all_day: Cell<bool>,
         pub recurrence_syncing: Cell<bool>,
         pub weekday_buttons: RefCell<Vec<gtk::ToggleButton>>,
         pub on_save: RefCell<Option<SaveFn>>,
@@ -257,6 +259,7 @@ mod imp {
                 .connect_visible_child_name_notify(move |_| {
                     if let Some(editor) = weak.upgrade() {
                         editor.imp().schedule_changed();
+                        editor.imp().sync_reminder_row_to_schedule();
                     }
                 });
 
@@ -409,10 +412,11 @@ impl EventEditor {
         imp.title_entry.set_text(title);
         imp.location_entry.set_text("");
         imp.description_view.buffer().set_text("");
-        imp.set_placeholder_state(&[]);
+        imp.reminder_selection_user_changed.set(false);
         *imp.original_timed_event.borrow_mut() = None;
         select_calendar(&imp.calendar_row, &imp.calendars.borrow(), calendar_id);
         imp.schedule_stack.set_visible_child_name("all-day");
+        imp.set_reminder_choice(load_default_reminders().all_day, true);
         if let (Some(start_date_row), Some(end_date_row), Some(timed_schedule)) = (
             imp.start_date_row_state.borrow().as_ref(),
             imp.end_date_row_state.borrow().as_ref(),
@@ -453,7 +457,10 @@ impl EventEditor {
         imp.title_entry.set_text(&event.title);
         imp.location_entry.set_text(&event.location);
         imp.description_view.buffer().set_text(&event.description);
-        imp.set_placeholder_state(&event.reminders);
+        imp.set_reminder_selection(
+            &event.reminders,
+            matches!(event.schedule, EventSchedule::AllDay { .. }),
+        );
         select_calendar(
             &imp.calendar_row,
             &imp.calendars.borrow(),
@@ -567,6 +574,7 @@ impl EventEditor {
         if let Some(chooser) = self.imp().timed_schedule_state.borrow().as_ref() {
             chooser.refresh_time_format();
         }
+        self.imp().refresh_reminder_labels();
     }
 }
 
@@ -576,10 +584,6 @@ impl imp::EventEditor {
             self.occurrence_recurrence_id.borrow().clone()?,
             self.occurrence_scope.get()?,
         ))
-    }
-
-    fn set_placeholder_state(&self, reminders: &[ReminderSpec]) {
-        self.set_reminder_selection(reminders);
     }
 
     fn set_repeat_model(&self, include_custom: bool) {
@@ -771,36 +775,100 @@ impl imp::EventEditor {
         }
     }
 
-    fn set_reminder_selection(&self, reminders: &[ReminderSpec]) {
-        let keep_existing = !reminders.is_empty()
-            && (reminders.len() != 1
-                || reminder_choice_index(reminders[0].seconds_before_start).is_none());
-        let mut labels = vec![
-            "No reminder",
-            "5 minutes before",
-            "10 minutes before",
-            "15 minutes before",
-            "30 minutes before",
-            "1 hour before",
-            "1 day before",
-        ];
-        if keep_existing {
-            labels.push("Keep existing reminders");
-        }
-        let selected = if keep_existing {
-            KEEP_EXISTING_REMINDERS_INDEX
-        } else {
-            reminders
-                .first()
-                .and_then(|reminder| reminder_choice_index(reminder.seconds_before_start))
-                .unwrap_or(0) as u32
+    /// Show an existing event's reminders through the list for its schedule
+    /// kind. Reminders the list cannot express are kept untouched behind a
+    /// "Keep existing reminders" entry.
+    fn set_reminder_selection(&self, reminders: &[ReminderSpec], all_day: bool) {
+        let choice = match reminders {
+            [] => Some(ReminderChoice::None),
+            [reminder] => {
+                ReminderChoice::from_seconds_before_start(all_day, reminder.seconds_before_start)
+            }
+            _ => None,
         };
+        match choice {
+            Some(choice) => self.set_reminder_choice(choice, all_day),
+            None => {
+                let mut labels = reminder_labels(all_day);
+                labels.push("Keep existing reminders".to_owned());
+                let keep_existing = ReminderChoice::list(all_day).len() as u32;
+                self.apply_reminder_model(&labels, keep_existing, all_day);
+            }
+        }
+    }
+
+    fn set_reminder_choice(&self, choice: ReminderChoice, all_day: bool) {
+        let selected = choice.index(all_day).unwrap_or(0);
+        self.apply_reminder_model(&reminder_labels(all_day), selected, all_day);
+    }
+
+    fn apply_reminder_model(&self, labels: &[String], selected: u32, all_day: bool) {
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
         let model = gtk::StringList::new(&labels);
         self.reminder_selection_syncing.set(true);
         self.reminders_row.set_model(Some(&model));
         self.reminders_row.set_selected(selected);
         self.reminder_selection_syncing.set(false);
+        self.reminder_row_all_day.set(all_day);
         self.reminder_selection_user_changed.set(false);
+    }
+
+    fn keep_existing_index(&self) -> u32 {
+        ReminderChoice::list(self.reminder_row_all_day.get()).len() as u32
+    }
+
+    fn selected_reminder_choice(&self) -> Option<ReminderChoice> {
+        ReminderChoice::from_index(
+            self.reminder_row_all_day.get(),
+            self.reminders_row.selected(),
+        )
+    }
+
+    /// Rebuild the reminder row when the schedule kind changes, because timed
+    /// and all-day events offer different lists. A pick the user made is
+    /// carried over only when the new list offers it; otherwise an existing
+    /// event falls back to its stored reminders and a new event to the
+    /// Preferences default.
+    fn sync_reminder_row_to_schedule(&self) {
+        let all_day = self.schedule_stack.visible_child_name().as_deref() == Some("all-day");
+        if self.reminder_row_all_day.get() == all_day {
+            return;
+        }
+        let carried = if self.reminder_selection_user_changed.get() {
+            self.selected_reminder_choice()
+                .filter(|choice| choice.is_for(all_day))
+        } else {
+            None
+        };
+        let base = self.editing_event.borrow().clone();
+        match (carried, base) {
+            (Some(choice), _) => {
+                self.set_reminder_choice(choice, all_day);
+                self.reminder_selection_user_changed.set(true);
+            }
+            (None, Some(event)) => self.set_reminder_selection(&event.reminders, all_day),
+            (None, None) => {
+                self.set_reminder_choice(load_default_reminders().for_all_day(all_day), all_day);
+            }
+        }
+    }
+
+    /// Re-render the reminder labels after the clock format changed, keeping
+    /// the selection and whether the user chose it.
+    fn refresh_reminder_labels(&self) {
+        let all_day = self.reminder_row_all_day.get();
+        let selected = self.reminders_row.selected();
+        let user_changed = self.reminder_selection_user_changed.get();
+        let mut labels = reminder_labels(all_day);
+        let has_keep_existing = self
+            .reminders_row
+            .model()
+            .is_some_and(|model| model.n_items() > labels.len() as u32);
+        if has_keep_existing {
+            labels.push("Keep existing reminders".to_owned());
+        }
+        self.apply_reminder_model(&labels, selected, all_day);
+        self.reminder_selection_user_changed.set(user_changed);
     }
 
     fn schedule_changed(&self) {
@@ -1073,14 +1141,16 @@ impl imp::EventEditor {
         let (start, end) = buffer.bounds();
         let description = buffer.text(&start, &end, false).to_string();
         let title = self.title_entry.text().to_string();
-        let reminders = if self.reminder_selection_user_changed.get()
-            && self.reminders_row.selected() != KEEP_EXISTING_REMINDERS_INDEX
-        {
-            self.reminders_for_selection(&title)
-        } else {
-            base.as_ref()
-                .map(|event| event.reminders.clone())
-                .unwrap_or_default()
+        // A new event always takes the row's value: it shows either the
+        // Preferences default for its schedule kind or the user's own pick.
+        let reminders = match &base {
+            Some(event)
+                if !self.reminder_selection_user_changed.get()
+                    || self.reminders_row.selected() == self.keep_existing_index() =>
+            {
+                event.reminders.clone()
+            }
+            _ => self.reminders_for_selection(&title),
         };
         let event = Event {
             id: base
@@ -1110,32 +1180,14 @@ impl imp::EventEditor {
     }
 
     fn reminders_for_selection(&self, title: &str) -> Vec<ReminderSpec> {
-        let seconds_before_start = match self.reminders_row.selected() {
-            1 => 5 * 60,
-            2 => 10 * 60,
-            3 => 15 * 60,
-            4 => 30 * 60,
-            5 => 60 * 60,
-            6 => 24 * 60 * 60,
-            _ => return Vec::new(),
-        };
-        vec![ReminderSpec {
-            seconds_before_start,
-            description: format!("Reminder for {title}"),
-        }]
+        self.selected_reminder_choice()
+            .map(|choice| choice.reminders(title))
+            .unwrap_or_default()
     }
 }
 
-fn reminder_choice_index(seconds_before_start: i64) -> Option<usize> {
-    match seconds_before_start {
-        seconds if seconds == 5 * 60 => Some(1),
-        seconds if seconds == 10 * 60 => Some(2),
-        seconds if seconds == 15 * 60 => Some(3),
-        seconds if seconds == 30 * 60 => Some(4),
-        seconds if seconds == 60 * 60 => Some(5),
-        seconds if seconds == 24 * 60 * 60 => Some(6),
-        _ => None,
-    }
+fn reminder_labels(all_day: bool) -> Vec<String> {
+    ReminderChoice::labels(all_day, format_wall_time)
 }
 
 fn frequency_index(frequency: Frequency) -> u32 {

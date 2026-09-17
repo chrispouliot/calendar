@@ -214,3 +214,87 @@ fn all_day_reminders_use_window_offset_midnight_boundaries_and_recurring_dates()
         "a bounded all-day master must emit each local-date reminder once"
     );
 }
+
+#[test]
+fn all_day_presets_fire_at_wall_clock_moments_around_the_event_day() {
+    let offset = FixedOffset::east_opt(2 * 60 * 60).unwrap();
+    let mut holiday = Event {
+        id: Uuid::parse_str("66666666-6666-6666-6666-666666666666").unwrap(),
+        calendar_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+        title: "Holiday".to_owned(),
+        location: String::new(),
+        description: String::new(),
+        schedule: EventSchedule::AllDay {
+            start_date: NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+            end_date_exclusive: NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
+        },
+        recurrence: None,
+        reminders: vec![
+            ReminderSpec {
+                seconds_before_start: 15 * 60 * 60,
+                description: "Day before".to_owned(),
+            },
+            ReminderSpec {
+                seconds_before_start: 3 * 60 * 60,
+                description: "Evening before".to_owned(),
+            },
+            ReminderSpec {
+                seconds_before_start: -9 * 60 * 60,
+                description: "Day of".to_owned(),
+            },
+        ],
+    };
+
+    let triggers = reminder_occurrences_in_window(
+        &holiday,
+        at_in(offset, 2026, 6, 30, 23, 59),
+        at_in(offset, 2026, 7, 3, 0, 0),
+    );
+    assert_eq!(
+        triggers
+            .iter()
+            .map(|occurrence| (occurrence.trigger_at, occurrence.description.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (at_in(offset, 2026, 7, 1, 9, 0), "Day before"),
+            (at_in(offset, 2026, 7, 1, 21, 0), "Evening before"),
+            (at_in(offset, 2026, 7, 2, 9, 0), "Day of"),
+        ],
+        "an after-start offset must fire on the event day in the scheduler's local offset"
+    );
+    assert!(
+        triggers
+            .iter()
+            .all(|occurrence| occurrence.occurrence_start == at_in(offset, 2026, 7, 2, 0, 0))
+    );
+
+    holiday.reminders.truncate(3);
+    holiday.reminders.drain(..2);
+    holiday.recurrence = Some(RecurrenceSpec {
+        rrule: vec!["RRULE:FREQ=DAILY;COUNT=2".to_owned()],
+        rdate: Vec::new(),
+        exdate: Vec::new(),
+    });
+    let recurring = reminder_occurrences_in_window(
+        &holiday,
+        at_in(offset, 2026, 7, 1, 23, 59),
+        at_in(offset, 2026, 7, 4, 0, 0),
+    );
+    assert_eq!(
+        recurring
+            .iter()
+            .map(|occurrence| (occurrence.occurrence_start, occurrence.trigger_at))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                at_in(offset, 2026, 7, 2, 0, 0),
+                at_in(offset, 2026, 7, 2, 9, 0),
+            ),
+            (
+                at_in(offset, 2026, 7, 3, 0, 0),
+                at_in(offset, 2026, 7, 3, 9, 0),
+            ),
+        ],
+        "recurring all-day masters must expand for after-start offsets too"
+    );
+}

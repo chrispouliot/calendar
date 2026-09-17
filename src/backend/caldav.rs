@@ -604,7 +604,9 @@ fn serialize_icalendar_event_component(
     }
 
     for reminder in &event.reminders {
-        if reminder.seconds_before_start <= 0 {
+        // Negative offsets fire after the start (all-day "day of" reminders)
+        // and serialize as positive durations. Zero cannot round-trip.
+        if reminder.seconds_before_start == 0 {
             return Err(EventSerializationError::UnsupportedReminders);
         }
         serialized_event.alarm(Alarm::display(
@@ -1129,11 +1131,13 @@ fn map_alarm<C: Component>(component: &C) -> Result<crate::model::ReminderSpec, 
     let seconds = parse_ical_duration(trigger.value()).ok_or_else(|| {
         EventMappingError::UnsupportedData("VALARM trigger is malformed".to_owned())
     })?;
-    if seconds >= 0 || seconds == i64::MIN {
+    if seconds == i64::MIN {
         return Err(EventMappingError::UnsupportedData(
-            "VALARM trigger must be a negative whole-second duration".to_owned(),
+            "VALARM trigger duration is out of range".to_owned(),
         ));
     }
+    // A positive trigger fires after the start, which all-day "day of"
+    // reminders from other clients use; it becomes a negative offset here.
     let seconds_before_start = -seconds;
     let description = component
         .properties()
