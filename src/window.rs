@@ -432,7 +432,7 @@ mod imp {
                 let win_weak = win.downgrade();
                 move || {
                     if let Some(win) = win_weak.upgrade() {
-                        win.imp().render_all_from_state();
+                        win.imp().rerender_all_views();
                     }
                 }
             });
@@ -443,7 +443,7 @@ mod imp {
                 let win_weak = win.downgrade();
                 move || {
                     if let Some(win) = win_weak.upgrade() {
-                        win.imp().render_all_from_state();
+                        win.imp().rerender_all_views();
                         if let Some(editor) = win.imp().event_editor.borrow().clone() {
                             editor.refresh_time_format();
                         }
@@ -520,7 +520,7 @@ impl CalendarWindow {
     }
 
     pub(crate) fn refresh_from_background(&self) {
-        self.imp().render_all_from_state();
+        self.imp().rerender_all_views();
     }
 
     fn navigate_previous(&self) {
@@ -779,8 +779,18 @@ impl imp::CalendarWindow {
     }
 
     /// Synchronise both concrete views and render from shared state.
+    ///
+    /// Only for navigation: repositions every view to the shared active date.
     fn render_all_from_state(&self) {
         self.sync_views_to_state();
+        self.rerender_all_views();
+    }
+
+    /// Re-render every view from the repository without moving them.  Used
+    /// after data changes (sync, edits, settings) so the user's scroll
+    /// position is kept; the month view's reported title month is lossy and
+    /// must not be pushed back into it as a navigation target.
+    fn rerender_all_views(&self) {
         self.render_month_view();
         self.render_week_view();
         self.render_agenda_view();
@@ -827,7 +837,7 @@ impl imp::CalendarWindow {
             repo.save_calendar(calendar)
         };
         result.map_err(|_| "Could not save the calendar.".to_string())?;
-        self.render_all_from_state();
+        self.rerender_all_views();
         Ok(())
     }
 
@@ -848,7 +858,7 @@ impl imp::CalendarWindow {
             repo.update_calendar(calendar)
         };
         result.map_err(|_| "Could not update the calendar.".to_string())?;
-        self.render_all_from_state();
+        self.rerender_all_views();
         Ok(())
     }
 
@@ -869,7 +879,7 @@ impl imp::CalendarWindow {
         if !deleted {
             return Err("Could not remove the calendar.".to_string());
         }
-        self.render_all_from_state();
+        self.rerender_all_views();
         Ok(())
     }
 
@@ -888,7 +898,7 @@ impl imp::CalendarWindow {
             return Err("Could not remove the account.".to_string());
         }
 
-        self.render_all_from_state();
+        self.rerender_all_views();
         let _ = delete_on_worker(account_id);
         Ok(())
     }
@@ -906,7 +916,7 @@ impl imp::CalendarWindow {
             repo.provision_caldav_account(account, discovery)
         };
         result.map_err(|_| "Could not add the online account.".to_string())?;
-        self.render_all_from_state();
+        self.rerender_all_views();
         Ok(crate::background::database_path())
     }
 
@@ -927,7 +937,7 @@ impl imp::CalendarWindow {
 
         match result {
             Ok(()) => {
-                self.render_all_from_state();
+                self.rerender_all_views();
                 true
             }
             Err(RepositoryError) => {
@@ -1246,7 +1256,7 @@ impl imp::CalendarWindow {
         };
         match result {
             Ok(()) => {
-                self.render_all_from_state();
+                self.rerender_all_views();
                 true
             }
             Err(RepositoryError) => {
@@ -1277,7 +1287,7 @@ impl imp::CalendarWindow {
                         }
                     }
                 };
-                self.render_all_from_state();
+                self.rerender_all_views();
                 self.show_following_delete_toast(undo);
                 return true;
             }
@@ -1308,7 +1318,7 @@ impl imp::CalendarWindow {
                     }
                 }
             };
-            self.render_all_from_state();
+            self.rerender_all_views();
             self.show_occurrence_delete_toast(undo);
             return true;
         }
@@ -1341,7 +1351,7 @@ impl imp::CalendarWindow {
             }
         };
 
-        self.render_all_from_state();
+        self.rerender_all_views();
 
         let pending = Rc::new(RefCell::new(Some(undo)));
         let toast = adw::Toast::builder()
@@ -1377,7 +1387,7 @@ impl imp::CalendarWindow {
         };
         match result {
             Ok(()) => {
-                self.render_all_from_state();
+                self.rerender_all_views();
                 self.overlay.add_toast(adw::Toast::new("Event restored."));
             }
             Err(RepositoryError) => {
@@ -1409,7 +1419,7 @@ impl imp::CalendarWindow {
                 };
                 match result {
                     Ok(()) => {
-                        win.imp().render_all_from_state();
+                        win.imp().rerender_all_views();
                         win.imp()
                             .overlay
                             .add_toast(adw::Toast::new("Event restored."));
@@ -1452,7 +1462,7 @@ impl imp::CalendarWindow {
                 };
                 match result {
                     Ok(()) => {
-                        win.imp().render_all_from_state();
+                        win.imp().rerender_all_views();
                         win.imp()
                             .overlay
                             .add_toast(adw::Toast::new("Events restored."));

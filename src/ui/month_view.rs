@@ -1243,6 +1243,10 @@ impl MonthView {
 
         let (y, m) = self.first_visible_week_ym();
         imp.last_title_ym.set((y, m));
+        if !imp.active_date_syncing.get() {
+            imp.active_date
+                .set(reconcile_month(self.active_date(), y, m));
+        }
         if let Some(cb) = imp.on_month_changed.borrow().as_ref() {
             cb(y, m);
         }
