@@ -9,6 +9,7 @@ use calendar::recurrence_form::{
     recurrence_presentation,
 };
 use calendar::reminder_choice::ReminderChoice;
+use calendar::viewer_time::local_timezone_for;
 use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike,
 };
@@ -1103,7 +1104,12 @@ impl imp::EventEditor {
                 self.show_error("Choose a valid end time.");
                 return;
             };
-            let timezone = original.as_ref().and_then(|event| event.timezone.clone());
+            // Keep an existing event's zone; give new events the system zone
+            // so CalDAV clients see local wall-clock times rather than UTC.
+            let timezone = match original.as_ref() {
+                Some(event) => event.timezone.clone(),
+                None => local_timezone_for(&start, &end),
+            };
             EventSchedule::Timed {
                 start,
                 end,

@@ -26,3 +26,49 @@ pub fn now_local_fixed() -> DateTime<FixedOffset> {
     };
     to_local_fixed(&value.fixed_offset())
 }
+
+/// Return the system-local IANA timezone identifier (for example
+/// `Europe/London`) when GLib reports one that chrono-tz recognizes.
+pub fn local_timezone_id() -> Option<String> {
+    let identifier = glib::TimeZone::local().identifier();
+    let identifier = identifier.trim_start_matches(':');
+    identifier
+        .parse::<chrono_tz::Tz>()
+        .ok()
+        .map(|timezone| timezone.name().to_owned())
+}
+
+/// Return the system-local timezone to attach to a new timed event, or
+/// `None` to store and upload it as UTC. See [`timezone_for`].
+pub fn local_timezone_for(
+    start: &DateTime<FixedOffset>,
+    end: &DateTime<FixedOffset>,
+) -> Option<String> {
+    timezone_for(start, end, &local_timezone_id()?)
+}
+
+/// Return `tzid` when it names a non-UTC zone in which both endpoints resolve
+/// unambiguously with the offsets they already carry. Otherwise `None`,
+/// meaning the event is stored and uploaded as UTC.
+pub fn timezone_for(
+    start: &DateTime<FixedOffset>,
+    end: &DateTime<FixedOffset>,
+    tzid: &str,
+) -> Option<String> {
+    let timezone = tzid.parse::<chrono_tz::Tz>().ok()?;
+    if matches!(timezone, chrono_tz::UTC | chrono_tz::Etc::UTC) {
+        return None;
+    }
+    [start, end]
+        .into_iter()
+        .all(|value| fits_timezone(value, timezone))
+        .then(|| timezone.name().to_owned())
+}
+
+fn fits_timezone(value: &DateTime<FixedOffset>, timezone: chrono_tz::Tz) -> bool {
+    use chrono::{Offset, TimeZone};
+    timezone
+        .from_local_datetime(&value.naive_local())
+        .single()
+        .is_some_and(|resolved| resolved.offset().fix() == *value.offset())
+}
